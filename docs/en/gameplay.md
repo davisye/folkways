@@ -86,6 +86,18 @@ Kaleidoscope Cookery's red and green chilies are also refused because eating the
 causes direct damage. Datapacks can add other foods with special harmful eating
 behavior to the `folkways:unsafe_food` item tag.
 
+## Pastures
+
+The target is the number of grown animals to retain. Residents breed ready adult
+pairs while the total is below or at the target. At the target, one additional
+birth is allowed; feeding waits while surplus young grow. Only adults above the
+retained count are culled, so a newborn does not replace a breeding adult.
+
+For example, retain two cows: two adults breed, their calf grows, then one of
+the three adults is culled and the cycle can repeat after the normal breeding
+cooldown. A target of zero disables breeding and culls all adults. One animal
+has no breeding partner; keep at least two for continued meat production.
+
 ## Composting
 
 Register an ordinary composter with the Colony Book. On the colony's

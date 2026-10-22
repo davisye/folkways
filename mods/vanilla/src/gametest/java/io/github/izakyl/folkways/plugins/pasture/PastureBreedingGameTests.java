@@ -25,11 +25,13 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.gametest.framework.GameTest;
 import net.minecraft.gametest.framework.GameTestHelper;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.SimpleContainer;
 import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.animal.Animal;
 import net.minecraft.world.entity.animal.Cow;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
@@ -49,6 +51,238 @@ public final class PastureBreedingGameTests {
     @SubscribeEvent
     public static void register(RegisterGameTestsEvent event) {
         event.register(PastureBreedingGameTests.class);
+    }
+
+    @GameTest(template = "empty")
+    public static void aHerdAtItsTargetStillGetsOneBreedingPair(GameTestHelper helper) {
+        Rig rig = pair(helper);
+        rig.target = 2;
+        helper.assertTrue(rig.nodes().size() == 1, "a herd exactly at its target still breeds for meat");
+        helper.assertTrue(rig.nodes(Herd.Job.CULL).isEmpty(), "the retained adults are not surplus");
+        rig.clear();
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty")
+    public static void aSurplusCalfMustGrowBeforeTheAdultReserveCanBeCulled(GameTestHelper helper) {
+        Rig rig = pair(helper);
+        rig.target = 2;
+        rig.cow(4, 3, -24000);
+        helper.assertTrue(rig.nodes(Herd.Job.CULL).isEmpty(), "a calf must not cost the herd a retained adult");
+        helper.assertTrue(rig.nodes().isEmpty(), "wait for the surplus calf rather than breeding more");
+        rig.animals.getLast().setAge(0);
+        List<Node> culls = rig.nodes(Herd.Job.CULL);
+        helper.assertTrue(culls.size() == 1, "three adults against a target of two provide one carcass");
+        helper.assertTrue(Commit.run(rig.level, culls.getFirst(), rig.worker(culls.getFirst(), new SimpleContainer(4)))
+            instanceof Outcome.Done, "the surplus adult is culled");
+        helper.assertTrue(rig.animals.stream().filter(Cow::isAlive).count() == 2, "two adult breeders remain");
+        helper.assertTrue(rig.nodes().size() == 1, "the retained pair can start the next cycle");
+        rig.clear();
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty")
+    public static void anInLovePairReservesTheOnlySurplusBirth(GameTestHelper helper) {
+        Rig rig = pair(helper);
+        rig.target = 4;
+        rig.cow(4, 3, 0);
+        rig.cow(5, 3, 0);
+        List<Node> first = rig.nodes();
+        helper.assertTrue(first.size() == 1, "only one pair starts a surplus birth at the target");
+        Node feed = first.getFirst();
+        helper.assertTrue(Commit.run(rig.level, feed,
+            rig.worker(feed, new SimpleContainer(new ItemStack(Items.WHEAT, 2)))) instanceof Outcome.Done,
+            "the first pair enters love");
+        helper.assertTrue(rig.animals.stream().filter(Cow::isInLove).count() == 2, "one birth is already pending");
+        helper.assertTrue(rig.nodes().isEmpty(), "the other ready pair waits while a birth is pending");
+        rig.clear();
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty")
+    public static void aStaleFeedingReturnsItsFoodWhenTheHerdGainsASurplus(GameTestHelper helper) {
+        Rig rig = pair(helper);
+        rig.target = 3;
+        Node feed = rig.nodes().getFirst();
+        rig.cow(4, 3, -24000);
+        rig.cow(5, 3, -24000);
+        refusedWithoutFood(helper, rig, feed);
+    }
+
+    @GameTest(template = "empty")
+    public static void aStaleCullCannotSpendAnAdultThatHasLeftTheHerd(GameTestHelper helper) {
+        Rig rig = pair(helper);
+        rig.target = 2;
+        rig.cow(4, 3, 0);
+        Node cull = rig.nodes(Herd.Job.CULL).getFirst();
+        Cow other = partner(rig, cull);
+        other.discard();
+        Cow subject = (Cow) rig.level.getEntity(((WorkSite.AtEntity) cull.spec().site()).entity());
+        float before = subject.getHealth();
+        helper.assertTrue(Commit.run(rig.level, cull, rig.worker(cull, new SimpleContainer(4))) instanceof Outcome.Failed,
+            "a planned surplus is rechecked after another adult disappears");
+        helper.assertTrue(subject.isAlive() && subject.getHealth() == before, "the retained animal takes no damage");
+        rig.clear();
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty")
+    public static void currentSettingsAndZoneRemovalStopOldCullJobs(GameTestHelper helper) {
+        Rig rig = pair(helper);
+        rig.target = 1;
+        Node cull = rig.nodes(Herd.Job.CULL).getFirst();
+        rig.target = 2;
+        helper.assertTrue(Commit.run(rig.level, cull, rig.worker(cull, new SimpleContainer(4))) instanceof Outcome.Failed,
+            "raising the current target protects the herd before the next survey");
+        rig.target = 0;
+        cull = rig.nodes(Herd.Job.CULL).getFirst();
+        rig.registered = false;
+        helper.assertTrue(Commit.run(rig.level, cull, rig.worker(cull, new SimpleContainer(4))) instanceof Outcome.Failed,
+            "removing the pasture also cancels an already planned cull");
+        helper.assertTrue(rig.animals.stream().allMatch(Cow::isAlive), "both adults survive the obsolete work");
+        rig.clear();
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty")
+    public static void zeroClearsAdultsAndOneCannotCreateABreedingPair(GameTestHelper helper) {
+        Rig rig = pair(helper);
+        rig.target = 0;
+        rig.cow(4, 3, -24000);
+        helper.assertTrue(rig.nodes().isEmpty(), "zero disables breeding");
+        List<Node> culls = rig.nodes(Herd.Job.CULL);
+        helper.assertTrue(culls.size() == 2, "zero clears the adults, but never slaughters the calf");
+        for (Node cull : culls) {
+            helper.assertTrue(Commit.run(rig.level, cull, rig.worker(cull, new SimpleContainer(4))) instanceof Outcome.Done,
+                "each surplus adult is removed exactly once");
+        }
+        helper.assertTrue(rig.animals.getLast().isAlive(), "the calf remains until grown");
+        rig.clear();
+        rig = new Rig(helper);
+        rig.target = 1;
+        rig.cow(2, 3, 0);
+        helper.assertTrue(rig.nodes().isEmpty() && rig.nodes(Herd.Job.CULL).isEmpty(),
+            "one retained adult is neither fed alone nor culled");
+        rig.clear();
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty")
+    public static void aPlannedCullCannotKillABabyOrAnAnimalOutsideTheCurrentPen(GameTestHelper helper) {
+        Rig rig = pair(helper);
+        rig.target = 2;
+        rig.cow(4, 3, 0);
+        Node cull = rig.nodes(Herd.Job.CULL).getFirst();
+        Cow subject = (Cow) rig.level.getEntity(((WorkSite.AtEntity) cull.spec().site()).entity());
+        subject.setAge(-24000);
+        helper.assertTrue(Commit.run(rig.level, cull, rig.worker(cull, new SimpleContainer(4))) instanceof Outcome.Failed,
+            "a subject which became a baby is not killed");
+        subject.setAge(0);
+        subject.setPos(Vec3.atBottomCenterOf(rig.floor.offset(-2, 1, 3)));
+        helper.assertTrue(Commit.run(rig.level, cull, rig.worker(cull, new SimpleContainer(4))) instanceof Outcome.Failed,
+            "an animal outside the current pasture is not killed");
+        helper.assertTrue(rig.animals.stream().allMatch(Cow::isAlive), "obsolete work harms no animal");
+        rig.clear();
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty")
+    public static void parallelFeedingCommitsRecheckCurrentTargetAndPendingBirths(GameTestHelper helper) {
+        Rig rig = pair(helper);
+        rig.target = 6;
+        rig.cow(4, 3, 0);
+        rig.cow(5, 3, 0);
+        List<Node> planned = rig.nodes();
+        helper.assertTrue(planned.size() == 2, "two missing head initially allow two pairs");
+        rig.target = 4;
+        Node first = planned.getFirst();
+        helper.assertTrue(Commit.run(rig.level, first,
+            rig.worker(first, new SimpleContainer(new ItemStack(Items.WHEAT, 2)))) instanceof Outcome.Done,
+            "one surplus birth is still allowed at the new target");
+        Node second = planned.getLast();
+        SimpleContainer food = new SimpleContainer(new ItemStack(Items.WHEAT, 2));
+        helper.assertTrue(Commit.run(rig.level, second, rig.worker(second, food)) instanceof Outcome.Failed,
+            "a second stale task cannot reserve the same surplus birth");
+        helper.assertTrue(food.countItem(Items.WHEAT) == 2 && rig.animals.stream().filter(Cow::isInLove).count() == 2,
+            "the rejected pair keeps its food and no extra parents enter love");
+        rig.clear();
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty")
+    public static void parallelCullsNeverCrossTheCurrentAdultReserve(GameTestHelper helper) {
+        Rig rig = pair(helper);
+        rig.target = 1;
+        rig.cow(4, 3, 0);
+        rig.cow(5, 3, 0);
+        List<Node> culls = rig.nodes(Herd.Job.CULL);
+        helper.assertTrue(culls.size() == 3, "three surplus adults are initially planned");
+        rig.target = 2;
+        for (int index = 0; index < culls.size(); index++) {
+            Node cull = culls.get(index);
+            Outcome result = Commit.run(rig.level, cull, rig.worker(cull, new SimpleContainer(4)));
+            helper.assertTrue(index < 2 ? result instanceof Outcome.Done : result instanceof Outcome.Failed,
+                "each commit reads the remaining adult reserve, including other workers' removals");
+        }
+        helper.assertTrue(rig.animals.stream().filter(Cow::isAlive).count() == 2, "the new target retains both adults");
+        rig.clear();
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty")
+    public static void everyLivestockBreedsAtTargetAndWaitsForMatureSurplus(GameTestHelper helper) {
+        for (EntityType<? extends Animal> type : List.<EntityType<? extends Animal>>of(
+                EntityType.COW, EntityType.SHEEP, EntityType.PIG, EntityType.CHICKEN)) {
+            Rig rig = new Rig(helper);
+            rig.target = 2;
+            rig.keeps = Livestock.named(BuiltInRegistries.ENTITY_TYPE.getKey(type)).orElseThrow();
+            List<Animal> stock = new ArrayList<>();
+            for (int index = 0; index < 3; index++) {
+                Animal animal = type.create(rig.level);
+                animal.setUUID(new UUID(rig.zone.id().getMostSignificantBits(), index + 1L));
+                animal.setPos(Vec3.atBottomCenterOf(rig.floor.offset(index + 2, 1, 3)));
+                animal.setAge(index == 2 ? -24000 : 0);
+                if (index < 2) {
+                    rig.level.addFreshEntity(animal);
+                }
+                stock.add(animal);
+            }
+            helper.assertTrue(rig.nodes().size() == 1, type + ": two retained adults still receive pair feeding");
+            rig.level.addFreshEntity(stock.getLast());
+            helper.assertTrue(rig.nodes().isEmpty() && rig.nodes(Herd.Job.CULL).isEmpty(),
+                type + ": wait for a surplus juvenile without killing breeders");
+            stock.getLast().setAge(0);
+            helper.assertTrue(rig.nodes(Herd.Job.CULL).size() == 1, type + ": exactly one mature animal is surplus");
+            stock.forEach(Animal::discard);
+        }
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty", timeoutTicks = 700)
+    public static void theAtTargetCycleProducesARealCalfAndCanStartAgain(GameTestHelper helper) {
+        Rig rig = pair(helper);
+        rig.target = 2;
+        List<Node> feeding = rig.nodes();
+        helper.assertTrue(feeding.size() == 1, "the pair at target receives breeding work");
+        Node feed = feeding.getFirst();
+        helper.assertTrue(Commit.run(rig.level, feed,
+            rig.worker(feed, new SimpleContainer(new ItemStack(Items.WHEAT, 2)))) instanceof Outcome.Done,
+            "the retained pair is fed");
+        helper.succeedWhen(() -> {
+            var stock = rig.level.getEntitiesOfClass(Cow.class, rig.pen().reach(rig.level),
+                cow -> cow.isAlive() && rig.pen().holds(cow));
+            Cow calf = stock.stream().filter(Cow::isBaby).findFirst().orElse(null);
+            helper.assertTrue(calf != null, "vanilla breeding produces a real calf at the target");
+            helper.assertTrue(rig.nodes(Herd.Job.CULL).isEmpty(), "the parents survive while the calf grows");
+            calf.setAge(0);
+            List<Node> culls = rig.nodes(Herd.Job.CULL);
+            helper.assertTrue(culls.size() == 1, "one adult becomes surplus after the calf grows");
+            helper.assertTrue(Commit.run(rig.level, culls.getFirst(), rig.worker(culls.getFirst(), new SimpleContainer(4)))
+                instanceof Outcome.Done, "the mature surplus is collected");
+            stock.stream().filter(Cow::isAlive).forEach(cow -> cow.setAge(0));
+            helper.assertTrue(rig.nodes().size() == 1, "once the normal cooldown ends, the next cycle is available");
+            stock.forEach(Cow::discard);
+        });
     }
 
     @GameTest(template = "empty")
@@ -324,6 +558,9 @@ public final class PastureBreedingGameTests {
         final PastDay made = new PastDay();
         final Herd herd = new Herd(() -> { }, made);
         final ZoneView zone;
+        int target = 8;
+        boolean registered = true;
+        Livestock keeps = Livestock.COW;
 
         Rig(GameTestHelper helper) {
             this(helper, 12, 6);
@@ -349,8 +586,8 @@ public final class PastureBreedingGameTests {
             }
             Settings settings = (Settings) Proxy.newProxyInstance(Settings.class.getClassLoader(),
                 new Class<?>[] {Settings.class}, (proxy, method, args) -> switch (method.getName()) {
-                    case "choice" -> Livestock.COW.type();
-                    case "count" -> 8;
+                    case "choice" -> keeps.type();
+                    case "count" -> target;
                     case "flag" -> false;
                     default -> throw new AssertionError(method.getName());
                 });
@@ -395,16 +632,21 @@ public final class PastureBreedingGameTests {
         private FrontView front() {
             return (FrontView) Proxy.newProxyInstance(FrontView.class.getClassLoader(),
                 new Class<?>[] {FrontView.class}, (proxy, method, args) -> switch (method.getName()) {
-                    case "zonesIn" -> List.of(zone);
+                    case "zonesIn" -> registered ? List.of(zone) : List.of();
                     default -> throw new AssertionError(method.getName());
                 });
         }
 
         List<Node> nodes() {
+            return nodes(Herd.Job.FEED);
+        }
+
+        List<Node> nodes(Herd.Job job) {
             herd.begin();
             Herd.Tally tally = herd.reconcile(view(), front(), new ArrayList<>()).getFirst();
-            PenChores chores = new PenChores(tally.pen(), Herd.Job.FEED, () -> { }, made);
-            chores.settle(tally.pen(), tally.work().getOrDefault(Herd.Job.FEED, List.of()));
+            PenChores chores = new PenChores(tally.pen(), job, () -> { }, made,
+                level -> Pen.find(view(), front(), zone.id()));
+            chores.settle(tally.pen(), tally.work().getOrDefault(job, List.of()));
             List<Grown> goals = new ArrayList<>();
             chores.goals(level, goals);
             return goals.stream().flatMap(goal -> goal.nodes().stream()).toList();
