@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import net.minecraft.core.BlockPos;
 import net.minecraft.gametest.framework.GameTest;
@@ -485,6 +486,49 @@ public final class FillPlanGameTests {
             helper.getLevel().setBlock(cell.above(3), Blocks.STONE.defaultBlockState(), 3);
             plan.advance(new Ground.Budget(1, 0));
             helper.assertTrue(old.refusal(helper.getLevel()).isPresent(), "world changes revoke retained geometry before reuse");
+        }
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty_large", batch = "safe_fill_fallback", timeoutTicks = 100)
+    public static void aDifferentMaterialRebuildsItsFallbackAfterTheExitWatchChanges(GameTestHelper helper) {
+        floor(helper);
+        BlockPos cell = at(helper, 11, 1, 11);
+        Set<BlockPos> cells = Set.of(cell);
+        AtomicReference<List<BlockPos>> anchors = new AtomicReference<>(List.of(at(helper, 1, 1, 1)));
+        Mob builder = resident(helper, at(helper, 1, 1, 1));
+        Mob bystander = null;
+        SimpleContainer pack = new SimpleContainer(new ItemStack(Items.DIRT, 8));
+        BlockState predicted = Blocks.STONE.defaultBlockState();
+        try (FillPlan plan = new FillPlan(helper.getLevel(), UUID.randomUUID(), UUID.randomUUID(), cells,
+                anchors::get, () -> {}, false, new FillPlan.Limits(Integer.MAX_VALUE, 0))) {
+            plan.refresh(new Survey(helper.getLevel(), cells).fill(), Set.of(Job.keyOf(cell)), predicted);
+            plan.advance(Ground.Budget.unlimited());
+            Job first = plan.jobs().getFirst();
+            // The broad material prediction is stone, while the worker actually carries dirt. Prove
+            // that fallback, then fail only because this worker has not reached its work stance yet.
+            helper.assertTrue(Commit.run(helper.getLevel(), node(plan, first), worker(builder, pack)) instanceof Outcome.Failed,
+                "the first actual-material proof is cached without placing from beyond hand reach");
+            bystander = resident(helper, cell);
+            plan.refresh(new Survey(helper.getLevel(), cells).fill(), Set.of(Job.keyOf(cell)), predicted);
+            plan.advance(Ground.Budget.unlimited());
+            helper.assertTrue(plan.jobs().isEmpty(), "the new occupant withdraws this offered face");
+            anchors.set(List.of(at(helper, 22, 1, 22)));
+            bystander.discard();
+            plan.refresh(new Survey(helper.getLevel(), cells).fill(), Set.of(Job.keyOf(cell)), predicted);
+            plan.advance(Ground.Budget.unlimited());
+            Job next = plan.jobs().getFirst();
+            BlockPos feet = next.footings().cells().iterator().next().block(helper.getLevel());
+            builder.setPos(Vec3.atBottomCenterOf(feet));
+            helper.assertTrue(Commit.run(helper.getLevel(), node(plan, next), worker(builder, pack)) instanceof Outcome.Done,
+                "the same actual material rebuilds an expired fallback after reframing to a different exterior");
+            helper.assertTrue(pack.countItem(Items.DIRT) == 7 && helper.getLevel().getBlockState(cell).is(Blocks.DIRT),
+                "the rejected attempt refunds its block and the rebuilt proof spends exactly one");
+        } finally {
+            builder.discard();
+            if (bystander != null) {
+                bystander.discard();
+            }
         }
         helper.succeed();
     }

@@ -396,7 +396,9 @@ final class FillPlan implements AutoCloseable {
             // Material can be selected from a broad item filter. Its geometry must be proved too; retain
             // this work across retries instead of redoing a large remaining-work scan on every attempt.
             proof = commitProofs.computeIfAbsent(cell, any -> new Candidate(context, cell, block, List.of(), null));
-            if (!proof.block.equals(block)) {
+            if (!proof.block.equals(block) || !proof.source.valid()
+                    || !proof.source.exits.equals(context.exits)
+                    || proof.access != null && !proof.access.valid()) {
                 proof = new Candidate(context, cell, block, List.of(), null);
                 commitProofs.put(cell, proof);
             }
