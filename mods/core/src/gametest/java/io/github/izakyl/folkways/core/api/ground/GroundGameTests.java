@@ -8,6 +8,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicBoolean;
 import net.minecraft.core.BlockPos;
 import net.minecraft.gametest.framework.GameTest;
 import net.minecraft.gametest.framework.GameTestHelper;
@@ -201,6 +202,8 @@ public final class GroundGameTests {
             }
             helper.assertTrue(watch.stats().work() == work && watch.stats().sectionBuilds() == sections,
                 "the other thirty-seven bodies cause no repeated graph or section work");
+            helper.assertTrue(watch.stats().environmentScans() == 1,
+                "a batch of thirty-eight body views performs one environment scan, not one per body");
             Map<BlockPos, BlockState> trial = Map.of(at(helper, 10, 2, 7), STONE);
             Ground.Access a = first.with(trial).beginAccess(List.of(exit));
             Ground.Access b = watch.now(bodies.getLast()).with(trial).beginAccess(List.of(exit));
@@ -335,10 +338,12 @@ public final class GroundGameTests {
         try (Grounds.Watch watch = hallWatch(helper)) {
             Ground.Access open = watch.now(body).accessFrom(List.of(exit));
             barriers.set(List.of(AABB.encapsulatingFullBlocks(at(helper, 12, 1, 6), at(helper, 12, 2, 8))));
+            watch.refresh();
             Ground.Access shut = watch.now(body).accessFrom(List.of(exit));
             helper.assertTrue(!open.valid() && shut.distance(inside) < 0,
                 "a moving structure barrier invalidates and changes the graph without a block write");
             barriers.set(List.of());
+            watch.refresh();
             Ground.Access reopened = watch.now(body).accessFrom(List.of(exit));
             helper.assertTrue(reopened.distance(inside) > 0, "removing the moving barrier restores the route");
             Runnable keepout = Keepouts.install((level, x, y, z) -> level == helper.getLevel()
@@ -352,6 +357,49 @@ public final class GroundGameTests {
             }
             helper.assertTrue(watch.now(body).accessFrom(List.of(exit)).distance(inside) > 0,
                 "removing the rule invalidates its cached geometry too");
+        } finally {
+            remove.run();
+        }
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty_large", timeoutTicks = 100)
+    public static void aDynamicKeepoutRefreshInvalidatesADistantCompletedRoute(GameTestHelper helper) {
+        room(helper, 6, 8);
+        BlockPos exit = at(helper, 3, 1, 7);
+        BlockPos inside = at(helper, 20, 1, 7);
+        Mob body = walker(helper, inside);
+        AtomicBoolean pending = new AtomicBoolean();
+        Runnable remove = Keepouts.install(new Keepouts.Keepout() {
+            private boolean blocked;
+
+            @Override
+            public boolean forbids(net.minecraft.world.level.Level level, int x, int y, int z) {
+                return level == helper.getLevel() && blocked && x == at(helper, 12, 1, 7).getX();
+            }
+
+            @Override
+            public void refresh(net.minecraft.world.level.Level level) {
+                if (level == helper.getLevel() && blocked != pending.get()) {
+                    blocked = pending.get();
+                    Keepouts.changed();
+                }
+            }
+        });
+        try (Grounds.Watch watch = hallWatch(helper)) {
+            Ground.Access open = watch.now(body).accessFrom(List.of(exit));
+            helper.assertTrue(open.distance(inside) > 0, "the original distant route is open");
+            pending.set(true);
+            long revision = watch.revision();
+            watch.refresh();
+            helper.assertTrue(watch.revision() > revision && !open.valid(),
+                "a live batch refresh publishes a remote source change before reusing any completed graph");
+            helper.assertTrue(watch.now(body).accessFrom(List.of(exit)).distance(inside) < 0,
+                "a changed remote keepout blocks the route even though this body's origin remains outside it");
+            pending.set(false);
+            watch.refresh();
+            helper.assertTrue(watch.now(body).accessFrom(List.of(exit)).distance(inside) > 0,
+                "refreshing that same installed source can reopen the route too");
         } finally {
             remove.run();
         }

@@ -81,13 +81,17 @@ surveying and graph expansion consume it. Non-positive nanoseconds disable the t
 retains the synchronous `accessFrom` behavior. An unfinished proof is not a negative accessibility result.
 Use `Ground.prepare(feet, budget)` before a `standable` query that has not already been surveyed.
 
-Terrain writes, chunk availability, moving structure barriers and `Keepouts.install`/removal invalidate
-`Watch.revision()` and old proofs. A finished `Access` describes its captured movement profile even after
+Terrain writes, chunk availability, moving structure barriers and keepout changes invalidate
+`Watch.revision()` and old proofs. Dynamic keepout sources implement `Keepout.refresh(level)` and call
+`Keepouts.changed()` when their answers change; installing or removing a source also changes its revision.
+Call `Watch.refresh()` once when starting a batch of views, and again before an actual placement, to check
+same-tick environment changes. Ordinary body views reuse one environment scan per server tick.
+A finished `Access` describes its captured movement profile even after
 the original body moves; callers must also check `Ground.valid()` for current body capabilities and obtain
 a fresh body view before committing a placement. All world reads and final checks run on the server thread.
 Caches have fixed entry/cell bounds; eviction does not cancel retained searches, and closing clears lookup
 caches. `Watch.stats()` exposes cumulative requests, hits, section builds, work and invalidations plus
-current cache sizes without enabling chat logs.
+current cache sizes and environment-scan counts without enabling chat logs.
 
 ## Lifecycle and test ownership
 

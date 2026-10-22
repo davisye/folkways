@@ -21,8 +21,14 @@ public final class Grounds {
             return 0;
         }
 
+        // Force one live environment check for a batch of body views, especially before committing work.
+        // Ordinary now()/revision() calls reuse that check for the rest of this server tick.
+        default long refresh() {
+            return revision();
+        }
+
         default Stats stats() {
-            return new Stats(0, 0, 0, 0, 0, 0, 0, 0);
+            return new Stats(0, 0, 0, 0, 0, 0, 0, 0, 0);
         }
 
         @Override
@@ -31,7 +37,8 @@ public final class Grounds {
 
     // Cumulative counters and current bounded-cache sizes, suitable for profiling without debug chat.
     public record Stats(long accessRequests, long accessHits, long sectionBuilds, long work,
-                        long invalidations, int accessEntries, int geometryEntries, int cachedCells) {
+                        long invalidations, long environmentScans, int accessEntries, int geometryEntries,
+                        int cachedCells) {
     }
 
     public interface Source {

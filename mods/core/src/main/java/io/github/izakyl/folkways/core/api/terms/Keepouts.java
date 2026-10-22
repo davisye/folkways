@@ -12,6 +12,10 @@ public final class Keepouts {
 
     public interface Keepout {
         boolean forbids(Level level, int x, int y, int z);
+
+        // Dynamic sources refresh their geometry here, then call changed() if their answers changed.
+        default void refresh(Level level) {
+        }
     }
 
     private static final List<Keepout> SOURCES = new CopyOnWriteArrayList<>();
@@ -32,6 +36,16 @@ public final class Keepouts {
 
     public static long revision() {
         return REVISION.get();
+    }
+
+    public static void changed() {
+        REVISION.incrementAndGet();
+    }
+
+    public static void refresh(Level level) {
+        for (Keepout source : SOURCES) {
+            source.refresh(level);
+        }
     }
 
     public static boolean forbidden(Level level, int x, int y, int z) {

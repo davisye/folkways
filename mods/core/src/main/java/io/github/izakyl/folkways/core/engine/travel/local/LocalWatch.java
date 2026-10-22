@@ -46,6 +46,7 @@ final class LocalWatch implements Grounds.Watch {
     private long sectionBuilds;
     private long work;
     private long invalidations;
+    private long environmentScans;
 
     LocalWatch(ServerLevel level, BoundingBox box) {
         this.level = level;
@@ -154,15 +155,17 @@ final class LocalWatch implements Grounds.Watch {
         if (closed) {
             return;
         }
+        if (!force && checkedAt == level.getGameTime() && keepouts == Keepouts.revision()) {
+            return;
+        }
+        checkedAt = level.getGameTime();
+        Keepouts.refresh(level);
         long rules = Keepouts.revision();
         if (keepouts != rules) {
             keepouts = rules;
             invalidate(true);
         }
-        if (!force && checkedAt == level.getGameTime()) {
-            return;
-        }
-        checkedAt = level.getGameTime();
+        environmentScans++;
         LongOpenHashSet now = new LongOpenHashSet();
         for (int x = ((int) Math.floor(readArea.minX)) >> 4; x <= (((int) Math.ceil(readArea.maxX) - 1) >> 4); x++) {
             for (int z = ((int) Math.floor(readArea.minZ)) >> 4; z <= (((int) Math.ceil(readArea.maxZ) - 1) >> 4); z++) {
@@ -185,19 +188,25 @@ final class LocalWatch implements Grounds.Watch {
         return revision;
     }
 
+    @Override
+    public long refresh() {
+        environment(true);
+        return revision;
+    }
+
     boolean valid(long before) {
         return !closed && revision() == before;
     }
 
     @Override
     public Grounds.Stats stats() {
-        return new Grounds.Stats(accessRequests, accessHits, sectionBuilds, work, invalidations,
+        return new Grounds.Stats(accessRequests, accessHits, sectionBuilds, work, invalidations, environmentScans,
             accesses.size(), geometries.size(), accesses.values().stream().mapToInt(LocalAccess::visited).sum());
     }
 
     @Override
     public Ground now(Collection<Mob> walkers) {
-        environment(true);
+        environment(false);
         Map<Walker.Kind, Walker> kinds = new LinkedHashMap<>();
         List<Mob> bodies = new ArrayList<>();
         for (Mob body : walkers) {
@@ -215,7 +224,7 @@ final class LocalWatch implements Grounds.Watch {
         if (body instanceof Mob mob && body.getPose() != net.minecraft.world.entity.Pose.SLEEPING) {
             return now(List.of(mob));
         }
-        environment(true);
+        environment(false);
         return new LocalGround(this, Walker.of(body).stream().toList(),
             body instanceof Mob mob ? List.of(mob) : List.of(), Map.of());
     }
