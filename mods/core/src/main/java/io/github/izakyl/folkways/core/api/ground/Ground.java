@@ -31,4 +31,20 @@ public interface Ground {
     Collection<BlockPos> lostSince(Ground earlier);
 
     Ground with(Map<BlockPos, BlockState> changes);
+
+    // A proof of access to explicit exits, without treating a body's own position as an exit. Each step is
+    // traversable in both directions, so a worker can come to the work and leave it by the same passage.
+    Access accessFrom(Collection<BlockPos> exits);
+
+    interface Access {
+
+        // -1 means no route was proved within the watched, loaded ground and the search budget.
+        int distance(BlockPos feet);
+
+        List<BlockPos> path(BlockPos feet);
+
+        List<BlockPos> stancesFor(BlockPos target);
+
+        boolean canWorkFrom(BlockPos feet, BlockPos target);
+    }
 }

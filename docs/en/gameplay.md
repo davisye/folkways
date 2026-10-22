@@ -48,6 +48,29 @@ to a filter. A search saved as a filter rule uses IDs and tags; it does not use
 translated names or Pinyin. Its meaning therefore does not depend on a player's
 language or JEC settings.
 
+If residents stop working, enable **Debug logs** on the Colony Book's **Settings**
+page. Every ten seconds, your chat shows the current planning duration, idle
+residents, task counts, recent blockers and whether the route optimizer used its
+fallback. Blockers and task samples describe the last completed schedule; they can
+be older than the live resident counts while planning is busy. Only the player
+who enabled the option receives these messages. Closing the book keeps it enabled;
+disconnecting disables it.
+
+With the same option enabled, task interruptions, work and path failures, planning
+exceptions and optimizer fallbacks appear as they happen. Work messages identify
+the resident, task, position and target; pickup messages also name the dropped
+item and its entity ID. Interruptions name the preempting behavior and the observed
+combat target and recent damage source. These are clues, not proof of what triggered
+the behavior. Events cover the colony across dimensions. Repeats are grouped for
+five seconds and bursts are limited to four messages per two seconds; queued
+occurrences retain their counts, with an overflow summary for larger bursts.
+Turning the option off discards that reader's pending messages.
+
+Route optimization has a work budget and, in the normal planning mode, a
+100-millisecond deadline. If either is exhausted, the scheduler restores and
+publishes its initial valid assignment so residents can work while further
+improvement waits for another schedule.
+
 ## Food safety
 
 Residents skip food with any chance of a harmful status effect, including effects
@@ -76,6 +99,32 @@ neither Cookery nor a straw hat is required. When the Cookery extension is
 installed, its planting materials participate in the same reserve system.
 
 The creative supply box also belongs to Vanilla and works without Cookery.
+
+## Groundwork clearing
+
+Clearing follows support dependencies. Side attachments have first priority,
+followed by blocks that need support below or above, including falling blocks,
+then ordinary blocks. A support waits until its dependents have been removed;
+ordinary blocks still come down from the top. Residents check dependencies again
+before breaking a block, and return products directly through colony logistics.
+
+Clearing stays inside the marked box. Attachments outside it, or attachments the
+settings preserve, also prevent their supports from being removed. Adjust the box
+or remove those attachments first. Paired structures such as doors and beds must
+be entirely inside the selection. Ordinary clearing dismantles scaffolds one cell
+at a time, taking side decks before their supports to avoid a chain collapse.
+
+## Groundwork
+
+Fill works upwards in layers and advances from the deeper work towards its
+entrance. Builders keep a way out for residents and players, and keep unfinished
+work accessible. The passage moves onto completed ground as the fill rises;
+builders retreat along it and finish the last opening from a safe stance.
+
+If filling would block a passage, the zone waits and shows an access message.
+Residents standing in the last space receive a task to walk clear. Players and
+other bystanders must move themselves. Provide a usable path or steps to an
+external working area when a pit has no safe exit.
 
 ## Buildings
 

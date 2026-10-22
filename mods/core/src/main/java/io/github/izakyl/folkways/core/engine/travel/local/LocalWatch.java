@@ -13,6 +13,7 @@ import java.util.Map;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.level.levelgen.structure.BoundingBox;
 
 final class LocalWatch implements Grounds.Watch {
@@ -82,6 +83,13 @@ final class LocalWatch implements Grounds.Watch {
             Walker.of(body).ifPresent(walker -> kinds.putIfAbsent(walker.kind(), walker));
         }
         return new LocalGround(this, List.copyOf(kinds.values()), List.copyOf(bodies), Map.of());
+    }
+
+    @Override
+    public Ground now(LivingEntity body) {
+        return body instanceof Mob mob && body.getPose() != net.minecraft.world.entity.Pose.SLEEPING ? now(List.of(mob))
+            : new LocalGround(this, Walker.of(body).stream().toList(),
+                body instanceof Mob mob ? List.of(mob) : List.of(), Map.of());
     }
 
     @Override

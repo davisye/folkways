@@ -7,6 +7,7 @@ import io.github.izakyl.folkways.core.api.colony.Sweep;
 import io.github.izakyl.folkways.base.persist.Reader;
 import io.github.izakyl.folkways.base.persist.Writer;
 import io.github.izakyl.folkways.core.api.terms.Goods;
+import io.github.izakyl.folkways.core.api.terms.Reach;
 import io.github.izakyl.folkways.core.api.terms.ItemSpec;
 import io.github.izakyl.folkways.core.api.terms.WorldPos;
 import io.github.izakyl.folkways.core.api.work.Grown;
@@ -26,6 +27,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Predicate;
 import net.minecraft.core.BlockPos;
 import net.minecraft.nbt.CompoundTag;
@@ -42,6 +44,8 @@ import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.network.chat.Component;
 
 final class GroundPresence implements Facing {
 
@@ -57,6 +61,7 @@ final class GroundPresence implements Facing {
         private final Map<String, Chores> works = new LinkedHashMap<>();
         private Optional<ItemSpec> filling = Optional.empty();
         private Weeding weeding = new Weeding(false, false);
+        private FillPlan fillPlan;
 
         Site(UUID zone) {
             this.zone = zone;
@@ -69,6 +74,7 @@ final class GroundPresence implements Facing {
                 : Optional.empty();
             if (!with.equals(filling)) {
                 works.remove(GroundworkContent.FILL);
+                closeFill();
                 filling = with;
             }
             boolean grass = settings.flag(GroundworkContent.WEED);
@@ -135,7 +141,27 @@ final class GroundPresence implements Facing {
             }
             if (with.isPresent()) {
                 ItemSpec spec = with.get();
-                settle(GroundworkContent.FILL, (at, chore) -> new FillNode(chore, spec), fill);
+                if (discovering) {
+                    settle(GroundworkContent.FILL, (at, chore) -> {
+                        throw new IllegalStateException("discovery does not offer work");
+                    }, fill);
+                } else {
+                    if (fillPlan == null) {
+                        fillPlan = new FillPlan(level, zone, colony.id(), view.cells(),
+                            () -> colony.storesIn(level.dimension()).stream()
+                                .filter(at -> at.in(level) && at.sameRealm(WorldPos.of(level, view.cells().iterator().next())))
+                                .flatMap(at -> Reach.workableCells(level, at.block(level)).stream()).toList(),
+                            GroundPresence.this::fillChanged);
+                    }
+                    Set<String> wanted = new HashSet<>(targets.getOrDefault(GroundworkContent.FILL, Set.of()));
+                    Chores existing = works.get(GroundworkContent.FILL);
+                    if (existing != null) {
+                        wanted.removeAll(existing.spent());
+                    }
+                    FillPlan plan = fillPlan;
+                    List<Job> front = plan.refresh(fill, wanted, fillState(spec));
+                    settle(GroundworkContent.FILL, (at, chore) -> new FillNode(chore, spec, plan), front);
+                }
             }
             if (settings.flag(GroundworkContent.HAUL)) {
                 settle(GroundworkContent.HAUL, (at, chore) -> new HaulNode(at, chore), survey.haul(view::at));
@@ -181,6 +207,7 @@ final class GroundPresence implements Facing {
                 initialized.remove(this.zone);
                 targets.clear();
                 works.clear();
+                closeFill();
             }
             configuration = configured;
             discovering = true;
@@ -204,6 +231,16 @@ final class GroundPresence implements Facing {
 
         void goals(ServerLevel level, List<Grown> into) {
             works.values().forEach(chores -> chores.goals(level, into));
+            if (fillPlan != null) {
+                into.addAll(fillPlan.steppingAside());
+            }
+        }
+
+        void closeFill() {
+            if (fillPlan != null) {
+                fillPlan.close();
+                fillPlan = null;
+            }
         }
     }
 
@@ -234,6 +271,13 @@ final class GroundPresence implements Facing {
 
     private final PastDay made = new PastDay();
 
+    private final AtomicBoolean fillDirty = new AtomicBoolean();
+
+    private void fillChanged() {
+        fillDirty.set(true);
+        sweep.nudge();
+    }
+
     GroundPresence(Colony colony) {
         this.colony = colony;
         this.sweep = new Sweep(colony, GroundworkContent.ID, 100);
@@ -261,10 +305,21 @@ final class GroundPresence implements Facing {
 
     @Override
     public List<Line> zoneLines(ZoneView zone, ColonyView view) {
-        return zone.delegation().equals(GroundworkContent.ZONE) ? made.lines(zone, view) : List.of();
+        if (!zone.delegation().equals(GroundworkContent.ZONE)) {
+            return List.of();
+        }
+        List<Line> lines = new ArrayList<>(made.lines(zone, view));
+        Site site = sites.get(zone.id());
+        if (site != null && site.fillPlan != null && site.fillPlan.waiting()) {
+            lines.add(Line.text(Component.translatable("folkways.ground.fill.waiting_access")));
+        }
+        return List.copyOf(lines);
     }
 
     public void tick(MinecraftServer server) {
+        if (fillDirty.getAndSet(false)) {
+            refresh(server);
+        }
         sweep.tick(server, this::refresh, this::goals);
     }
 
@@ -285,13 +340,20 @@ final class GroundPresence implements Facing {
                 seen.add(zone.id());
             }
         }
-        sites.keySet().retainAll(seen);
+        sites.entrySet().removeIf(entry -> {
+            if (seen.contains(entry.getKey())) {
+                return false;
+            }
+            entry.getValue().closeFill();
+            return true;
+        });
         initialized.retainAll(seen);
         keepMade();
     }
 
     public void closed(Closing why) {
         keepMade();
+        sites.values().forEach(Site::closeFill);
         sites.clear();
         initialized.clear();
     }
@@ -321,5 +383,11 @@ final class GroundPresence implements Facing {
             site.goals(view.level(), goals);
         }
         return goals;
+    }
+
+    private static BlockState fillState(ItemSpec spec) {
+        return spec.item().map(BuiltInRegistries.ITEM::get).filter(BlockItem.class::isInstance)
+            .map(BlockItem.class::cast).map(item -> item.getBlock().defaultBlockState())
+            .orElse(Blocks.STONE.defaultBlockState());
     }
 }

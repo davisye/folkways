@@ -1,0 +1,471 @@
+package io.github.izakyl.folkways.plugins.groundwork;
+
+import io.github.izakyl.folkways.FolkwaysMod;
+import io.github.izakyl.folkways.core.api.resident.Resident;
+import io.github.izakyl.folkways.core.api.terms.ItemSpec;
+import io.github.izakyl.folkways.core.api.work.Grown;
+import io.github.izakyl.folkways.core.api.work.Node;
+import io.github.izakyl.folkways.core.api.work.Outcome;
+import io.github.izakyl.folkways.core.api.work.Placement;
+import io.github.izakyl.folkways.core.api.work.Worker;
+import io.github.izakyl.folkways.core.engine.labor.Commit;
+import io.github.izakyl.folkways.effect.Effects;
+import io.github.izakyl.folkways.front.api.PastDay;
+import io.github.izakyl.folkways.plugins.FolkwaysVanillaMod;
+import io.github.izakyl.folkways.plugins.person.PersonBody;
+import java.lang.reflect.Proxy;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.UUID;
+import java.util.stream.Collectors;
+import net.minecraft.core.BlockPos;
+import net.minecraft.gametest.framework.GameTest;
+import net.minecraft.gametest.framework.GameTestHelper;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.SimpleContainer;
+import net.minecraft.world.entity.Mob;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.Vec3;
+import net.neoforged.bus.api.SubscribeEvent;
+import net.neoforged.fml.common.EventBusSubscriber;
+import net.neoforged.neoforge.event.RegisterGameTestsEvent;
+import net.neoforged.neoforge.gametest.GameTestHolder;
+import net.neoforged.neoforge.gametest.PrefixGameTestTemplate;
+
+@EventBusSubscriber(modid = FolkwaysVanillaMod.ID, bus = EventBusSubscriber.Bus.MOD)
+@GameTestHolder(FolkwaysMod.MOD_ID)
+@PrefixGameTestTemplate(false)
+public final class FillPlanGameTests {
+
+    private static final BlockState DIRT = Blocks.DIRT.defaultBlockState();
+    private static final ItemSpec MATERIAL = ItemSpec.of(ResourceLocation.withDefaultNamespace("dirt"));
+
+    @SubscribeEvent
+    public static void register(RegisterGameTestsEvent event) {
+        event.register(FillPlanGameTests.class);
+    }
+
+    @GameTest(template = "empty_large", batch = "safe_fill", timeoutTicks = 100)
+    public static void aTunnelIsFilledFromItsFarEndAndTheLastGapCloses(GameTestHelper helper) {
+        floor(helper);
+        tunnel(helper, 7, 15, false);
+        Set<BlockPos> cells = box(at(helper, 7, 1, 10), at(helper, 15, 2, 10));
+        UUID colony = UUID.randomUUID();
+        Mob worker = resident(helper, at(helper, 5, 1, 10));
+        ((io.github.izakyl.folkways.core.api.resident.body.Body) worker).joinColony(colony);
+        SimpleContainer pack = new SimpleContainer(new ItemStack(Items.DIRT, 64));
+        try (FillPlan plan = plan(helper, colony, cells)) {
+            List<Job> first = refresh(plan, helper, cells);
+            helper.assertTrue(!first.isEmpty() && first.stream().allMatch(job -> job.cell().getX() >= at(helper, 12, 1, 10).getX()),
+                "only a work band at the deep end opens first, got " + first.stream().map(Job::cell).toList());
+            for (int attempt = 0; attempt < cells.size() * 3 && cells.stream().anyMatch(cell -> Survey.open(helper.getLevel().getBlockState(cell))); attempt++) {
+                List<Job> jobs = refresh(plan, helper, cells);
+                if (jobs.isEmpty() && !plan.steppingAside().isEmpty()) {
+                    Node move = plan.steppingAside().getFirst().nodes().getFirst();
+                    BlockPos target = move.spec().stances().cells().iterator().next().block(helper.getLevel());
+                    worker.setPos(Vec3.atBottomCenterOf(target));
+                    helper.assertTrue(Commit.run(helper.getLevel(), move, worker(worker, pack)) instanceof Outcome.Done,
+                        "the builder can walk back through the retained passage");
+                    continue;
+                }
+                helper.assertTrue(!jobs.isEmpty(), "the retained passage can be filled by retreating: attempt " + attempt);
+                Job job = jobs.getFirst();
+                BlockPos stance = job.footings().cells().stream().map(at -> at.block(helper.getLevel()))
+                    .min(Comparator.comparingDouble(feet -> feet.distSqr(worker.blockPosition()))).orElseThrow();
+                worker.setPos(Vec3.atBottomCenterOf(stance));
+                Outcome result = Commit.run(helper.getLevel(), node(plan, job), worker(worker, pack));
+                helper.assertTrue(result instanceof Outcome.Done, "a safe step commits, got " + result);
+                helper.assertTrue(!worker.isInWall(), "the builder is never buried by its own work");
+            }
+            helper.assertTrue(cells.stream().allMatch(cell -> helper.getLevel().getBlockState(cell).is(Blocks.DIRT)),
+                "every layer, including the access passage, is filled");
+            helper.assertTrue(pack.countItem(Items.DIRT) == 64 - cells.size(), "exactly one block is spent per cell");
+        } finally {
+            worker.discard();
+        }
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty_large", batch = "safe_fill", timeoutTicks = 100)
+    public static void theSecondOfTwoExitClosuresChecksTheFirstPlacement(GameTestHelper helper) {
+        floor(helper);
+        tunnel(helper, 7, 15, true);
+        BlockPos west = at(helper, 6, 1, 10);
+        BlockPos east = at(helper, 16, 1, 10);
+        Set<BlockPos> cells = Set.of(west, east);
+        Mob inside = resident(helper, at(helper, 11, 1, 10));
+        Mob builder = resident(helper, at(helper, 5, 1, 10));
+        SimpleContainer pack = new SimpleContainer(new ItemStack(Items.DIRT, 8));
+        try (FillPlan plan = plan(helper, UUID.randomUUID(), cells)) {
+            List<Job> jobs = refresh(plan, helper, cells);
+            helper.assertTrue(jobs.size() == 2, "each of the two exits is safe when the other remains open");
+            Node closeWest = node(plan, jobs.stream().filter(job -> job.cell().equals(west)).findFirst().orElseThrow());
+            Node closeEast = node(plan, jobs.stream().filter(job -> job.cell().equals(east)).findFirst().orElseThrow());
+            helper.assertTrue(Commit.run(helper.getLevel(), closeWest, worker(builder, pack)) instanceof Outcome.Done,
+                "the first door is filled while the other is open");
+            builder.setPos(Vec3.atBottomCenterOf(at(helper, 17, 1, 10)));
+            helper.assertTrue(Commit.run(helper.getLevel(), closeEast, worker(builder, pack)) instanceof Outcome.Failed,
+                "the other already-offered job cannot close the last exit around the bystander");
+            helper.assertTrue(helper.getLevel().getBlockState(east).isAir() && pack.countItem(Items.DIRT) == 7,
+                "the refused placement changes no block and returns its material");
+        } finally {
+            inside.discard();
+            builder.discard();
+        }
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty_large", batch = "safe_fill", timeoutTicks = 100)
+    public static void aBystanderEnteringAfterPlanningKeepsTheLastExitOpen(GameTestHelper helper) {
+        floor(helper);
+        tunnel(helper, 7, 11, false);
+        BlockPos mouth = at(helper, 6, 2, 10);
+        Set<BlockPos> cells = Set.of(mouth);
+        Mob builder = resident(helper, at(helper, 5, 1, 10));
+        Mob bystander = null;
+        SimpleContainer pack = new SimpleContainer(new ItemStack(Items.DIRT, 8));
+        try (FillPlan plan = plan(helper, UUID.randomUUID(), cells)) {
+            Job job = refresh(plan, helper, cells).getFirst();
+            Node seal = node(plan, job);
+            bystander = resident(helper, at(helper, 10, 1, 10));
+            helper.assertTrue(Commit.run(helper.getLevel(), seal, worker(builder, pack)) instanceof Outcome.Failed,
+                "a new bystander is protected even though the seal was planned before it entered");
+            helper.assertTrue(pack.countItem(Items.DIRT) == 8 && helper.getLevel().getBlockState(mouth).isAir(),
+                "the seal waits without using material");
+            bystander.setPos(Vec3.atBottomCenterOf(at(helper, 4, 1, 10)));
+            helper.assertTrue(Commit.run(helper.getLevel(), seal, worker(builder, pack)) instanceof Outcome.Done,
+                "the same pending seal succeeds once everyone is outside");
+        } finally {
+            if (bystander != null) {
+                bystander.discard();
+            }
+            builder.discard();
+        }
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty_large", batch = "safe_fill", timeoutTicks = 100)
+    public static void anIdleResidentGetsARealWalkOutOfTheLastFillCell(GameTestHelper helper) {
+        floor(helper);
+        UUID colony = UUID.randomUUID();
+        BlockPos cell = at(helper, 11, 1, 11);
+        Mob body = resident(helper, cell);
+        ((io.github.izakyl.folkways.core.api.resident.body.Body) body).joinColony(colony);
+        FillPlan plan = plan(helper, colony, Set.of(cell));
+        try {
+            helper.assertTrue(refresh(plan, helper, Set.of(cell)).isEmpty(), "a cell occupied by the resident waits");
+            List<Grown> moves = plan.steppingAside();
+            helper.assertTrue(moves.size() == 1, "the idle resident is asked to step aside instead of waiting forever");
+            Node move = moves.getFirst().nodes().getFirst();
+            helper.assertTrue(move.worker().filter(body.getUUID()::equals).isPresent(), "only this resident takes the move");
+            BlockPos target = move.spec().stances().cells().iterator().next().block(helper.getLevel());
+            helper.assertTrue(!target.equals(cell) && plan.safeDestination(body, target), "the destination is outside the pending fill");
+            body.setNoAi(false);
+            helper.assertTrue(body.getNavigation().moveTo(target.getX() + 0.5D, target.getY(), target.getZ() + 0.5D, 1.0D),
+                "normal navigation can take the resident to the aside stance");
+            helper.runAtTickTime(40, () -> {
+                try {
+                    helper.assertTrue(plan.clearOfFill(body), "walking actually clears the last pending cell");
+                    helper.assertTrue(Commit.run(helper.getLevel(), move,
+                        worker(body, new SimpleContainer())) instanceof Outcome.Done, "the walking task finishes");
+                    helper.assertTrue(!refresh(plan, helper, Set.of(cell)).isEmpty(), "the final fill is now available");
+                    helper.succeed();
+                } finally {
+                    plan.close();
+                    body.discard();
+                }
+            });
+        } catch (RuntimeException failure) {
+            plan.close();
+            body.discard();
+            throw failure;
+        }
+    }
+
+    @GameTest(template = "empty_large", batch = "safe_fill", timeoutTicks = 100)
+    public static void unfinishedWorkKeepsItsEntranceEvenWithoutAnybodyInside(GameTestHelper helper) {
+        floor(helper);
+        tunnel(helper, 7, 15, false);
+        BlockPos mouth = at(helper, 6, 1, 10);
+        BlockPos deep = at(helper, 14, 1, 10);
+        Set<BlockPos> cells = Set.of(mouth, deep);
+        try (FillPlan plan = plan(helper, UUID.randomUUID(), cells)) {
+            List<Job> jobs = refresh(plan, helper, cells);
+            helper.assertTrue(jobs.stream().noneMatch(job -> job.cell().equals(mouth))
+                    && jobs.stream().anyMatch(job -> job.cell().equals(deep)),
+                "the empty inner room stays accessible until its distant work is done");
+        }
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty_large", batch = "safe_fill", timeoutTicks = 100)
+    public static void aRaisedWorkFaceProvidesTheNextLayersStances(GameTestHelper helper) {
+        floor(helper);
+        Set<BlockPos> cells = box(at(helper, 9, 1, 9), at(helper, 12, 3, 12));
+        Mob builder = resident(helper, at(helper, 8, 1, 8));
+        UUID colony = UUID.randomUUID();
+        ((io.github.izakyl.folkways.core.api.resident.body.Body) builder).joinColony(colony);
+        SimpleContainer pack = new SimpleContainer(new ItemStack(Items.DIRT, 64));
+        try (FillPlan plan = plan(helper, colony, cells)) {
+            for (int attempt = 0; attempt < cells.size() * 2 && cells.stream().anyMatch(cell -> Survey.open(helper.getLevel().getBlockState(cell))); attempt++) {
+                List<Job> jobs = refresh(plan, helper, cells);
+                if (jobs.isEmpty() && !plan.steppingAside().isEmpty()) {
+                    Node move = plan.steppingAside().getFirst().nodes().getFirst();
+                    BlockPos target = move.spec().stances().cells().iterator().next().block(helper.getLevel());
+                    builder.setPos(Vec3.atBottomCenterOf(target));
+                    helper.assertTrue(Commit.run(helper.getLevel(), move, worker(builder, pack)) instanceof Outcome.Done,
+                        "the builder can retreat from the raised face");
+                    continue;
+                }
+                helper.assertTrue(!jobs.isEmpty(), "each raised layer has a safe next step at " + attempt
+                    + ", body=" + builder.position() + ", left=" + cells.stream()
+                        .filter(cell -> Survey.open(helper.getLevel().getBlockState(cell))).toList());
+                Job job = jobs.getFirst();
+                BlockPos stance = job.footings().cells().iterator().next().block(helper.getLevel());
+                builder.setPos(Vec3.atBottomCenterOf(stance));
+                helper.assertTrue(Commit.run(helper.getLevel(), node(plan, job), worker(builder, pack)) instanceof Outcome.Done,
+                    "filling can move its escape route onto completed ground");
+            }
+            helper.assertTrue(cells.stream().allMatch(cell -> helper.getLevel().getBlockState(cell).is(Blocks.DIRT)),
+                "no permanently reserved access column remains");
+        } finally {
+            builder.discard();
+        }
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty_large", batch = "safe_fill", timeoutTicks = 100)
+    public static void aBlockedLargePartDoesNotHideAnIndependentFill(GameTestHelper helper) {
+        floor(helper);
+        for (BlockPos cell : box(at(helper, 2, 1, 4), at(helper, 18, 3, 14))) {
+            helper.getLevel().setBlock(cell, Blocks.STONE.defaultBlockState(), 3);
+        }
+        List<BlockPos> path = new ArrayList<>();
+        for (int row = 0; row < 5; row++) {
+            int z = 5 + row * 2;
+            for (int step = 0; step < 15; step++) {
+                path.add(at(helper, row % 2 == 0 ? 3 + step : 17 - step, 1, z));
+            }
+            if (row < 4) {
+                path.add(at(helper, row % 2 == 0 ? 17 : 3, 1, z + 1));
+            }
+        }
+        Set<BlockPos> cells = new LinkedHashSet<>(path);
+        for (BlockPos cell : path) {
+            helper.getLevel().setBlock(cell, Blocks.AIR.defaultBlockState(), 3);
+            helper.getLevel().setBlock(cell.above(), Blocks.AIR.defaultBlockState(), 3);
+        }
+        helper.getLevel().setBlock(at(helper, 2, 1, 5), Blocks.AIR.defaultBlockState(), 3);
+        helper.getLevel().setBlock(at(helper, 2, 2, 5), Blocks.AIR.defaultBlockState(), 3);
+        BlockPos free = at(helper, 20, 1, 19);
+        cells.add(free);
+        Mob bystander = resident(helper, path.getLast());
+        try (FillPlan plan = plan(helper, UUID.randomUUID(), cells)) {
+            List<Job> jobs = refresh(plan, helper, cells);
+            helper.assertTrue(path.size() > 64 && jobs.stream().anyMatch(job -> job.cell().equals(free)),
+                "more than a trial budget of blocked work cannot starve an independent part");
+            helper.assertTrue(jobs.stream().noneMatch(job -> path.contains(job.cell())),
+                "the bystander's only passage stays open");
+        } finally {
+            bystander.discard();
+        }
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty_large", batch = "safe_fill", timeoutTicks = 100)
+    public static void aRemovedPlanRefusesItsAlreadyClaimedWorkAndReturnsTheBlock(GameTestHelper helper) {
+        floor(helper);
+        BlockPos cell = at(helper, 11, 1, 11);
+        Mob builder = resident(helper, at(helper, 10, 1, 10));
+        SimpleContainer pack = new SimpleContainer(new ItemStack(Items.DIRT, 8));
+        FillPlan plan = plan(helper, UUID.randomUUID(), Set.of(cell));
+        try {
+            Node node = node(plan, refresh(plan, helper, Set.of(cell)).getFirst());
+            node.planned(helper.getLevel());
+            plan.close();
+            helper.assertTrue(Commit.run(helper.getLevel(), node, worker(builder, pack)) instanceof Outcome.Failed,
+                "a node kept by an old worker cannot place after its plan was removed");
+            helper.assertTrue(pack.countItem(Items.DIRT) == 8 && helper.getLevel().getBlockState(cell).isAir(),
+                "the stale task changes nothing and returns its block");
+        } finally {
+            plan.close();
+            builder.discard();
+        }
+        helper.succeed();
+    }
+
+    private static FillPlan plan(GameTestHelper helper, UUID colony, Set<BlockPos> cells) {
+        return new FillPlan(helper.getLevel(), UUID.randomUUID(), colony, cells,
+            () -> List.of(at(helper, 1, 1, 1)), () -> {});
+    }
+
+    @GameTest(template = "empty_large", batch = "safe_fill", timeoutTicks = 100)
+    public static void aBodyOverhangingTheLastCellAlsoStepsAside(GameTestHelper helper) {
+        floor(helper);
+        BlockPos cell = at(helper, 11, 1, 11);
+        UUID colony = UUID.randomUUID();
+        Mob builder = resident(helper, at(helper, 10, 1, 11));
+        builder.setPos(cell.getX() - 0.15D, cell.getY(), cell.getZ() + 0.5D);
+        ((io.github.izakyl.folkways.core.api.resident.body.Body) builder).joinColony(colony);
+        SimpleContainer pack = new SimpleContainer(new ItemStack(Items.DIRT, 8));
+        try (FillPlan plan = plan(helper, colony, Set.of(cell))) {
+            List<Job> waiting = refresh(plan, helper, Set.of(cell));
+            helper.assertTrue(!builder.blockPosition().equals(cell) && !plan.clearOfFill(builder),
+                "the feet are outside the target but the body crosses its edge");
+            helper.assertTrue(waiting.isEmpty(), "the overlapping body blocks the last cell");
+            helper.assertTrue(plan.steppingAside().size() == 1,
+                "edge overlap also asks the resident to walk clear");
+            Node move = plan.steppingAside().getFirst().nodes().getFirst();
+            BlockPos target = move.spec().stances().cells().iterator().next().block(helper.getLevel());
+            builder.setPos(Vec3.atBottomCenterOf(target));
+            helper.assertTrue(Commit.run(helper.getLevel(), move, worker(builder, pack)) instanceof Outcome.Done,
+                "walking clear completes the aside task");
+            Job job = refresh(plan, helper, Set.of(cell)).getFirst();
+            BlockPos stance = job.footings().cells().iterator().next().block(helper.getLevel());
+            builder.setPos(Vec3.atBottomCenterOf(stance));
+            helper.assertTrue(Commit.run(helper.getLevel(), node(plan, job), worker(builder, pack)) instanceof Outcome.Done,
+                "the last cell is filled after the body has cleared it");
+        } finally {
+            builder.discard();
+        }
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty_large", batch = "safe_fill", timeoutTicks = 100)
+    public static void arrivingAtTheEdgeOfAStanceStillLeavesTheBlockInReach(GameTestHelper helper) {
+        floor(helper);
+        BlockPos cell = at(helper, 11, 1, 11);
+        Mob builder = resident(helper, at(helper, 9, 1, 9));
+        SimpleContainer pack = new SimpleContainer(new ItemStack(Items.DIRT, 8));
+        try (FillPlan plan = plan(helper, UUID.randomUUID(), Set.of(cell))) {
+            Job job = refresh(plan, helper, Set.of(cell)).getFirst();
+            BlockPos feet = job.footings().cells().stream().map(at -> at.block(helper.getLevel()))
+                .max(Comparator.comparingDouble(at -> at.distSqr(cell))).orElseThrow();
+            Vec3 centered = Vec3.atBottomCenterOf(feet);
+            Vec3 away = centered.subtract(Vec3.atBottomCenterOf(cell)).multiply(1, 0, 1).normalize().scale(0.85D);
+            builder.setPos(centered.add(away));
+            helper.assertTrue(Commit.run(helper.getLevel(), node(plan, job), worker(builder, pack)) instanceof Outcome.Done,
+                "the navigation arrival tolerance cannot strand a task just beyond actual hand reach");
+            helper.assertTrue(helper.getLevel().getBlockState(cell).is(Blocks.DIRT), "the work actually places its block");
+        } finally {
+            builder.discard();
+        }
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty_large", batch = "safe_fill", timeoutTicks = 100)
+    public static void arrivingAtAPitsLipStillUsesTheValidWorkStance(GameTestHelper helper) {
+        floor(helper);
+        BlockPos cell = at(helper, 11, 0, 11);
+        helper.getLevel().setBlock(cell, Blocks.AIR.defaultBlockState(), 3);
+        Mob builder = resident(helper, at(helper, 9, 1, 9));
+        SimpleContainer pack = new SimpleContainer(new ItemStack(Items.DIRT, 8));
+        try (FillPlan plan = plan(helper, UUID.randomUUID(), Set.of(cell))) {
+            Job job = refresh(plan, helper, Set.of(cell)).getFirst();
+            BlockPos feet = job.footings().cells().stream().map(at -> at.block(helper.getLevel()))
+                .max(Comparator.comparingDouble(at -> at.distSqr(cell))).orElseThrow();
+            Vec3 centered = Vec3.atBottomCenterOf(feet);
+            Vec3 away = centered.subtract(Vec3.atBottomCenterOf(cell)).multiply(1, 0, 1).normalize().scale(0.85D);
+            builder.setPos(centered.add(away));
+            helper.assertTrue(Commit.run(helper.getLevel(), node(plan, job), worker(builder, pack)) instanceof Outcome.Done,
+                "stopping within the valid work stance still fills the pit without refusing the same task forever");
+            helper.assertTrue(helper.getLevel().getBlockState(cell).is(Blocks.DIRT), "the lower cell really is filled");
+        } finally {
+            builder.discard();
+        }
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty_large", batch = "safe_fill", timeoutTicks = 100)
+    public static void anotherActiveFillCannotSupplyATrustedExit(GameTestHelper helper) {
+        floor(helper);
+        BlockPos cell = at(helper, 11, 1, 11);
+        FillPlan neighbouring = plan(helper, UUID.randomUUID(), Set.of(at(helper, 1, 1, 1)));
+        try (FillPlan own = plan(helper, UUID.randomUUID(), Set.of(cell))) {
+            helper.assertTrue(refresh(own, helper, Set.of(cell)).isEmpty(),
+                "a neighbouring colony's pending fill cannot be treated as a permanent exit");
+            neighbouring.close();
+            helper.assertTrue(!refresh(own, helper, Set.of(cell)).isEmpty(),
+                "removing that fill releases the outside stance for a fresh proof");
+        } finally {
+            neighbouring.close();
+        }
+        helper.succeed();
+    }
+
+    private static List<Job> refresh(FillPlan plan, GameTestHelper helper, Set<BlockPos> cells) {
+        return plan.refresh(new Survey(helper.getLevel(), cells).fill(),
+            cells.stream().map(Job::keyOf).collect(Collectors.toSet()), DIRT);
+    }
+
+    private static Node node(FillPlan plan, Job job) {
+        Chores chores = new Chores(UUID.randomUUID(), "fill", (level, chore) -> new FillNode(chore, MATERIAL, plan),
+            () -> {}, new PastDay());
+        return new FillNode(new Chores.Chore(UUID.randomUUID(), job, chores), MATERIAL, plan);
+    }
+
+    private static Worker worker(Mob body, SimpleContainer pack) {
+        return (Worker) Proxy.newProxyInstance(FillPlanGameTests.class.getClassLoader(), new Class<?>[] {Worker.class},
+            (proxy, method, args) -> switch (method.getName()) {
+                case "body" -> body;
+                case "pack" -> pack;
+                case "resident" -> new Resident(body.getUUID(), PersonBody.ID);
+                case "effects" -> Effects.NONE;
+                case "placement" -> Placement.NOWHERE;
+                case "held" -> ItemStack.EMPTY;
+                case "within", "route", "supplied" -> List.of();
+                default -> null;
+            });
+    }
+
+    private static Mob resident(GameTestHelper helper, BlockPos feet) {
+        Mob body = PersonBody.RESIDENT.get().create(helper.getLevel());
+        body.setPos(Vec3.atBottomCenterOf(feet));
+        body.setOnGround(true);
+        io.github.izakyl.folkways.plugins.person.walk.Walking.INSTANCE.fit(body);
+        body.setNoAi(true);
+        helper.getLevel().addFreshEntity(body);
+        return body;
+    }
+
+    private static Set<BlockPos> box(BlockPos min, BlockPos max) {
+        Set<BlockPos> cells = new LinkedHashSet<>();
+        BlockPos.betweenClosed(min, max).forEach(cell -> cells.add(cell.immutable()));
+        return cells;
+    }
+
+    private static void floor(GameTestHelper helper) {
+        for (int x = 0; x <= 23; x++) {
+            for (int z = 0; z <= 23; z++) {
+                for (int y = 0; y <= 5; y++) {
+                    helper.getLevel().setBlock(at(helper, x, y, z),
+                        y == 0 ? Blocks.STONE.defaultBlockState() : Blocks.AIR.defaultBlockState(), 3);
+                }
+            }
+        }
+    }
+
+    private static void tunnel(GameTestHelper helper, int from, int to, boolean bothEnds) {
+        ServerLevel level = helper.getLevel();
+        for (int x = from - 1; x <= to + 1; x++) {
+            for (int z = 9; z <= 11; z++) {
+                for (int y = 1; y <= 3; y++) {
+                    if (y == 3 || z != 10 || x == to + 1 && !bothEnds) {
+                        level.setBlock(at(helper, x, y, z), Blocks.STONE.defaultBlockState(), 3);
+                    }
+                }
+            }
+        }
+    }
+
+    private static BlockPos at(GameTestHelper helper, int x, int y, int z) {
+        return helper.absolutePos(new BlockPos(x, y, z));
+    }
+}

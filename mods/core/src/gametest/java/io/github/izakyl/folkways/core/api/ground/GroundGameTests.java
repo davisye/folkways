@@ -13,6 +13,7 @@ import net.minecraft.world.entity.Mob;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.levelgen.structure.BoundingBox;
+import net.minecraft.world.phys.Vec3;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.event.RegisterGameTestsEvent;
@@ -77,10 +78,89 @@ public final class GroundGameTests {
         }
     }
 
+    @GameTest(template = "empty_large", timeoutTicks = 100)
+    public static void anOccupiedSealedRoomIsNotAnExit(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        room(helper, 6, 8);
+        BlockPos exit = at(helper, 3, 1, 7);
+        BlockPos inside = at(helper, 20, 1, 7);
+        Mob body = walker(helper, inside);
+        try (Grounds.Watch watch = Grounds.watch(level, BoundingBox.fromCorners(at(helper, 2, 0, 5), at(helper, 21, 3, 9)))) {
+            Ground ground = watch.now(List.of(body));
+            Ground.Access before = ground.accessFrom(List.of(exit));
+            helper.assertTrue(before.distance(inside) > 0 && before.path(inside).getLast().equals(exit),
+                "a route is proved to the actual exit");
+            Map<BlockPos, BlockState> wall = new HashMap<>();
+            for (int z = 6; z <= 8; z++) {
+                wall.put(at(helper, 12, 1, z), STONE);
+                wall.put(at(helper, 12, 2, z), STONE);
+            }
+            Ground trial = ground.with(wall);
+            helper.assertTrue(trial.reachable(inside), "the ordinary survey still starts from the body inside");
+            helper.assertTrue(trial.accessFrom(List.of(exit)).distance(inside) < 0,
+                "the body's own position cannot make a sealed room a way out");
+            helper.assertTrue(ground.accessFrom(List.of()).distance(inside) < 0,
+                "a survey without a confirmed exit proves no escape");
+            helper.assertTrue(before.distance(inside) > 0, "a virtual closure leaves the original proof alone");
+        }
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty_large", timeoutTicks = 100)
+    public static void playerEscapeUsesThePlayersHeight(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        room(helper, 6, 8);
+        BlockPos exit = at(helper, 3, 1, 7);
+        BlockPos inside = at(helper, 20, 1, 7);
+        var player = net.neoforged.neoforge.common.util.FakePlayerFactory.getMinecraft(level);
+        player.setPos(Vec3.atBottomCenterOf(inside));
+        try (Grounds.Watch watch = Grounds.watch(level, BoundingBox.fromCorners(at(helper, 2, 0, 5), at(helper, 21, 3, 9)))) {
+            Ground ground = watch.now(player);
+            helper.assertTrue(ground.accessFrom(List.of(exit)).distance(inside) >= 0,
+                "a player fits in the original two-high hall");
+            Map<BlockPos, BlockState> beam = new HashMap<>();
+            for (int z = 6; z <= 8; z++) {
+                beam.put(at(helper, 12, 2, z), STONE);
+            }
+            helper.assertTrue(ground.with(beam).accessFrom(List.of(exit)).distance(inside) < 0,
+                "a one-high gap does not count as an escape for a standing player");
+            Ground pig = watch.now(List.of(walker(helper, inside)));
+            helper.assertTrue(pig.with(beam).accessFrom(List.of(exit)).distance(inside) >= 0,
+                "the same gap really is walkable for a smaller body");
+        }
+        helper.succeed();
+    }
+
     private static Mob walker(GameTestHelper helper, BlockPos feet) {
         Mob body = EntityType.PIG.create(helper.getLevel());
         body.moveTo(feet.getX() + 0.5D, feet.getY(), feet.getZ() + 0.5D);
         return body;
+    }
+
+    @GameTest(template = "empty_large", timeoutTicks = 100)
+    public static void aSleepingBodyNeedsAnExitItCanUseAfterWaking(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        room(helper, 6, 8);
+        BlockPos exit = at(helper, 3, 1, 7);
+        BlockPos inside = at(helper, 20, 1, 7);
+        Mob body = EntityType.VILLAGER.create(level);
+        body.setPos(Vec3.atBottomCenterOf(inside));
+        body.setPose(net.minecraft.world.entity.Pose.SLEEPING);
+        body.refreshDimensions();
+        helper.assertTrue(body.getBbHeight() < 1.0F, "the resting body is physically shorter than the gap");
+        try (Grounds.Watch watch = Grounds.watch(level, BoundingBox.fromCorners(at(helper, 2, 0, 5), at(helper, 21, 3, 9)))) {
+            Ground ground = watch.now(body);
+            helper.assertTrue(ground.accessFrom(List.of(exit)).distance(inside) >= 0, "the original hall has a usable exit");
+            Map<BlockPos, BlockState> beam = new HashMap<>();
+            for (int z = 6; z <= 8; z++) {
+                beam.put(at(helper, 12, 2, z), STONE);
+            }
+            helper.assertTrue(ground.with(beam).accessFrom(List.of(exit)).distance(inside) < 0,
+                "a gap only the sleeping pose fits is not a way out after waking");
+            helper.assertTrue(body.getPose() == net.minecraft.world.entity.Pose.SLEEPING && body.getBbHeight() < 1.0F,
+                "the proof neither wakes nor resizes the real body");
+        }
+        helper.succeed();
     }
 
     private static BlockPos at(GameTestHelper helper, int x, int y, int z) {

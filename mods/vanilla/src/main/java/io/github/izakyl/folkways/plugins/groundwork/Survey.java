@@ -57,10 +57,12 @@ final class Survey {
     private final ServerLevel level;
     private final Set<BlockPos> cells;
     private final Map<BlockPos, Boolean> footed = new HashMap<>();
+    private final ClearOrder clearing;
 
     Survey(ServerLevel level, Set<BlockPos> cells) {
         this.level = level;
         this.cells = cells;
+        this.clearing = new ClearOrder(level);
     }
 
     List<Job> clear(Predicate<BlockPos> member) {
@@ -68,19 +70,47 @@ final class Survey {
     }
 
     // Every block in the box goes, but a colony's own blocks, liquids, what no hand breaks and what the zone keeps.
-    // A cell waits for the one over it, and nobody digs out the block they stand on. A cell other work of the zone
-    // has taken is left to it, and what lies under it waits for that work too.
+    // Attachments go first and their supports wait. Ordinary cells still go top down, and nobody digs out the
+    // block they stand on. A cell other work has taken is left to it, including any supports it still needs.
     List<Job> clear(Predicate<BlockPos> member, Predicate<BlockState> kept, Set<BlockPos> claimed) {
         Predicate<BlockPos> wanted = toClear(member, kept);
         List<Job> jobs = new ArrayList<>();
+        Set<BlockPos> grouped = new HashSet<>();
         for (BlockPos cell : sorted(DOWNWARD)) {
-            if (!wanted.test(cell) || claimed.contains(cell)
-                || !discovering && cells.contains(cell.above()) && wanted.test(cell.above())) {
+            if (!wanted.test(cell) || claimed.contains(cell) || grouped.contains(cell)) {
                 continue;
             }
-            stances(cell, Set.of(cell.above())).ifPresent(where -> jobs.add(Job.at(cell, site(cell), where)));
+            List<BlockPos> parts = ClearOrder.parts(level, cell);
+            boolean whole = parts.stream().allMatch(part -> cells.contains(part) && wanted.test(part)
+                && !claimed.contains(part));
+            if (!whole && !discovering) {
+                continue;
+            }
+            // Keep blocked work in the initial target snapshot so the zone cannot complete around it.
+            if (!whole) {
+                parts = List.of(cell);
+            }
+            grouped.addAll(parts);
+            BlockPos anchor = parts.getFirst();
+            Set<BlockPos> own = Set.copyOf(parts);
+            if (!discovering && (clearing.blocked(parts)
+                    || clearing.priority(parts) == ClearOrder.ORDINARY && parts.stream().anyMatch(part ->
+                        cells.contains(part.above()) && !own.contains(part.above()) && wanted.test(part.above())))) {
+                continue;
+            }
+            Set<BlockPos> barred = new HashSet<>(parts);
+            parts.forEach(part -> barred.add(part.above()));
+            List<BlockPos> affected = parts;
+            stances(anchor, barred).ifPresent(where -> jobs.add(new Job(Job.keyOf(anchor), site(anchor), anchor,
+                affected, List.of(), where)));
         }
-        return jobs;
+        if (discovering || jobs.isEmpty()) {
+            return jobs;
+        }
+        // The planner may reorder independent jobs. Offer only the highest executable tier, rather than relying
+        // on list order to make side attachments precede vertical dependents and then ordinary clearing.
+        int first = jobs.stream().mapToInt(job -> clearing.priority(job.cells())).min().orElse(ClearOrder.ORDINARY);
+        return jobs.stream().filter(job -> clearing.priority(job.cells()) == first).toList();
     }
 
     List<Job> fill() {

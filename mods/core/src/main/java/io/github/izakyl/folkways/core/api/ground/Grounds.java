@@ -3,6 +3,7 @@ package io.github.izakyl.folkways.core.api.ground;
 import java.util.Collection;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.level.levelgen.structure.BoundingBox;
 
 public final class Grounds {
@@ -10,6 +11,9 @@ public final class Grounds {
     public interface Watch extends AutoCloseable {
 
         Ground now(Collection<Mob> walkers);
+
+        // Survey one body's dimensions and locomotion, including a player who may need a way out of a work site.
+        Ground now(LivingEntity walker);
 
         @Override
         void close();
