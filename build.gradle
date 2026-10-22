@@ -4,6 +4,12 @@ plugins {
 
 // The root builds no mod of its own: it hosts the modules needed by each GameTest suite.
 
+ext.buildChannel = providers.gradleProperty("buildChannel").getOrElse("release")
+if (!(buildChannel in ["release", "nightly"])) {
+    throw new GradleException("Unknown buildChannel '${buildChannel}'; choose release or nightly")
+}
+ext.nightlyBuild = buildChannel == "nightly"
+
 def modProjects = [
     folkways_core: ":core",
     folkways_vanilla: ":vanilla",
@@ -33,6 +39,15 @@ repositories {
     maven { url = "https://libraries.minecraft.net/" }
     maven { url = "https://maven.createmod.net" }
     maven { url = "https://maven.firstdark.dev/snapshots" }
+}
+
+if (nightlyBuild) {
+    repositories {
+        exclusiveContent {
+            forRepository { maven { url = "https://api.modrinth.com/maven" } }
+            filter { includeModule("maven.modrinth", "spark") }
+        }
+    }
 }
 
 java {
@@ -96,6 +111,7 @@ dependencies {
         }
     }
     runtimeOnly ldlib2Coordinate
+    if (nightlyBuild) { runtimeOnly "maven.modrinth:spark:${project.spark_version}" }
     runtimeOnly core.lib("create")
     if (cookeryTests) { runtimeOnly core.lib("kaleidoscope_cookery") }
     additionalRuntimeClasspath("com.eed3si9n.starlark:starlark:${project.starlark_version}") {
@@ -117,7 +133,7 @@ tasks.named("jar") {
 }
 
 // Every mod's jar into build/libs, where the e2e instances find them.
-def collectJars = tasks.register("collectJars", Copy) {
+def collectJars = tasks.register("collectJars", Sync) {
     modProjects.values().each { path -> from(project(path).tasks.named("jar")) }
     into layout.buildDirectory.dir("libs")
 }

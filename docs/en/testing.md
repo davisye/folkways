@@ -15,6 +15,47 @@ Complete the [development setup](../../CONTRIBUTING.md#development-setup) first.
 | `./gradlew check`         | Module checks, game test source compilation, and checks for tabs and trailing whitespace; does not launch game tests |
 | `./gradlew build`         | Gradle checks, jar packaging and collection                                                                          |
 
+## Nightly diagnostics
+
+`./gradlew build` produces Release jars. `./gradlew -PbuildChannel=nightly build`
+produces jars with a `-nightly` version suffix. CI builds and checks both channels;
+its GameTests and client smoke test run the Nightly channel. The Nightly release
+publishes only that channel's jars. Switching channels also clears the previous
+channel's collected jars from `build/libs/`.
+
+Nightly Core includes the unmodified [Spark NeoForge 1.21.1 build](https://modrinth.com/mod/spark/version/1.10.124-neoforge-1.21.1)
+as a Jar-in-Jar mod. It enables background CPU sampling for both the server and
+client, at Spark's default 10 ms interval. Planning heartbeat logs default to on.
+Release Core does not bundle Spark or enable its profiler, and new Release
+server configs default to disabled heartbeat logs. Existing user preferences
+take priority in both channels.
+
+After reproducing a slowdown, save the server profile locally with
+`/spark profiler stop --save-to-file`; for rendering stalls use
+`/sparkc profiler stop --save-to-file`. The files are written under
+`config/spark/`. Use `profiler info` on either command to inspect sampling status,
+and `profiler start` to begin another recording. Bare `profiler open` or
+`profiler stop` uploads profiling data to Spark's viewer; automatic background
+sampling does not upload a profile.
+
+To opt out of Nightly background sampling, set `backgroundProfiler` to `false`
+in `config/spark/config.json`, or launch Java with `-Dspark.backgroundProfiler=false`
+or `SPARK_BACKGROUNDPROFILER=false`. A saved `diagnostics.logPlanHeartbeat`
+preference in `folkways_core-server.toml` controls the heartbeat log separately.
+Per-player chat diagnostics remain opt-in. A separately installed Spark mod
+keeps its own settings when using Release.
+
+Use Java 21's JFR for deeper investigations of allocations, GC pauses or locks;
+start a short recording when needed. Nightly does not start a second continuous
+JFR recording alongside Spark. Spark's native async profiler supports Linux and
+macOS; on Windows its Java sampler provides CPU stack samples. See
+[Spark commands](https://spark.lucko.me/docs/Command-Usage) and
+[profiler engines](https://spark.lucko.me/docs/misc/Using-async-profiler).
+
+`./gradlew :core:checkDiagnostics :core:verifyDiagnostics` checks the selected
+channel's defaults, opt-outs and packaged profiler checksum without launching
+Minecraft. Both checks are included in `build`.
+
 ## NeoForge GameTests
 
 Choose a test owner and environment:

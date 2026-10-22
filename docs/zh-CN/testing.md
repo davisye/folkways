@@ -15,6 +15,39 @@
 | `./gradlew check`         | 各模组检查、游戏测试源码编译，以及制表符和行尾空白检查；不启动游戏测试 |
 | `./gradlew build`         | Gradle 检查、jar 打包与汇总                                            |
 
+## Nightly 诊断工具
+
+`./gradlew build` 生成 Release；`./gradlew -PbuildChannel=nightly build`
+生成版本号带 `-nightly` 的测试版。CI 会构建并检查两个渠道，游戏测试及客户端冒烟测试
+使用 Nightly。Nightly 发布只取对应渠道的包。切换渠道时，`build/libs/` 中上个渠道
+收集的包会被清理，避免混用。
+
+Nightly Core 内置未修改的 [Spark NeoForge 1.21.1 版本](https://modrinth.com/mod/spark/version/1.10.124-neoforge-1.21.1)，
+启动后默认对服务器和客户端进行后台 CPU 采样，采用 Spark 默认的 10 毫秒间隔。
+调度心跳日志也默认开启。Release 不内置或启动 Spark，新建服务器配置的心跳日志默认
+关闭。两个渠道都保留用户已保存的设置。
+
+复现卡顿后，执行 `/spark profiler stop --save-to-file` 保存服务器采样；
+画面卡顿则使用 `/sparkc profiler stop --save-to-file`。文件保存在 `config/spark/`。
+两个命令均可用 `profiler info` 查看状态，用 `profiler start` 开始下一轮采样。
+直接执行 `profiler open` 或不带 `--save-to-file` 的 `profiler stop` 会上传数据至
+Spark 查看器；后台采样本身不会上传分析报告。
+
+要关闭 Nightly 自动采样，在 `config/spark/config.json` 中设置
+`"backgroundProfiler": false`，或通过 Java 参数 `-Dspark.backgroundProfiler=false`
+或环境变量 `SPARK_BACKGROUNDPROFILER=false` 关闭。心跳日志单独由
+`folkways_core-server.toml` 的 `diagnostics.logPlanHeartbeat` 控制。
+个人聊天诊断仍需自行开启。在 Release 中自行安装的 Spark 使用它自己的设置。
+
+需要分析对象分配、GC 停顿或锁等待时，再使用 Java 21 自带的 JFR 短时采集。
+Nightly 不会在 Spark 之外再常驻一套 JFR 录制。Spark 的原生 async profiler 支持
+Linux 和 macOS；Windows 使用 Java 采样器采集 CPU 调用栈。详见
+[Spark 命令说明](https://spark.lucko.me/docs/Command-Usage)和
+[采样引擎说明](https://spark.lucko.me/docs/misc/Using-async-profiler)。
+
+`./gradlew :core:checkDiagnostics :core:verifyDiagnostics` 可在不启动 Minecraft 的情况下
+检查所选渠道的默认行为、关闭设置及包内分析器的校验和。`build` 已包含这两项检查。
+
 ## NeoForge GameTests
 
 选择测试所属模组和运行环境：

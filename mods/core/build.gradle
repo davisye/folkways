@@ -8,10 +8,94 @@ ext.modId = "folkways_core"
 ext.modName = "folkways-core"
 apply from: rootProject.file("gradle/mod.gradle")
 
+if (rootProject.nightlyBuild) {
+    repositories {
+        exclusiveContent {
+            forRepository { maven { url = "https://api.modrinth.com/maven" } }
+            filter { includeModule("maven.modrinth", "spark") }
+        }
+    }
+    dependencies {
+        jarJar("maven.modrinth:spark") {
+            version {
+                strictly "[${project.spark_version}]"
+                prefer project.spark_version
+            }
+            transitive = false
+        }
+    }
+    sourceSets.main.resources.srcDir("src/nightly/resources")
+}
+
+tasks.named("processResources") {
+    inputs.property("buildChannel", rootProject.buildChannel)
+    filesMatching("META-INF/folkways/build.properties") {
+        expand(build_channel: rootProject.buildChannel)
+    }
+}
+
+// Check the jar itself: a cached Nightly dependency must never leak into a Release.
+tasks.register("verifyDiagnostics") {
+    group = "verification"
+    dependsOn tasks.named("jar")
+    inputs.file(tasks.named("jar", Jar).flatMap { it.archiveFile })
+    inputs.property("buildChannel", rootProject.buildChannel)
+    inputs.property("sparkSha512", project.spark_sha512)
+    doLast {
+        def archive = tasks.named("jar", Jar).get().archiveFile.get().asFile
+        def contents = zipTree(archive)
+        def info = new Properties()
+        contents.matching { include "META-INF/folkways/build.properties" }.singleFile.withInputStream { info.load(it) }
+        if (info.getProperty("channel") != rootProject.buildChannel) {
+            throw new GradleException("Wrong diagnostic channel in ${archive.name}")
+        }
+        def metadata = new groovy.json.JsonSlurper().parse(
+            contents.matching { include "META-INF/jarjar/metadata.json" }.singleFile)
+        def profiler = metadata.jars.findAll { it.identifier.artifact == "spark" }
+        if (profiler.size() != (rootProject.nightlyBuild ? 1 : 0)) {
+            throw new GradleException("Unexpected Spark dependency in ${archive.name}")
+        }
+        if (rootProject.nightlyBuild) {
+            def nested = contents.matching { include profiler.first().path }.singleFile
+            def hash = java.security.MessageDigest.getInstance("SHA-512").digest(nested.bytes).encodeHex().toString()
+            if (hash != project.spark_sha512) {
+                throw new GradleException("Spark checksum mismatch in ${archive.name}")
+            }
+            contents.matching { include "META-INF/LICENSE_spark.txt" }.singleFile
+            contents.matching { include "META-INF/NOTICE_spark.txt" }.singleFile
+        } else if (!contents.matching {
+            include "META-INF/jarjar/*spark*.jar", "me/lucko/spark/**"
+            include "META-INF/LICENSE_spark.txt", "META-INF/NOTICE_spark.txt"
+        }.isEmpty()) {
+            throw new GradleException("Nightly profiler files leaked into ${archive.name}")
+        }
+        logger.lifecycle("Verified ${rootProject.buildChannel} diagnostics in ${archive.name}")
+    }
+}
+
 // Shared helpers stay in the core module to retain access to package-private planning internals.
 // They contain no test registration, so consumers never load the core test suite to reuse them.
 sourceSets {
     gameTestFixtures
+    diagnosticsTest {
+        compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
+        runtimeClasspath += sourceSets.main.output + sourceSets.main.runtimeClasspath
+    }
+}
+
+tasks.register("checkDiagnostics", JavaExec) {
+    group = "verification"
+    classpath = sourceSets.diagnosticsTest.runtimeClasspath
+    mainClass = "io.github.izakyl.folkways.DiagnosticsCheck"
+    javaLauncher = javaToolchains.launcherFor {
+        languageVersion = JavaLanguageVersion.of(project.java_release.toInteger())
+    }
+    args rootProject.buildChannel
+    environment.remove("SPARK_BACKGROUNDPROFILER")
+}
+
+tasks.named("check") {
+    dependsOn "verifyDiagnostics", "checkDiagnostics"
 }
 
 neoForge {
