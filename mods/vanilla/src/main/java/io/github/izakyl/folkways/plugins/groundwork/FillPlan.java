@@ -122,6 +122,7 @@ final class FillPlan implements AutoCloseable {
     private BlockState material;
     private Planning planning;
     private Context context;
+    private boolean reconsider;
     private final Map<BlockPos, Candidate> proofs = new HashMap<>();
     private final Map<BlockPos, Candidate> commitProofs = new HashMap<>();
     private final Set<BlockPos> proving = new HashSet<>();
@@ -194,8 +195,12 @@ final class FillPlan implements AutoCloseable {
         inputs = List.copyOf(jobs);
         wanted = Set.copyOf(desired);
         material = block;
-        if (different || planning == null || planning.done) {
+        if (different || planning == null) {
             restart();
+        } else if (planning.done) {
+            // A normal sweep is not a revocation. Workers may still be walking to this valid face;
+            // keep its offers and proofs while a new people snapshot is considered in the background.
+            reconsider = true;
         }
         return jobs();
     }
@@ -234,6 +239,22 @@ final class FillPlan implements AutoCloseable {
         if (context != null && !context.valid()) {
             restart();
         }
+        if (reconsider) {
+            if (!context.advance(budget) || budget.exhausted()) {
+                return false;
+            }
+            // With no offered work, discover newly available anchors as well (for example another
+            // colony withdrawing a fill which had excluded our only exterior). A live offered face
+            // retains its exact exit geometry and its caches while workers approach it.
+            Context next = offered.isEmpty() ? new Context() : context.withPeople();
+            if (!next.valid()) {
+                restart();
+            } else {
+                context = next;
+                planning = new Planning(context);
+                reconsider = false;
+            }
+        }
         if (planning == null) {
             return false;
         }
@@ -251,6 +272,7 @@ final class FillPlan implements AutoCloseable {
         provingDestinations.clear();
         context = new Context();
         planning = new Planning(context);
+        reconsider = false;
         offered = Map.of();
         steppingAside = List.of();
         phase = Phase.WAITING;
@@ -310,6 +332,10 @@ final class FillPlan implements AutoCloseable {
                     proving.remove(cell);
                     if (answer.isPresent()) {
                         commitRefused++;
+                        if (answer.get() == GroundRefusal.FILL_ACCESS_BLOCKED && offered.containsKey(cell)) {
+                            reconsider = true;
+                            changed.run();
+                        }
                     } else {
                         commitProved++;
                     }
@@ -365,7 +391,8 @@ final class FillPlan implements AutoCloseable {
             return Optional.of(GroundRefusal.FILL_ACCESS_BLOCKED);
         }
         Candidate proof = proofs.get(cell);
-        if (proof == null || !proof.block.equals(block)) {
+        if (proof == null || !proof.block.equals(block) || !proof.source.valid() || !proof.access.valid()
+                || !proof.source.exits.equals(context.exits)) {
             // Material can be selected from a broad item filter. Its geometry must be proved too; retain
             // this work across retries instead of redoing a large remaining-work scan on every attempt.
             proof = commitProofs.computeIfAbsent(cell, any -> new Candidate(context, cell, block, List.of(), null));
@@ -453,7 +480,10 @@ final class FillPlan implements AutoCloseable {
         return missesPending(body.getBoundingBox().move(here.subtract(body.position())));
     }
 
-    void movedAside() {
+    void movedAside(UUID resident) {
+        steppingAside = steppingAside.stream().filter(move -> move.nodes().stream()
+            .noneMatch(node -> node.worker().filter(resident::equals).isPresent())).toList();
+        reconsider = true;
         changed.run();
     }
 
@@ -466,6 +496,7 @@ final class FillPlan implements AutoCloseable {
         final List<LivingEntity> people;
         final Candidate geometry;
         final List<AABB> shape;
+        final List<Job> jobs;
         View before;
         Ground after;
         Ground.Access access;
@@ -485,6 +516,7 @@ final class FillPlan implements AutoCloseable {
             this.block = block;
             this.people = people;
             this.geometry = geometry;
+            jobs = remaining;
             shape = block.getCollisionShape(level, cell).move(cell.getX(), cell.getY(), cell.getZ()).toAabbs();
         }
 
@@ -624,11 +656,11 @@ final class FillPlan implements AutoCloseable {
                         }
                     }
                     case 9 -> {
-                        if (job == remaining.size()) {
+                        if (job == jobs.size()) {
                             stage++;
                             continue;
                         }
-                        Job next = remaining.get(job++);
+                        Job next = jobs.get(job++);
                         if (next.cell().equals(cell) || !pending.contains(next.cell())
                                 || !Survey.open(level.getBlockState(next.cell()))) {
                             continue;
@@ -772,6 +804,9 @@ final class FillPlan implements AutoCloseable {
             .thenComparingLong(rank -> rank.job().cell().asLong()));
         final Map<Integer, Part> byPart = new LinkedHashMap<>();
         final List<Part> candidates = new ArrayList<>();
+        final Set<BlockPos> rejected = new HashSet<>();
+        final List<Job> inputJobs = inputs;
+        final Set<String> targetKeys = wanted;
         Iterator<BlockPos> cellsLeft = cells.iterator();
         Iterator<BlockPos> seeds;
         Iterator<BlockPos> path;
@@ -809,7 +844,7 @@ final class FillPlan implements AutoCloseable {
                         }
                         if (cellsLeft.hasNext()) {
                             BlockPos cell = cellsLeft.next();
-                            if (wanted.contains(Job.keyOf(cell)) && Survey.open(level.getBlockState(cell))) {
+                            if (targetKeys.contains(Job.keyOf(cell)) && Survey.open(level.getBlockState(cell))) {
                                 left.add(cell);
                             }
                         } else {
@@ -821,8 +856,8 @@ final class FillPlan implements AutoCloseable {
                         if (!budget.tryStep()) {
                             return;
                         }
-                        if (job < inputs.size()) {
-                            Job next = inputs.get(job++);
+                        if (job < inputJobs.size()) {
+                            Job next = inputJobs.get(job++);
                             if (pending.contains(next.cell())) {
                                 jobs.add(next);
                             }
@@ -999,6 +1034,7 @@ final class FillPlan implements AutoCloseable {
 
         final class Publication {
             final Iterator<Part> groups = candidates.iterator();
+            final Iterator<Job> previous = offered.values().iterator();
             final Map<BlockPos, Job> next = new LinkedHashMap<>();
             final Set<Integer> active = new HashSet<>();
             Iterator<Job> jobs = Collections.emptyIterator();
@@ -1007,7 +1043,17 @@ final class FillPlan implements AutoCloseable {
 
             boolean advance(Ground.Budget budget) {
                 while (budget.tryStep()) {
-                    if (jobs.hasNext()) {
+                    if (previous.hasNext()) {
+                        Job job = previous.next();
+                        if (pending.contains(job.cell()) && !rejected.contains(job.cell())) {
+                            next.put(job.cell(), job);
+                            Integer part = parts.get(job.cell());
+                            if (part != null) {
+                                active.add(part);
+                            }
+                            closing &= job.footings().cells().stream().noneMatch(at -> cells.contains(at.block(level)));
+                        }
+                    } else if (jobs.hasNext()) {
                         Job job = jobs.next();
                         next.put(job.cell(), job);
                         closing &= job.footings().cells().stream().noneMatch(at -> cells.contains(at.block(level)));
@@ -1075,6 +1121,9 @@ final class FillPlan implements AutoCloseable {
                             Stances.of(level, trial.stands).orElseThrow()));
                         published = true;
                     }
+                } else {
+                    // Only a new counterexample may revoke an otherwise unchanged offered face.
+                    rejected.add(next.job().cell());
                 }
                 trial = null;
                 tried++;
@@ -1235,6 +1284,8 @@ final class FillPlan implements AutoCloseable {
             exits = earlier.exits;
             ports = earlier.ports;
             portsDone = earlier.portsDone;
+            perimeter = earlier.perimeter;
+            edges = earlier.edges;
             source = earlier.source;
             revision = earlier.revision;
             liveRevision = earlier.liveRevision;
@@ -1483,6 +1534,7 @@ final class FillPlan implements AutoCloseable {
         remaining = List.of();
         wanted = Set.of();
         material = null;
+        reconsider = false;
         pending.clear();
         Map<UUID, Allowance> allowances = ALLOWANCES.get(level);
         if (allowances != null) {

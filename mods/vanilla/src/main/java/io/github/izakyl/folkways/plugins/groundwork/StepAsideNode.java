@@ -53,7 +53,7 @@ final class StepAsideNode implements Node {
         if (!plan.safeDestination(who.body(), target) || !plan.clearOfFill(who.body())) {
             return Outcome.failed(GroundRefusal.FILL_ACCESS_CHANGED);
         }
-        plan.movedAside();
+        plan.movedAside(resident);
         return Outcome.done();
     }
 

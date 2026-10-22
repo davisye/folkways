@@ -428,6 +428,67 @@ public final class FillPlanGameTests {
         helper.succeed();
     }
 
+    @GameTest(template = "empty_large", batch = "safe_fill_retention", timeoutTicks = 500)
+    public static void ordinarySweepsKeepAnOfferWhileItsWorkerIsStillOnTheWay(GameTestHelper helper) {
+        floor(helper);
+        BlockPos cell = at(helper, 18, 1, 18);
+        Set<BlockPos> cells = Set.of(cell);
+        Mob builder = resident(helper, at(helper, 1, 1, 1));
+        SimpleContainer pack = new SimpleContainer(new ItemStack(Items.DIRT, 8));
+        FillPlan plan = plan(helper, UUID.randomUUID(), cells);
+        Job job = refresh(plan, helper, cells).getFirst();
+        Node held = node(plan, job);
+        held.planned(helper.getLevel());
+        int[] ticks = {0};
+        helper.onEachTick(() -> {
+            if (++ticks[0] > 250) {
+                return;
+            }
+            if (ticks[0] % 100 == 0) {
+                plan.refresh(new Survey(helper.getLevel(), cells).fill(), Set.of(Job.keyOf(cell)), DIRT);
+                helper.assertTrue(held.refusal(helper.getLevel()).isEmpty(),
+                    "a normal sweep cannot revoke the valid node before its worker arrives");
+            }
+            // Replanning can need many more ticks than the next sweep. Every intermediate publication
+            // must preserve the old proof too, not just the first call that starts this new round.
+            plan.advance(new Ground.Budget(1, 0));
+            helper.assertTrue(held.refusal(helper.getLevel()).isEmpty(), "a suspended round keeps the worker's offer");
+        });
+        helper.runAtTickTime(251, () -> {
+            try {
+                BlockPos feet = job.footings().cells().iterator().next().block(helper.getLevel());
+                builder.setPos(Vec3.atBottomCenterOf(feet));
+                helper.assertTrue(Commit.run(helper.getLevel(), held, worker(builder, pack)) instanceof Outcome.Done,
+                    "the original claimed node still commits after multiple ordinary sweeps");
+                helper.assertTrue(pack.countItem(Items.DIRT) == 7, "the delayed work spends exactly one block");
+                helper.succeed();
+            } finally {
+                plan.close();
+                builder.discard();
+            }
+        });
+    }
+
+    @GameTest(template = "empty_large", batch = "safe_fill_invalidation", timeoutTicks = 100)
+    public static void changedInputsAndTerrainStillRevokeRetainedOffers(GameTestHelper helper) {
+        floor(helper);
+        BlockPos cell = at(helper, 11, 1, 11);
+        Set<BlockPos> cells = Set.of(cell);
+        try (FillPlan plan = plan(helper, UUID.randomUUID(), cells)) {
+            Node old = node(plan, refresh(plan, helper, cells).getFirst());
+            plan.refresh(new Survey(helper.getLevel(), cells).fill(), Set.of(), DIRT);
+            helper.assertTrue(old.refusal(helper.getLevel()).isPresent(), "removing the target revokes the old offer");
+            refresh(plan, helper, cells);
+            plan.refresh(new Survey(helper.getLevel(), cells).fill(), Set.of(Job.keyOf(cell)), Blocks.STONE.defaultBlockState());
+            helper.assertTrue(old.refusal(helper.getLevel()).isPresent(), "changing material revokes its old proof");
+            refresh(plan, helper, cells);
+            helper.getLevel().setBlock(cell.above(3), Blocks.STONE.defaultBlockState(), 3);
+            plan.advance(new Ground.Budget(1, 0));
+            helper.assertTrue(old.refusal(helper.getLevel()).isPresent(), "world changes revoke retained geometry before reuse");
+        }
+        helper.succeed();
+    }
+
     private static FillPlan plan(GameTestHelper helper, UUID colony, Set<BlockPos> cells) {
         return new FillPlan(helper.getLevel(), UUID.randomUUID(), colony, cells,
             () -> List.of(at(helper, 1, 1, 1)), () -> {}, false,
