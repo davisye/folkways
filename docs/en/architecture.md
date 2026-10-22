@@ -73,6 +73,8 @@ so client language and optional integrations cannot change server filtering.
 `Ground.beginAccess(exits)` share surveyed sections and search results only when locomotion, entity type,
 dimensions, step/fall limits, fire immunity, rail/keepout permissions and path maluses agree. Virtual block
 overlays and exit sets are part of the cache key. `Ground.with(changes)` leaves the real world unchanged.
+Rail-origin permissions also include the exact origin; rail overlays conservatively isolate origins.
+Custom locomotions are isolated per body until they can declare all evaluator-dependent capabilities.
 
 Advance an `Access` with one `Ground.Budget` shared by all planning loops in that colony tick. Both section
 surveying and graph expansion consume it. Non-positive nanoseconds disable the time limit; `unlimited()`

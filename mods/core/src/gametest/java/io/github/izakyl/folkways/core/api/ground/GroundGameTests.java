@@ -387,6 +387,36 @@ public final class GroundGameTests {
         helper.succeed();
     }
 
+    @GameTest(template = "empty_large", timeoutTicks = 100)
+    public static void railOriginRulesKeepPositionDependentGraphsSeparate(GameTestHelper helper) {
+        room(helper, 6, 8);
+        BlockPos exit = at(helper, 3, 1, 7);
+        BlockPos inside = at(helper, 20, 1, 7);
+        helper.getLevel().setBlock(exit, Blocks.RAIL.defaultBlockState(), 3);
+        helper.getLevel().setBlock(inside, Blocks.RAIL.defaultBlockState(), 3);
+        Mob first = walker(helper, inside);
+        Mob second = walker(helper, exit);
+        try (Grounds.Watch watch = hallWatch(helper)) {
+            Ground a = watch.now(first);
+            Ground.Access fromInsideRail = a.beginAccess(List.of(exit));
+            Ground.Access fromExitRail = watch.now(second).beginAccess(List.of(exit));
+            helper.assertTrue(fromInsideRail != fromExitRail,
+                "rail permissions read the local region around the exact origin, not just an on-rail boolean");
+            first.setPos(Vec3.atBottomCenterOf(exit));
+            helper.assertTrue(!a.valid() && watch.now(first).beginAccess(List.of(exit)) == fromExitRail,
+                "moving between rail origins renews the capability view and selects the matching graph");
+            Mob left = walker(helper, at(helper, 6, 1, 7));
+            Mob right = walker(helper, at(helper, 18, 1, 7));
+            Map<BlockPos, BlockState> rail = Map.of(at(helper, 10, 1, 7), Blocks.RAIL.defaultBlockState());
+            Ground virtual = watch.now(left).with(rail);
+            helper.assertTrue(virtual.beginAccess(List.of(exit)) != watch.now(right).with(rail).beginAccess(List.of(exit)),
+                "a rail overlay conservatively keeps different origins separate too");
+            left.setPos(Vec3.atBottomCenterOf(at(helper, 7, 1, 7)));
+            helper.assertTrue(!virtual.valid(), "moving with a rail overlay invalidates that position-dependent view");
+        }
+        helper.succeed();
+    }
+
     private static int drain(GameTestHelper helper, Ground.Access access, int work) {
         int slices = 0;
         while (!access.complete() && slices++ < 200000) {

@@ -8,6 +8,9 @@ import io.github.izakyl.folkways.core.api.terms.Keepouts;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
+import javax.annotation.Nullable;
+import net.minecraft.core.BlockPos;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.entity.Mob;
@@ -32,13 +35,15 @@ record Walker(Kind kind, Locomotion locomotion, Mob body, LivingEntity source) {
         return kind.width() == Float.floatToIntBits(dimensions.width())
             && kind.height() == Float.floatToIntBits(dimensions.height())
             && kind.onRail() == Kind.onRail(source)
+            && (kind.railOrigin() == null || kind.railOrigin().equals(source.blockPosition()))
             && kind.inKeepout() == Keepouts.forbidden(source.level(), source.blockPosition());
     }
 
     // Evaluators read more than the entity's class or size. In particular rail/keepout permissions depend
     // on the origin, while step height, falls, fire immunity and maluses may differ between two villagers.
     record Kind(ResourceLocation locomotion, EntityType<?> type, int width, int height, int step, int fall,
-                boolean fireImmune, boolean onRail, boolean inKeepout, List<Integer> maluses) {
+                boolean fireImmune, boolean onRail, @Nullable BlockPos railOrigin, boolean inKeepout,
+                List<Integer> maluses, @Nullable UUID individual) {
 
         private static final PathType[] PATH_TYPES = PathType.values();
 
@@ -47,10 +52,12 @@ record Walker(Kind kind, Locomotion locomotion, Mob body, LivingEntity source) {
             for (PathType type : PATH_TYPES) {
                 maluses.add(Float.floatToIntBits(body.getPathfindingMalus(type)));
             }
+            boolean rail = onRail(body);
             return new Kind(locomotion.id(), body.getType(), Float.floatToIntBits(body.getBbWidth()),
                 Float.floatToIntBits(body.getBbHeight()), Float.floatToIntBits(body.maxUpStep()),
-                body.getMaxFallDistance(), body.fireImmune(), onRail(body),
-                Keepouts.forbidden(body.level(), body.blockPosition()), List.copyOf(maluses));
+                body.getMaxFallDistance(), body.fireImmune(), rail, rail ? body.blockPosition().immutable() : null,
+                Keepouts.forbidden(body.level(), body.blockPosition()), List.copyOf(maluses),
+                locomotion.id().equals(Locomotions.WALKING) ? null : body.getUUID());
         }
 
         boolean matches(Mob body) {
@@ -58,6 +65,8 @@ record Walker(Kind kind, Locomotion locomotion, Mob body, LivingEntity source) {
                     || height != Float.floatToIntBits(body.getBbHeight())
                     || step != Float.floatToIntBits(body.maxUpStep()) || fall != body.getMaxFallDistance()
                     || fireImmune != body.fireImmune() || onRail != onRail(body)
+                    || railOrigin != null && !railOrigin.equals(body.blockPosition())
+                    || individual != null && !individual.equals(body.getUUID())
                     || inKeepout != Keepouts.forbidden(body.level(), body.blockPosition())) {
                 return false;
             }

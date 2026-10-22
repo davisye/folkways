@@ -14,6 +14,7 @@ import java.util.Map;
 import javax.annotation.Nullable;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.level.ChunkPos;
@@ -90,7 +91,7 @@ final class LocalWatch implements Grounds.Watch {
     }
 
     Geometry geometry(Walker walker, Map<BlockPos, BlockState> changes) {
-        GeometryKey key = new GeometryKey(walker.kind(), changes);
+        GeometryKey key = new GeometryKey(walker.kind(), changes, railOverlayOrigin(walker, changes));
         Geometry found = geometries.computeIfAbsent(key, ignored -> new Geometry(walker, changes));
         trim(geometries, MOST_GEOMETRIES);
         return found;
@@ -101,7 +102,8 @@ final class LocalWatch implements Grounds.Watch {
         accessRequests++;
         List<BlockPos> sorted = exits.stream().map(BlockPos::immutable).distinct()
             .sorted(BlockPos::compareTo).toList();
-        AccessKey key = new AccessKey(walker == null ? null : walker.kind(), changes, sorted);
+        AccessKey key = new AccessKey(walker == null ? null : walker.kind(), changes, sorted,
+            walker == null ? null : railOverlayOrigin(walker, changes));
         LocalAccess found = accesses.get(key);
         if (found != null && found.valid()) {
             accessHits++;
@@ -225,10 +227,17 @@ final class LocalWatch implements Grounds.Watch {
         LocalGrounds.forget(this);
     }
 
-    private record GeometryKey(Walker.Kind kind, Map<BlockPos, BlockState> changes) {
+    @Nullable
+    private static BlockPos railOverlayOrigin(Walker walker, Map<BlockPos, BlockState> changes) {
+        return changes.values().stream().anyMatch(state -> state.is(BlockTags.RAILS))
+            ? walker.source().blockPosition().immutable() : null;
     }
 
-    private record AccessKey(@Nullable Walker.Kind kind, Map<BlockPos, BlockState> changes, List<BlockPos> exits) {
+    private record GeometryKey(Walker.Kind kind, Map<BlockPos, BlockState> changes, @Nullable BlockPos railOrigin) {
+    }
+
+    private record AccessKey(@Nullable Walker.Kind kind, Map<BlockPos, BlockState> changes, List<BlockPos> exits,
+                             @Nullable BlockPos railOrigin) {
     }
 
     final class Geometry {

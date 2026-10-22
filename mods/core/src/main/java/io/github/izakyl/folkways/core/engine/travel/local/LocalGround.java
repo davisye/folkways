@@ -18,6 +18,7 @@ import net.minecraft.core.Direction;
 import net.minecraft.core.Holder;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.Mob;
@@ -53,6 +54,7 @@ final class LocalGround implements Ground, LevelReader {
     private final List<Walker> walkers;
     private final List<Mob> bodies;
     private final Map<BlockPos, BlockState> changes;
+    private final List<BlockPos> railOverlayOrigins;
     private final LongOpenHashSet changedSections = new LongOpenHashSet();
     private final Map<Walker.Kind, LocalWatch.Geometry> base = new HashMap<>();
     private final Map<Walker.Kind, LocalWatch.Geometry> trial = new HashMap<>();
@@ -69,6 +71,8 @@ final class LocalGround implements Ground, LevelReader {
         this.walkers = walkers;
         this.bodies = bodies;
         this.changes = Map.copyOf(changes);
+        railOverlayOrigins = changes.values().stream().anyMatch(state -> state.is(BlockTags.RAILS))
+            ? walkers.stream().map(walker -> walker.source().blockPosition().immutable()).toList() : List.of();
         changes.keySet().forEach(cell -> Section.touchedBy(cell, changedSections));
         for (Walker walker : walkers) {
             base.put(walker.kind(), watch.geometry(walker, Map.of()));
@@ -80,7 +84,15 @@ final class LocalGround implements Ground, LevelReader {
 
     @Override
     public boolean valid() {
-        return watch.valid(revision) && walkers.stream().allMatch(Walker::current);
+        if (!watch.valid(revision) || !walkers.stream().allMatch(Walker::current)) {
+            return false;
+        }
+        for (int i = 0; i < railOverlayOrigins.size(); i++) {
+            if (!railOverlayOrigins.get(i).equals(walkers.get(i).source().blockPosition())) {
+                return false;
+            }
+        }
+        return true;
     }
 
     boolean terrainValid() {
