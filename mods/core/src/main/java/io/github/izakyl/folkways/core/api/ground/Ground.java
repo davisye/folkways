@@ -100,6 +100,12 @@ public interface Ground {
             return true;
         }
 
+        // A completed bounded search may still have stopped at its cell cap. Only an exhaustive proof
+        // permits a caller to use a negative distance as evidence that two places are disconnected.
+        default boolean exhaustive() {
+            return complete();
+        }
+
         default boolean valid() {
             return true;
         }
@@ -108,7 +114,7 @@ public interface Ground {
             return 0;
         }
 
-        // -1 means no route was proved within the watched, loaded ground and the search budget.
+        // -1 means no route was proved. It proves disconnection only after an exhaustive search.
         int distance(BlockPos feet);
 
         List<BlockPos> path(BlockPos feet);

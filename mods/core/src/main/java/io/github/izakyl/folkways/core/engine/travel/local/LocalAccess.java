@@ -37,6 +37,7 @@ final class LocalAccess implements Ground.Access {
     private long[] steps;
     private int stepAt;
     private boolean done;
+    private boolean truncated;
     @Nullable
     private Survey.Read reading;
     private long readingKey;
@@ -59,6 +60,11 @@ final class LocalAccess implements Ground.Access {
     @Override
     public boolean complete() {
         return done && valid();
+    }
+
+    @Override
+    public boolean exhaustive() {
+        return complete() && !truncated;
     }
 
     @Override
@@ -98,7 +104,7 @@ final class LocalAccess implements Ground.Access {
                 }
                 exitAt++;
                 if (distances.size() >= MOST_VISITED) {
-                    finish();
+                    finish(true);
                     return true;
                 }
             }
@@ -140,7 +146,7 @@ final class LocalAccess implements Ground.Access {
                         toward.put(next, cell);
                         open.enqueue(next);
                         if (distances.size() >= MOST_VISITED) {
-                            finish();
+                            finish(true);
                             return true;
                         }
                     }
@@ -148,15 +154,16 @@ final class LocalAccess implements Ground.Access {
                 }
                 current = false;
             }
-            finish();
+            finish(false);
             return true;
         } finally {
             watch.worked(budget.used() - before);
         }
     }
 
-    private void finish() {
+    private void finish(boolean limited) {
         done = true;
+        truncated = limited;
         current = false;
         steps = null;
         open.clear();
