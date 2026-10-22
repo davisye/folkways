@@ -15,6 +15,12 @@ public final class Grounds {
         // Survey one body's dimensions and locomotion, including a player who may need a way out of a work site.
         Ground now(LivingEntity walker);
 
+        // Changes whenever watched terrain or loaded-space availability changes. An earlier access proof
+        // must not be retained after the revision changes, including while its search is unfinished.
+        default long revision() {
+            return 0;
+        }
+
         @Override
         void close();
     }
