@@ -363,6 +363,30 @@ public final class GroundGameTests {
             BoundingBox.fromCorners(at(helper, 2, 0, 5), at(helper, 21, 3, 9)));
     }
 
+    @GameTest(template = "empty_large", timeoutTicks = 100)
+    public static void aPlayersChangedDimensionsInvalidateItsSizingView(GameTestHelper helper) {
+        room(helper, 6, 8);
+        BlockPos inside = at(helper, 20, 1, 7);
+        var player = net.neoforged.neoforge.common.util.FakePlayerFactory.getMinecraft(helper.getLevel());
+        player.setPose(net.minecraft.world.entity.Pose.STANDING);
+        player.refreshDimensions();
+        player.setPos(Vec3.atBottomCenterOf(inside));
+        try (Grounds.Watch watch = hallWatch(helper)) {
+            Ground standing = watch.now(player);
+            Ground.Access tall = standing.accessFrom(List.of(at(helper, 3, 1, 7)));
+            player.setPose(net.minecraft.world.entity.Pose.SWIMMING);
+            player.refreshDimensions();
+            helper.assertTrue(!standing.valid(), "changing the real player's size invalidates the captured proxy view");
+            Ground swimming = watch.now(player);
+            helper.assertTrue(swimming.valid() && swimming.beginAccess(List.of(at(helper, 3, 1, 7))) != tall,
+                "the current player receives the matching dimensions' graph");
+        } finally {
+            player.setPose(net.minecraft.world.entity.Pose.STANDING);
+            player.refreshDimensions();
+        }
+        helper.succeed();
+    }
+
     private static int drain(GameTestHelper helper, Ground.Access access, int work) {
         int slices = 0;
         while (!access.complete() && slices++ < 200000) {

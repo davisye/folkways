@@ -80,7 +80,7 @@ final class LocalGround implements Ground, LevelReader {
 
     @Override
     public boolean valid() {
-        return watch.valid(revision) && walkers.stream().allMatch(walker -> walker.kind().matches(walker.body()));
+        return watch.valid(revision) && walkers.stream().allMatch(Walker::current);
     }
 
     boolean terrainValid() {

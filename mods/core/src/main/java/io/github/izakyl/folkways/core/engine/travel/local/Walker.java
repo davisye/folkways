@@ -18,7 +18,22 @@ import net.minecraft.world.entity.PathfinderMob;
 import net.minecraft.world.entity.Pose;
 import net.minecraft.world.level.pathfinder.PathType;
 
-record Walker(Kind kind, Locomotion locomotion, Mob body) {
+record Walker(Kind kind, Locomotion locomotion, Mob body, LivingEntity source) {
+
+    boolean current() {
+        if (source.isRemoved() || source.level() != body.level() || !kind.matches(body)) {
+            return false;
+        }
+        if (source == body) {
+            return true;
+        }
+        EntityDimensions dimensions = source.getPose() == Pose.SLEEPING ? source.getDimensions(Pose.STANDING)
+            : EntityDimensions.scalable(source.getBbWidth(), source.getBbHeight());
+        return kind.width() == Float.floatToIntBits(dimensions.width())
+            && kind.height() == Float.floatToIntBits(dimensions.height())
+            && kind.onRail() == Kind.onRail(source)
+            && kind.inKeepout() == Keepouts.forbidden(source.level(), source.blockPosition());
+    }
 
     // Evaluators read more than the entity's class or size. In particular rail/keepout permissions depend
     // on the origin, while step height, falls, fire immunity and maluses may differ between two villagers.
@@ -54,7 +69,7 @@ record Walker(Kind kind, Locomotion locomotion, Mob body) {
             return true;
         }
 
-        private static boolean onRail(Mob body) {
+        private static boolean onRail(LivingEntity body) {
             return body.level().getBlockState(body.blockPosition()).is(BlockTags.RAILS)
                 || body.level().getBlockState(body.blockPosition().below()).is(BlockTags.RAILS);
         }
@@ -64,7 +79,7 @@ record Walker(Kind kind, Locomotion locomotion, Mob body) {
     static Optional<Walker> of(Mob body) {
         return Bodies.of(body).map(Body::kind).map(kind -> kind.locomotion())
             .or(() -> Locomotions.of(Locomotions.WALKING))
-            .map(locomotion -> new Walker(Kind.of(locomotion, body), locomotion, body));
+            .map(locomotion -> new Walker(Kind.of(locomotion, body), locomotion, body, body));
     }
 
     static Optional<Walker> of(LivingEntity body) {
@@ -74,12 +89,12 @@ record Walker(Kind kind, Locomotion locomotion, Mob body) {
                     return walker;
                 }
                 Mob sizing = new SizingBody(body);
-                return new Walker(Kind.of(walker.locomotion(), sizing), walker.locomotion(), sizing);
+                return new Walker(Kind.of(walker.locomotion(), sizing), walker.locomotion(), sizing, body);
             });
         }
         return Locomotions.of(Locomotions.WALKING).map(locomotion -> {
             Mob sizing = new SizingBody(body);
-            return new Walker(Kind.of(locomotion, sizing), locomotion, sizing);
+            return new Walker(Kind.of(locomotion, sizing), locomotion, sizing, body);
         });
     }
 
