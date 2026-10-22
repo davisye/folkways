@@ -66,7 +66,7 @@ final class FillPlan implements AutoCloseable {
     private static final Map<ServerLevel, Map<UUID, Allowance>> ALLOWANCES = new WeakHashMap<>();
 
     record Limits(int work, long nanos) {
-        static final Limits NORMAL = new Limits(4096, 2_000_000L);
+        static final Limits NORMAL = new Limits(16384, 2_000_000L);
     }
 
     // Time spent between calls is not charged to the planner. All plans and execution checks belonging to
