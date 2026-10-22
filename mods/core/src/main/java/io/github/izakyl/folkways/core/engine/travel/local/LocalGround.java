@@ -48,14 +48,15 @@ final class LocalGround implements Ground, LevelReader {
 
     private static final int MOST_REACHED = 1 << 20;
 
-    private static final int MOST_ACCESS = 32768;
-
     private final LocalWatch watch;
+    private final long revision;
     private final List<Walker> walkers;
     private final List<Mob> bodies;
     private final Map<BlockPos, BlockState> changes;
     private final LongOpenHashSet changedSections = new LongOpenHashSet();
-    private final Map<Walker.Kind, Long2ObjectOpenHashMap<Section>> trial = new HashMap<>();
+    private final Map<Walker.Kind, LocalWatch.Geometry> base = new HashMap<>();
+    private final Map<Walker.Kind, LocalWatch.Geometry> trial = new HashMap<>();
+    private final Map<Walker.Kind, Preparation> preparing = new HashMap<>();
     private final Long2ObjectOpenHashMap<List<BlockPos>> stances = new Long2ObjectOpenHashMap<>();
     private final Long2ObjectOpenHashMap<List<BlockPos>> inReach = new Long2ObjectOpenHashMap<>();
     // Each cell come to, and the stretch it is in.
@@ -64,10 +65,44 @@ final class LocalGround implements Ground, LevelReader {
 
     LocalGround(LocalWatch watch, List<Walker> walkers, List<Mob> bodies, Map<BlockPos, BlockState> changes) {
         this.watch = watch;
+        this.revision = watch.revision();
         this.walkers = walkers;
         this.bodies = bodies;
-        this.changes = changes;
+        this.changes = Map.copyOf(changes);
         changes.keySet().forEach(cell -> Section.touchedBy(cell, changedSections));
+        for (Walker walker : walkers) {
+            base.put(walker.kind(), watch.geometry(walker, Map.of()));
+            if (!changes.isEmpty()) {
+                trial.put(walker.kind(), watch.geometry(walker, this.changes));
+            }
+        }
+    }
+
+    @Override
+    public boolean valid() {
+        return watch.valid(revision) && walkers.stream().allMatch(walker -> walker.kind().matches(walker.body()));
+    }
+
+    boolean terrainValid() {
+        return watch.valid(revision);
+    }
+
+    @Override
+    public boolean prepare(BlockPos feet, Ground.Budget budget) {
+        if (!valid()) {
+            return false;
+        }
+        int before = budget.used();
+        try {
+            for (Walker walker : walkers) {
+                if (section(walker, Section.keyOf(feet.asLong()), budget) == null) {
+                    return false;
+                }
+            }
+            return true;
+        } finally {
+            watch.worked(budget.used() - before);
+        }
     }
 
     @Override
@@ -177,111 +212,45 @@ final class LocalGround implements Ground, LevelReader {
 
     @Override
     public Ground.Access accessFrom(Collection<BlockPos> exits) {
-        Long2IntOpenHashMap distances = new Long2IntOpenHashMap();
-        distances.defaultReturnValue(-1);
-        it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap toward =
-            new it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap();
-        // Callers protecting a body survey that body alone. Mixing movement kinds could invent a route whose
-        // successive steps require different bodies, so no such proof is returned for a mixed survey.
-        if (walkers.size() == 1) {
-            Walker walker = walkers.getFirst();
-            LongArrayFIFOQueue open = new LongArrayFIFOQueue();
-            for (BlockPos exit : exits) {
-                long cell = exit.asLong();
-                if (known(exit) && section(walker, Section.keyOf(cell)).stands().contains(cell)
-                        && !distances.containsKey(cell) && distances.size() < MOST_ACCESS) {
-                    distances.put(cell, 0);
-                    open.enqueue(cell);
-                }
-            }
-            while (!open.isEmpty() && distances.size() < MOST_ACCESS) {
-                long cell = open.dequeueLong();
-                long[] steps = section(walker, Section.keyOf(cell)).steps().get(cell);
-                if (steps == null) {
-                    continue;
-                }
-                for (long next : steps) {
-                    if (distances.containsKey(next)
-                            || !watch.covers(BlockPos.getX(next), BlockPos.getY(next), BlockPos.getZ(next))) {
-                        continue;
-                    }
-                    Section there = section(walker, Section.keyOf(next));
-                    if (there.stands().contains(next) && there.stepsTo(next, cell)) {
-                        distances.put(next, distances.get(cell) + 1);
-                        toward.put(next, cell);
-                        open.enqueue(next);
-                        if (distances.size() >= MOST_ACCESS) {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        return new Ground.Access() {
-            private final Long2ObjectOpenHashMap<List<BlockPos>> workStances = new Long2ObjectOpenHashMap<>();
+        Ground.Access access = beginAccess(exits);
+        access.advance(Ground.Budget.unlimited());
+        return access;
+    }
 
-            @Override
-            public int distance(BlockPos feet) {
-                return distances.get(feet.asLong());
-            }
-
-            @Override
-            public List<BlockPos> path(BlockPos feet) {
-                List<BlockPos> path = new ArrayList<>();
-                long cell = feet.asLong();
-                if (!distances.containsKey(cell)) {
-                    return List.of();
-                }
-                path.add(BlockPos.of(cell));
-                while (distances.get(cell) > 0) {
-                    cell = toward.get(cell);
-                    path.add(BlockPos.of(cell));
-                }
-                return List.copyOf(path);
-            }
-
-            @Override
-            public List<BlockPos> stancesFor(BlockPos target) {
-                List<BlockPos> saved = workStances.get(target.asLong());
-                if (saved != null) {
-                    return saved;
-                }
-                List<BlockPos> found = new ArrayList<>();
-                int span = Mth.ceil(Reach.PLAYER_BLOCK_REACH);
-                for (BlockPos feet : BlockPos.betweenClosed(target.offset(-span, -span, -span),
-                        target.offset(span, span, span))) {
-                    if (canWorkFrom(feet, target)) {
-                        found.add(feet.immutable());
-                    }
-                }
-                found.sort(Comparator.<BlockPos>comparingDouble(feet -> feet.distSqr(target))
-                    .thenComparingInt(BlockPos::getY).thenComparingInt(BlockPos::getX)
-                    .thenComparingInt(BlockPos::getZ));
-                List<BlockPos> answer = List.copyOf(found);
-                workStances.put(target.asLong(), answer);
-                return answer;
-            }
-
-            @Override
-            public boolean canWorkFrom(BlockPos feet, BlockPos target) {
-                return !feet.equals(target) && !feet.equals(target.below()) && distance(feet) >= 0
-                    && Reach.withinReach(feet, target) && inSight(feet, target);
-            }
-        };
+    @Override
+    public Ground.Access beginAccess(Collection<BlockPos> exits) {
+        return watch.access(this, walkers.size() == 1 ? walkers.getFirst() : null, changes, exits);
     }
 
     private Section section(Walker walker, long key) {
-        if (!changedSections.contains(key)) {
-            return watch.section(walker, key);
+        return section(walker, key, Ground.Budget.unlimited());
+    }
+
+    @Nullable
+    Section section(Walker walker, long key, Ground.Budget budget) {
+        Preparation pending = preparing.get(walker.kind());
+        if (pending == null || pending.key() != key) {
+            if (budget.exhausted()) {
+                return null;
+            }
+            pending = new Preparation(key, read(walker, key));
+            preparing.put(walker.kind(), pending);
         }
-        Long2ObjectOpenHashMap<Section> sections =
-            trial.computeIfAbsent(walker.kind(), kind -> new Long2ObjectOpenHashMap<>());
-        Section known = sections.get(key);
-        if (known == null) {
-            known = Survey.of(watch.level(), key, walker, changes);
-            sections.put(key, known);
+        pending.read().use(walker);
+        pending.read().advance(budget);
+        Section result = pending.read().result();
+        if (result != null) {
+            preparing.remove(walker.kind());
         }
-        return known;
+        return result;
+    }
+
+    Survey.Read read(Walker walker, long key) {
+        LocalWatch.Geometry geometry = (changedSections.contains(key) ? trial : base).get(walker.kind());
+        return geometry.read(key);
+    }
+
+    private record Preparation(long key, Survey.Read read) {
     }
 
     private Long2IntOpenHashMap reached() {
@@ -370,7 +339,7 @@ final class LocalGround implements Ground, LevelReader {
         }
     }
 
-    private boolean inSight(BlockPos feet, BlockPos target) {
+    boolean inSight(BlockPos feet, BlockPos target) {
         if (Math.abs(feet.getX() - target.getX()) <= 1 && Math.abs(feet.getY() - target.getY()) <= 1
             && Math.abs(feet.getZ() - target.getZ()) <= 1) {
             return true;

@@ -2,6 +2,7 @@ package io.github.izakyl.folkways.core.api.terms;
 
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.Level;
 
@@ -14,13 +15,23 @@ public final class Keepouts {
     }
 
     private static final List<Keepout> SOURCES = new CopyOnWriteArrayList<>();
+    private static final AtomicLong REVISION = new AtomicLong();
 
     private Keepouts() {
     }
 
     public static Runnable install(Keepout source) {
         SOURCES.add(source);
-        return () -> SOURCES.remove(source);
+        REVISION.incrementAndGet();
+        return () -> {
+            if (SOURCES.remove(source)) {
+                REVISION.incrementAndGet();
+            }
+        };
+    }
+
+    public static long revision() {
+        return REVISION.get();
     }
 
     public static boolean forbidden(Level level, int x, int y, int z) {

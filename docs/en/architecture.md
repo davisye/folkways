@@ -67,6 +67,26 @@ that matcher. Mod IDs, tags, whole item IDs and wildcard patterns retain their
 registry semantics. Saved rules use the original overload without display names,
 so client language and optional integrations cannot change server filtering.
 
+## Incremental ground proofs
+
+`Grounds.Watch.now(body)` keeps each body's ordinary reach origins separate. Explicit exit proofs from
+`Ground.beginAccess(exits)` share surveyed sections and search results only when locomotion, entity type,
+dimensions, step/fall limits, fire immunity, rail/keepout permissions and path maluses agree. Virtual block
+overlays and exit sets are part of the cache key. `Ground.with(changes)` leaves the real world unchanged.
+
+Advance an `Access` with one `Ground.Budget` shared by all planning loops in that colony tick. Both section
+surveying and graph expansion consume it. Non-positive nanoseconds disable the time limit; `unlimited()`
+retains the synchronous `accessFrom` behavior. An unfinished proof is not a negative accessibility result.
+Use `Ground.prepare(feet, budget)` before a `standable` query that has not already been surveyed.
+
+Terrain writes, chunk availability, moving structure barriers and `Keepouts.install`/removal invalidate
+`Watch.revision()` and old proofs. A finished `Access` describes its captured movement profile even after
+the original body moves; callers must also check `Ground.valid()` for current body capabilities and obtain
+a fresh body view before committing a placement. All world reads and final checks run on the server thread.
+Caches have fixed entry/cell bounds; eviction does not cancel retained searches, and closing clears lookup
+caches. `Watch.stats()` exposes cumulative requests, hits, section builds, work and invalidations plus
+current cache sizes without enabling chat logs.
+
 ## Lifecycle and test ownership
 
 [`ColonyLifecycle`](../../mods/core/src/main/java/io/github/izakyl/folkways/core/api/colony/ColonyLifecycle.java)

@@ -4,7 +4,11 @@ import io.github.izakyl.folkways.core.api.resident.Locomotion;
 import io.github.izakyl.folkways.core.api.resident.Locomotions;
 import io.github.izakyl.folkways.core.api.resident.body.Bodies;
 import io.github.izakyl.folkways.core.api.resident.body.Body;
+import io.github.izakyl.folkways.core.api.terms.Keepouts;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.EntityDimensions;
@@ -12,18 +16,55 @@ import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.PathfinderMob;
 import net.minecraft.world.entity.Pose;
+import net.minecraft.world.level.pathfinder.PathType;
 
 record Walker(Kind kind, Locomotion locomotion, Mob body) {
 
-    record Kind(ResourceLocation locomotion, int width, int height) {
+    // Evaluators read more than the entity's class or size. In particular rail/keepout permissions depend
+    // on the origin, while step height, falls, fire immunity and maluses may differ between two villagers.
+    record Kind(ResourceLocation locomotion, EntityType<?> type, int width, int height, int step, int fall,
+                boolean fireImmune, boolean onRail, boolean inKeepout, List<Integer> maluses) {
+
+        private static final PathType[] PATH_TYPES = PathType.values();
+
+        static Kind of(Locomotion locomotion, Mob body) {
+            List<Integer> maluses = new ArrayList<>();
+            for (PathType type : PATH_TYPES) {
+                maluses.add(Float.floatToIntBits(body.getPathfindingMalus(type)));
+            }
+            return new Kind(locomotion.id(), body.getType(), Float.floatToIntBits(body.getBbWidth()),
+                Float.floatToIntBits(body.getBbHeight()), Float.floatToIntBits(body.maxUpStep()),
+                body.getMaxFallDistance(), body.fireImmune(), onRail(body),
+                Keepouts.forbidden(body.level(), body.blockPosition()), List.copyOf(maluses));
+        }
+
+        boolean matches(Mob body) {
+            if (type != body.getType() || width != Float.floatToIntBits(body.getBbWidth())
+                    || height != Float.floatToIntBits(body.getBbHeight())
+                    || step != Float.floatToIntBits(body.maxUpStep()) || fall != body.getMaxFallDistance()
+                    || fireImmune != body.fireImmune() || onRail != onRail(body)
+                    || inKeepout != Keepouts.forbidden(body.level(), body.blockPosition())) {
+                return false;
+            }
+            for (int i = 0; i < PATH_TYPES.length; i++) {
+                if (maluses.get(i) != Float.floatToIntBits(body.getPathfindingMalus(PATH_TYPES[i]))) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private static boolean onRail(Mob body) {
+            return body.level().getBlockState(body.blockPosition()).is(BlockTags.RAILS)
+                || body.level().getBlockState(body.blockPosition().below()).is(BlockTags.RAILS);
+        }
     }
 
     // A body the colony has no kind for is surveyed as if it walked, when anything walks at all.
     static Optional<Walker> of(Mob body) {
         return Bodies.of(body).map(Body::kind).map(kind -> kind.locomotion())
             .or(() -> Locomotions.of(Locomotions.WALKING))
-            .map(locomotion -> new Walker(new Kind(locomotion.id(), Float.floatToIntBits(body.getBbWidth()),
-                Float.floatToIntBits(body.getBbHeight())), locomotion, body));
+            .map(locomotion -> new Walker(Kind.of(locomotion, body), locomotion, body));
     }
 
     static Optional<Walker> of(LivingEntity body) {
@@ -33,14 +74,12 @@ record Walker(Kind kind, Locomotion locomotion, Mob body) {
                     return walker;
                 }
                 Mob sizing = new SizingBody(body);
-                return new Walker(new Kind(walker.locomotion().id(), Float.floatToIntBits(sizing.getBbWidth()),
-                    Float.floatToIntBits(sizing.getBbHeight())), walker.locomotion(), sizing);
+                return new Walker(Kind.of(walker.locomotion(), sizing), walker.locomotion(), sizing);
             });
         }
         return Locomotions.of(Locomotions.WALKING).map(locomotion -> {
             Mob sizing = new SizingBody(body);
-            return new Walker(new Kind(locomotion.id(), Float.floatToIntBits(sizing.getBbWidth()),
-                Float.floatToIntBits(sizing.getBbHeight())), locomotion, sizing);
+            return new Walker(Kind.of(locomotion, sizing), locomotion, sizing);
         });
     }
 
