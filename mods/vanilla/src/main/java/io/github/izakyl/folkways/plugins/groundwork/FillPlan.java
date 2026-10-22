@@ -210,6 +210,9 @@ final class FillPlan implements AutoCloseable {
 
     boolean advance() {
         return allotted(budget -> {
+            if (budget.exhausted()) {
+                return false;
+            }
             if (context != null && !context.valid()) {
                 restart();
             }
