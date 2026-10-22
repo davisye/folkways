@@ -465,6 +465,35 @@ public final class GroundGameTests {
         helper.succeed();
     }
 
+    @GameTest(template = "empty_large", batch = "ground_access_limit", timeoutTicks = 100)
+    public static void aCappedLargeSearchDoesNotProveDisconnection(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        BlockPos floor = at(helper, 1024, 0, 1024);
+        BlockPos last = floor.offset(191, 0, 191);
+        // Load a read collar as well as the 36,864-cell floor, without changing the user's world.
+        for (int x = (floor.getX() >> 4) - 1; x <= (last.getX() >> 4) + 1; x++) {
+            for (int z = (floor.getZ() >> 4) - 1; z <= (last.getZ() >> 4) + 1; z++) {
+                level.getChunk(x, z);
+            }
+        }
+        for (BlockPos cell : BlockPos.betweenClosed(floor, last)) {
+            level.setBlock(cell, STONE, 2);
+        }
+        BlockPos exit = floor.above().offset(1, 0, 1);
+        Mob body = walker(helper, exit);
+        try (Grounds.Watch watch = Grounds.watch(level, BoundingBox.fromCorners(floor, last.above(3)))) {
+            Ground.Access access = watch.now(body).beginAccess(List.of(exit));
+            access.advance(Ground.Budget.unlimited());
+            helper.assertTrue(access.valid() && access.complete() && access.visited() == 32768,
+                "the large search finishes at the fixed cell cap");
+            helper.assertTrue(!access.exhaustive(), "an unexpanded frontier cannot prove disconnection");
+            helper.assertTrue(access.distance(exit) == 0 && access.path(exit).equals(List.of(exit)),
+                "the bounded search still provides its actually proved positive routes");
+            System.out.println("GROUND_CAPPED_32768 stats=" + watch.stats());
+        }
+        helper.succeed();
+    }
+
     private static int drain(GameTestHelper helper, Ground.Access access, int work) {
         int slices = 0;
         while (!access.complete() && slices++ < 200000) {

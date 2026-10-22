@@ -79,6 +79,8 @@ Custom locomotions are isolated per body until they can declare all evaluator-de
 Advance an `Access` with one `Ground.Budget` shared by all planning loops in that colony tick. Both section
 surveying and graph expansion consume it. Non-positive nanoseconds disable the time limit; `unlimited()`
 retains the synchronous `accessFrom` behavior. An unfinished proof is not a negative accessibility result.
+`Access.complete()` also becomes true at the fixed cell cap so proved positive routes remain usable;
+negative distances establish disconnection only when `Access.exhaustive()` is true.
 Use `Ground.prepare(feet, budget)` before a `standable` query that has not already been surveyed.
 
 Terrain writes, chunk availability, moving structure barriers and keepout changes invalidate

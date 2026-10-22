@@ -71,6 +71,8 @@ JEC 及其 PinIn 库只用于编译，不随 Folkways 内嵌。
 分区扫描和图搜索都消耗预算。纳秒数非正值表示只限制工作量；`unlimited()` 保留同步 `accessFrom`
 的行为。搜索未完成时不能将未证明可达当成不可达。对尚未扫描的位置查询 `standable` 前，先调用
 `Ground.prepare(feet, budget)`。
+达到固定格数上限时 `Access.complete()` 也会返回真，已经证明的正向路线仍可使用；
+只有 `Access.exhaustive()` 为真时，负距离才能证明两处不连通。
 
 地形写入、区块可用性、移动装置障碍及禁行规则变化会更新 `Watch.revision()`，使旧证明失效。
 动态来源实现 `Keepout.refresh(level)`，在其返回结果改变时调用 `Keepouts.changed()`；安装或移除来源
