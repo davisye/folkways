@@ -696,6 +696,12 @@ final class FillPlan implements AutoCloseable {
         int last;
         Integer part;
         boolean crosses;
+        View view;
+        final List<BlockPos> safeExits = new ArrayList<>();
+        int exit;
+        Ground.Access retreat;
+        boolean rerouting;
+        boolean rerouted;
 
         Aside(Context source, Map<BlockPos, Integer> parts, Set<Integer> active) {
             this.source = source;
@@ -715,11 +721,11 @@ final class FillPlan implements AutoCloseable {
                         person++;
                         continue;
                     }
-                    View view = source.view(next);
-                    if (!view.access().advance(budget)) {
+                    View current = source.view(next);
+                    if (!current.access().advance(budget)) {
                         return false;
                     }
-                    FootSearch search = source.footing(next, view.ground());
+                    FootSearch search = source.footing(next, current.ground());
                     if (!search.advance(budget)) {
                         return false;
                     }
@@ -728,11 +734,61 @@ final class FillPlan implements AutoCloseable {
                         continue;
                     }
                     body = next;
+                    view = current;
                     way = view.access().path(search.feet);
                     part = partAt(search.feet, parts);
                     cursor = 0;
                     last = -1;
                     crosses = false;
+                }
+                if (!body.isAlive()) {
+                    nextBody();
+                    continue;
+                }
+                if (!view.ground().valid()) {
+                    if (!budget.tryStep()) {
+                        return false;
+                    }
+                    // A suspended retreat belongs to this body's actual current dimensions and gait.
+                    // Waking or changing capability must not publish a path from the old body.
+                    resetBody();
+                    continue;
+                }
+                if (rerouting) {
+                    if (exit < source.exits.size()) {
+                        if (!budget.tryStep()) {
+                            return false;
+                        }
+                        BlockPos at = source.exits.get(exit++);
+                        if (clearAsideStance(body, at)) {
+                            safeExits.add(at);
+                        }
+                        continue;
+                    }
+                    if (safeExits.isEmpty()) {
+                        if (!budget.tryStep()) {
+                            return false;
+                        }
+                        nextBody();
+                        continue;
+                    }
+                    if (retreat == null) {
+                        retreat = view.ground().beginAccess(safeExits);
+                    }
+                    if (!retreat.advance(budget)) {
+                        return false;
+                    }
+                    FootSearch search = source.footing(body, view.ground());
+                    if (!search.advance(budget)) {
+                        return false;
+                    }
+                    way = search.feet == null ? List.of() : retreat.path(search.feet);
+                    part = search.feet == null ? null : partAt(search.feet, parts);
+                    cursor = 0;
+                    last = -1;
+                    crosses = false;
+                    rerouting = false;
+                    rerouted = true;
                 }
                 if (!budget.tryStep()) {
                     return false;
@@ -749,14 +805,37 @@ final class FillPlan implements AutoCloseable {
                     cursor++;
                 } else {
                     if (!way.isEmpty() && (!clearOfFill(body) || crosses)
-                            && (part == null || !active.contains(part)) && last >= 0 && last + 1 < way.size()) {
-                        moves.add(Grown.of(new StepAsideNode(FillPlan.this, zone, (Mob) body, way.get(last + 1), level)));
+                            && (part == null || !active.contains(part)) && last >= 0) {
+                        if (last + 1 < way.size()) {
+                            moves.add(Grown.of(new StepAsideNode(FillPlan.this, zone, (Mob) body, way.get(last + 1), level)));
+                        } else if (!rerouted) {
+                            // The closest trusted exit can be only one block beyond the fill. It is a
+                            // valid escape anchor but still inside the navigation arrival buffer. Keep
+                            // the escape proof unchanged and find an actual retreat to farther, clear
+                            // trusted roots; never invent a reachable extra step past a finished path.
+                            rerouting = true;
+                            continue;
+                        }
                     }
-                    body = null;
-                    person++;
+                    nextBody();
                 }
             }
             return person == source.people.size();
+        }
+
+        private void nextBody() {
+            person++;
+            resetBody();
+        }
+
+        private void resetBody() {
+            body = null;
+            view = null;
+            retreat = null;
+            safeExits.clear();
+            exit = 0;
+            rerouting = false;
+            rerouted = false;
         }
     }
 

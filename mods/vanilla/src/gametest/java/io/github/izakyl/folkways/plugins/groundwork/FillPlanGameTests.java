@@ -539,6 +539,202 @@ public final class FillPlanGameTests {
             new FillPlan.Limits(Integer.MAX_VALUE, 0));
     }
 
+    @GameTest(template = "empty_large", batch = "safe_fill_near_exit", timeoutTicks = 100)
+    public static void aNearTrustedExitDoesNotEndTheAsideInsideItsSafetyBuffer(GameTestHelper helper) {
+        floor(helper);
+        UUID colony = UUID.randomUUID();
+        BlockPos cell = at(helper, 11, 1, 11);
+        Mob body = resident(helper, cell);
+        ((io.github.izakyl.folkways.core.api.resident.body.Body) body).joinColony(colony);
+        FillPlan plan = new FillPlan(helper.getLevel(), UUID.randomUUID(), colony, Set.of(cell),
+            () -> List.of(at(helper, 12, 1, 11), at(helper, 13, 1, 11)), () -> {}, false,
+            new FillPlan.Limits(Integer.MAX_VALUE, 0));
+        try {
+            helper.assertTrue(refresh(plan, helper, Set.of(cell)).isEmpty(), "the body still blocks the last fill");
+            helper.assertTrue(plan.steppingAside().size() == 1,
+                "a trusted exit one block away cannot swallow the resident's real move farther clear: " + retreatState(plan));
+            Node move = plan.steppingAside().getFirst().nodes().getFirst();
+            BlockPos target = move.spec().stances().cells().iterator().next().block(helper.getLevel());
+            helper.assertTrue(plan.safeDestination(body, target), "the move really clears the full arrival buffer");
+            body.setNoAi(false);
+            helper.assertTrue(body.getNavigation().moveTo(target.getX() + 0.5D, target.getY(), target.getZ() + 0.5D, 1.0D),
+                "normal navigation can really walk beyond the near anchor");
+            helper.runAtTickTime(40, () -> {
+                try {
+                    helper.assertTrue(plan.clearOfFill(body), "the real walk leaves the pending cube clear");
+                    helper.assertTrue(Commit.run(helper.getLevel(), move,
+                        worker(body, new SimpleContainer())) instanceof Outcome.Done, "the actual aside node completes");
+                    Job job = refresh(plan, helper, Set.of(cell)).getFirst();
+                    body.setPos(Vec3.atBottomCenterOf(job.footings().cells().iterator().next().block(helper.getLevel())));
+                    SimpleContainer pack = new SimpleContainer(new ItemStack(Items.DIRT, 2));
+                    helper.assertTrue(Commit.run(helper.getLevel(), node(plan, job), worker(body, pack)) instanceof Outcome.Done,
+                        "the last fill really commits after the real retreat");
+                    helper.assertTrue(pack.countItem(Items.DIRT) == 1 && helper.getLevel().getBlockState(cell).is(Blocks.DIRT),
+                        "the retreat neither spends nor duplicates the final block");
+                    helper.succeed();
+                } finally {
+                    plan.close();
+                    body.discard();
+                }
+            });
+        } catch (RuntimeException failure) {
+            plan.close();
+            body.discard();
+            throw failure;
+        }
+    }
+
+    @GameTest(template = "empty_large", batch = "safe_fill_near_exit_budget", timeoutTicks = 2000)
+    public static void crowdedRetreatsResumeTheirFarExitSearchWithOneWorkUnit(GameTestHelper helper) {
+        floor(helper);
+        UUID colony = UUID.randomUUID();
+        Set<BlockPos> cells = box(at(helper, 10, 1, 10), at(helper, 12, 1, 12));
+        List<Mob> people = cells.stream().map(cell -> resident(helper, cell)).toList();
+        people.forEach(body -> ((io.github.izakyl.folkways.core.api.resident.body.Body) body).joinColony(colony));
+        FillPlan plan = new FillPlan(helper.getLevel(), UUID.randomUUID(), colony, cells,
+            () -> List.of(at(helper, 13, 1, 11), at(helper, 14, 1, 11)), () -> {}, false,
+            new FillPlan.Limits(Integer.MAX_VALUE, 0));
+        plan.refresh(new Survey(helper.getLevel(), cells).fill(), cells.stream().map(Job::keyOf).collect(Collectors.toSet()), DIRT);
+        long[] slices = {0};
+        helper.onEachTick(() -> {
+            for (int i = 0; i < 256 && !plan.stage().equals("complete"); i++) {
+                Ground.Budget one = new Ground.Budget(1, 0);
+                plan.advance(one);
+                slices[0]++;
+                helper.assertTrue(one.used() <= 1 && plan.jobs().isEmpty(), "one-unit retreats cannot place over any crowded body");
+            }
+        });
+        helper.startSequence().thenWaitUntil(() -> {
+            helper.assertTrue(plan.stage().equals("complete"), "tiny slices eventually complete the farther retreat graph");
+            helper.assertTrue(plan.steppingAside().size() == people.size() && slices[0] > 256,
+                "every crowded resident gets a real move after multiple server ticks: " + retreatState(plan));
+        }).thenExecute(() -> {
+            List<Grown> moves = List.copyOf(plan.steppingAside());
+            for (Grown grown : moves) {
+                Node move = grown.nodes().getFirst();
+                Mob body = people.stream().filter(person -> move.worker().filter(person.getUUID()::equals).isPresent()).findFirst().orElseThrow();
+                BlockPos target = move.spec().stances().cells().iterator().next().block(helper.getLevel());
+                helper.assertTrue(plan.safeDestination(body, target), "each size-aware retreat target clears the whole fill buffer");
+                body.setPos(Vec3.atBottomCenterOf(target));
+                helper.assertTrue(Commit.run(helper.getLevel(), move, worker(body, new SimpleContainer())) instanceof Outcome.Done,
+                    "all residents can complete their retained aside nodes");
+            }
+            helper.assertTrue(!refresh(plan, helper, cells).isEmpty(), "the emptied work face becomes available again");
+            plan.close();
+            people.forEach(Mob::discard);
+        }).thenSucceed();
+    }
+
+    @GameTest(template = "empty_large", batch = "safe_fill_near_exit_closed", timeoutTicks = 100)
+    public static void anAsideWaitsIfEveryFartherTrustedExitIsBehindAWall(GameTestHelper helper) {
+        floor(helper);
+        for (int x = 10; x <= 13; x++) {
+            for (int z = 10; z <= 12; z++) {
+                for (int y = 1; y <= 3; y++) {
+                    if (y == 3 || x == 10 || x == 13 || z != 11) {
+                        helper.getLevel().setBlock(at(helper, x, y, z), Blocks.STONE.defaultBlockState(), 3);
+                    }
+                }
+            }
+        }
+        UUID colony = UUID.randomUUID();
+        BlockPos cell = at(helper, 11, 1, 11);
+        Mob body = resident(helper, cell);
+        ((io.github.izakyl.folkways.core.api.resident.body.Body) body).joinColony(colony);
+        try (FillPlan plan = new FillPlan(helper.getLevel(), UUID.randomUUID(), colony, Set.of(cell),
+                () -> List.of(at(helper, 12, 1, 11), at(helper, 14, 1, 11)), () -> {}, false,
+                new FillPlan.Limits(Integer.MAX_VALUE, 0))) {
+            helper.assertTrue(refresh(plan, helper, Set.of(cell)).isEmpty() && plan.steppingAside().isEmpty(),
+                "an anchor behind the buffer does not invent a route through the surrounding wall");
+            helper.assertTrue(helper.getLevel().getBlockState(cell).isAir(), "the trapped resident is never filled over");
+            helper.getLevel().setBlock(at(helper, 13, 1, 11), Blocks.AIR.defaultBlockState(), 3);
+            helper.getLevel().setBlock(at(helper, 13, 2, 11), Blocks.AIR.defaultBlockState(), 3);
+            refresh(plan, helper, Set.of(cell));
+            helper.assertTrue(plan.steppingAside().size() == 1,
+                "opening a real onward passage invalidates the old wait and supplies a safe retreat: " + retreatState(plan));
+        } finally {
+            body.discard();
+        }
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty_large", batch = "safe_fill_near_exit_resizing", timeoutTicks = 100)
+    public static void aBodyGrowingDuringARetreatProofRechecksTheWholeBuffer(GameTestHelper helper)
+            throws ReflectiveOperationException {
+        floor(helper);
+        UUID colony = UUID.randomUUID();
+        BlockPos cell = at(helper, 11, 1, 11);
+        Mob body = resident(helper, cell);
+        ((io.github.izakyl.folkways.core.api.resident.body.Body) body).joinColony(colony);
+        FillPlan plan = new FillPlan(helper.getLevel(), UUID.randomUUID(), colony, Set.of(cell),
+            () -> List.of(at(helper, 12, 1, 11), at(helper, 13, 1, 11), at(helper, 15, 1, 11)), () -> {}, false,
+            new FillPlan.Limits(Integer.MAX_VALUE, 0));
+        try {
+            plan.refresh(new Survey(helper.getLevel(), Set.of(cell)).fill(), Set.of(Job.keyOf(cell)), DIRT);
+            boolean suspended = false;
+            for (int i = 0; i < 2000 && !suspended; i++) {
+                plan.advance(new Ground.Budget(64, 0));
+                Object planning = reflected(plan, "planning");
+                Object aside = reflected(planning, "aside");
+                suspended = aside != null && Boolean.TRUE.equals(optionalReflected(aside, "rerouting"));
+            }
+            helper.assertTrue(suspended, "the exit filtering/search can remain suspended between slices: " + retreatState(plan));
+            helper.runAtTickTime(1, () -> {
+                try {
+                    body.getAttribute(net.minecraft.world.entity.ai.attributes.Attributes.SCALE).setBaseValue(4.0D);
+                    body.refreshDimensions();
+                    helper.assertTrue(body.getBbWidth() > 2.0F, "the same resident now needs a materially wider safe buffer");
+                    plan.advance(Ground.Budget.unlimited());
+                    helper.assertTrue(plan.stage().equals("complete") && plan.steppingAside().size() == 1,
+                        "the resized body gets a newly proved retreat rather than losing progress forever");
+                    Node move = plan.steppingAside().getFirst().nodes().getFirst();
+                    BlockPos target = move.spec().stances().cells().iterator().next().block(helper.getLevel());
+                    helper.assertTrue(plan.safeDestination(body, target), "the old small-body target is never published for the larger body");
+                    helper.succeed();
+                } finally {
+                    plan.close();
+                    body.discard();
+                }
+            });
+        } catch (ReflectiveOperationException | RuntimeException failure) {
+            plan.close();
+            body.discard();
+            throw failure;
+        }
+    }
+
+    private static Object reflected(Object object, String name) throws ReflectiveOperationException {
+        var field = object.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        return field.get(object);
+    }
+
+    private static Object optionalReflected(Object object, String name) throws ReflectiveOperationException {
+        try {
+            return reflected(object, name);
+        } catch (NoSuchFieldException absent) {
+            return "absent";
+        }
+    }
+
+    private static String retreatState(FillPlan plan) {
+        try {
+            Object context = reflected(plan, "context");
+            Object aside = reflected(reflected(plan, "planning"), "aside");
+            var state = new java.util.LinkedHashMap<String, Object>();
+            state.put("exits", reflected(context, "exits"));
+            state.put("people", reflected(context, "people"));
+            if (aside != null) {
+                for (String key : List.of("person", "way", "last", "cursor", "rerouting", "rerouted", "exit", "safeExits")) {
+                    state.put(key, optionalReflected(aside, key));
+                }
+            }
+            return state.toString();
+        } catch (ReflectiveOperationException failure) {
+            return failure.toString();
+        }
+    }
+
     @GameTest(template = "empty_large", batch = "safe_fill", timeoutTicks = 100)
     public static void aBodyOverhangingTheLastCellAlsoStepsAside(GameTestHelper helper) {
         floor(helper);
