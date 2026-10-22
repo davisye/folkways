@@ -21,8 +21,17 @@ public final class Grounds {
             return 0;
         }
 
+        default Stats stats() {
+            return new Stats(0, 0, 0, 0, 0, 0, 0, 0);
+        }
+
         @Override
         void close();
+    }
+
+    // Cumulative counters and current bounded-cache sizes, suitable for profiling without debug chat.
+    public record Stats(long accessRequests, long accessHits, long sectionBuilds, long work,
+                        long invalidations, int accessEntries, int geometryEntries, int cachedCells) {
     }
 
     public interface Source {

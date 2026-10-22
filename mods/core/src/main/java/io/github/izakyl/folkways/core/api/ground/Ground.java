@@ -17,6 +17,11 @@ public interface Ground {
 
     boolean standable(BlockPos feet);
 
+    // Prepare this cell's standing geometry before using the synchronous standable() query.
+    default boolean prepare(BlockPos feet, Budget budget) {
+        return true;
+    }
+
     boolean reachable(BlockPos feet);
 
     List<BlockPos> stancesFor(BlockPos target);
