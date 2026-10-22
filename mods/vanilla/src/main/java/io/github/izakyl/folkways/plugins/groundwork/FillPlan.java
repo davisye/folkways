@@ -14,18 +14,22 @@ import io.github.izakyl.folkways.plugins.person.PersonBody;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.UUID;
 import java.util.WeakHashMap;
 import java.util.function.Supplier;
+import java.util.function.Function;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.server.level.ServerLevel;
@@ -57,11 +61,38 @@ final class FillPlan implements AutoCloseable {
 
     // Every loaded colony in this level shares the same exclusion of future fill space from trusted exits.
     private static final Map<ServerLevel, Set<FillPlan>> LIVE = new WeakHashMap<>();
+    private static final Map<ServerLevel, Long> LIVE_REVISIONS = new WeakHashMap<>();
+    private static final Map<ServerLevel, ArrayDeque<Activation>> ACTIVATIONS = new WeakHashMap<>();
+    private static final Map<ServerLevel, Map<UUID, Allowance>> ALLOWANCES = new WeakHashMap<>();
+
+    record Limits(int work, long nanos) {
+        static final Limits NORMAL = new Limits(4096, 2_000_000L);
+    }
+
+    // Time spent between calls is not charged to the planner. All plans and execution checks belonging to
+    // this colony nevertheless share one allowance per tick, including repeated attempts by many workers.
+    private static final class Allowance {
+        long tick = Long.MIN_VALUE;
+        int work;
+        long nanos;
+        int plans;
+        long commitUntil = Long.MIN_VALUE;
+        UUID commitZone;
+    }
+
+    private record Activation(long revision, BoundingBox bounds) {
+    }
 
     private record Ranked(Job job, int part, int depth, boolean passage) {
     }
 
-    private record View(Ground ground, Ground.Access access) {
+    private record View(LivingEntity body, Ground ground, Ground.Access access) {
+    }
+
+    private record Change(BlockPos cell, BlockState material) {
+    }
+
+    private record Trial(Ground ground, Ground.Access access) {
     }
 
     private final ServerLevel level;
@@ -72,27 +103,59 @@ final class FillPlan implements AutoCloseable {
     private final BlockPos origin;
     private final BoundingBox workBox;
     private final Supplier<Collection<BlockPos>> external;
+    private final boolean externalTargets;
+    private final Limits limits;
     private BoundingBox bounds;
     private AABB worldBounds;
     private Grounds.Watch watch;
     private final Mob surveyor;
     private final Runnable changed;
-    private Set<BlockPos> pending = Set.of();
+    private Set<BlockPos> pending = new LinkedHashSet<>();
     private List<Job> remaining = List.of();
     private final Map<Integer, Integer> cursors = new HashMap<>();
     private volatile Map<BlockPos, Job> offered = Map.of();
     private volatile List<Grown> steppingAside = List.of();
     private volatile Phase phase = Phase.WAITING;
     private volatile boolean closed;
+    private Set<String> wanted = Set.of();
+    private List<Job> inputs = List.of();
+    private BlockState material;
+    private Planning planning;
+    private Context context;
+    private final Map<BlockPos, Candidate> proofs = new HashMap<>();
+    private final Map<BlockPos, Candidate> commitProofs = new HashMap<>();
+    private final Set<BlockPos> proving = new HashSet<>();
+    private final Set<BlockPos> provingDestinations = new HashSet<>();
+    // Deliberately observable by the pressure fixture, without enabling chat logging.
+    private long slices;
+    private long totalWork;
+    private long totalNanos;
+    private long maxSliceNanos;
+    private int lastWork;
+    private long commitAttempts;
+    private long commitBudgetYields;
+    private long commitRefused;
+    private long commitProved;
+    private long totalCommitNanos;
+    private long maxCommitNanos;
 
     FillPlan(ServerLevel level, UUID zone, UUID colony, Set<BlockPos> cells,
             Supplier<Collection<BlockPos>> external, Runnable changed) {
+        this(level, zone, colony, cells, external, changed, false, Limits.NORMAL);
+    }
+
+    FillPlan(ServerLevel level, UUID zone, UUID colony, Set<BlockPos> cells,
+            Supplier<Collection<BlockPos>> external, Runnable changed, boolean externalTargets, Limits limits) {
         this.level = level;
         this.zone = zone;
         this.colony = colony;
         this.cells = Set.copyOf(cells);
         this.changed = changed;
         this.external = external;
+        this.externalTargets = externalTargets;
+        this.limits = limits;
+        ALLOWANCES.computeIfAbsent(level, any -> new HashMap<>())
+            .computeIfAbsent(colony, any -> new Allowance()).plans++;
         BlockPos first = cells.iterator().next();
         realm = WorldPos.of(level, first).realm();
         origin = new WorldPos(realm, BlockPos.ZERO).block(level);
@@ -101,6 +164,13 @@ final class FillPlan implements AutoCloseable {
         surveyor = PersonBody.RESIDENT.get().create(level);
         surveyor.setPos(Vec3.atBottomCenterOf(first));
         LIVE.computeIfAbsent(level, any -> new HashSet<>()).add(this);
+        long revision = LIVE_REVISIONS.merge(level, 1L, Long::sum);
+        ArrayDeque<Activation> activations = ACTIVATIONS.computeIfAbsent(level, any -> new ArrayDeque<>());
+        activations.addLast(new Activation(revision, new BoundingBox(workBox.minX(), workBox.minY() - 1,
+            workBox.minZ(), workBox.maxX(), workBox.maxY() + 1, workBox.maxZ())));
+        while (activations.size() > 128) {
+            activations.removeFirst();
+        }
     }
 
     Phase phase() {
@@ -115,125 +185,227 @@ final class FillPlan implements AutoCloseable {
         return steppingAside;
     }
 
-    List<Job> refresh(List<Job> jobs, Set<String> wanted, BlockState material) {
+    // Refresh only replaces inputs. Expensive proofs retain their progress between ordinary sweeps.
+    List<Job> refresh(List<Job> jobs, Set<String> desired, BlockState block) {
         if (closed) {
             return List.of();
         }
-        Set<BlockPos> left = new LinkedHashSet<>();
-        cells.stream().filter(cell -> wanted.contains(Job.keyOf(cell)) && Survey.open(level.getBlockState(cell)))
-            .sorted(Comparator.comparingLong(BlockPos::asLong)).forEach(left::add);
-        pending = Set.copyOf(left);
-        remaining = jobs.stream().filter(job -> pending.contains(job.cell())).toList();
-        Context context = new Context();
-        View view = context.view(surveyor);
-        Map<BlockPos, Integer> parts = parts();
-        Set<BlockPos> passage = new HashSet<>();
-        for (LivingEntity body : context.people) {
-            View bodyView = context.view(body);
-            footing(body, bodyView.ground()).ifPresent(feet -> protect(passage, bodyView.access().path(feet)));
+        boolean different = !desired.equals(wanted) || !block.equals(material);
+        inputs = List.copyOf(jobs);
+        wanted = Set.copyOf(desired);
+        material = block;
+        if (different || planning == null || planning.done) {
+            restart();
         }
-        List<Ranked> ranks = new ArrayList<>();
-        for (Job job : remaining) {
-            List<BlockPos> stands = context.workStances(view.access(), job.cell());
-            if (stands.isEmpty()) {
-                continue;
-            }
-            BlockPos entry = stands.stream().min(Comparator.comparingInt(view.access()::distance)).orElseThrow();
-            protect(passage, view.access().path(entry));
-            ranks.add(new Ranked(job, parts.get(job.cell()), view.access().distance(entry) / BAND, false));
-        }
-        ranks = ranks.stream().map(rank -> new Ranked(rank.job(), rank.part(), rank.depth(),
-                passage.contains(rank.job().cell())))
-            .sorted(Comparator.comparingInt((Ranked rank) -> rank.job().cell().getY())
-                .thenComparing(Comparator.comparingInt(Ranked::depth).reversed())
-                .thenComparingLong(rank -> rank.job().cell().asLong())).toList();
-        Map<Integer, List<Ranked>> candidates = new LinkedHashMap<>();
-        for (Ranked rank : ranks) {
-            candidates.computeIfAbsent(rank.part(), any -> new ArrayList<>()).add(rank);
-        }
-        Map<Ranked, Job> safe = new LinkedHashMap<>();
-        for (Map.Entry<Integer, List<Ranked>> entry : candidates.entrySet()) {
-            List<Ranked> part = entry.getValue();
-            int start = Math.floorMod(cursors.getOrDefault(entry.getKey(), 0), part.size());
-            boolean found = false;
-            for (int tried = 0; tried < Math.min(MOST_TRIALS, part.size()); tried++) {
-                Ranked rank = part.get((start + tried) % part.size());
-                List<BlockPos> stands = safeStances(context, rank.job().cell(), material, true);
-                if (!stands.isEmpty()) {
-                    Job job = rank.job();
-                    safe.put(rank, new Job(job.key(), job.site(), job.cell(), job.cells(), job.canopy(),
-                        Stances.of(level, stands).orElseThrow()));
-                    found = true;
-                }
-            }
-            // A crowded or unreachable first band must not permanently hide later safe work, nor consume the
-            // trial allowance of an independent part. A changed world is always checked again before commit.
-            cursors.put(entry.getKey(), found ? 0 : (start + MOST_TRIALS) % part.size());
-        }
-        Map<Integer, List<Ranked>> byPart = new LinkedHashMap<>();
-        safe.keySet().forEach(rank -> byPart.computeIfAbsent(rank.part(), any -> new ArrayList<>()).add(rank));
-        Map<BlockPos, Job> next = new LinkedHashMap<>();
-        boolean retreat = false;
-        for (List<Ranked> part : byPart.values()) {
-            List<Ranked> ordinary = part.stream().filter(rank -> !rank.passage()).toList();
-            List<Ranked> front = ordinary.isEmpty() ? part : ordinary;
-            retreat |= ordinary.isEmpty();
-            int layer = front.stream().mapToInt(rank -> rank.job().cell().getY()).min().orElseThrow();
-            int depth = front.stream().filter(rank -> rank.job().cell().getY() == layer)
-                .mapToInt(Ranked::depth).max().orElseThrow();
-            front.stream().filter(rank -> rank.job().cell().getY() == layer && rank.depth() == depth)
-                .forEach(rank -> next.put(rank.job().cell(), safe.get(rank)));
-        }
-        offered = Map.copyOf(next);
-        Set<Integer> activeParts = new HashSet<>();
-        safe.keySet().stream().filter(rank -> next.containsKey(rank.job().cell())).forEach(rank -> activeParts.add(rank.part()));
-        steppingAside = pending.isEmpty() ? List.of() : stepAside(context, parts, activeParts);
-        phase = next.isEmpty() ? Phase.WAITING : retreat ? Phase.RETREATING : Phase.FILLING;
-        if (!next.isEmpty() && next.values().stream().allMatch(job -> job.footings().cells().stream()
-                .noneMatch(at -> cells.contains(at.block(level))))) {
-            phase = Phase.CLOSING;
-        }
-        return List.copyOf(next.values());
+        return jobs();
     }
 
+    List<Job> jobs() {
+        return List.copyOf(offered.values());
+    }
+
+    String stage() {
+        return planning == null ? "idle" : planning.stage;
+    }
+
+    boolean advance() {
+        return allotted(budget -> {
+            if (context != null && !context.valid()) {
+                restart();
+            }
+            Map<UUID, Allowance> allowances = ALLOWANCES.get(level);
+            Allowance allowance = allowances == null ? null : allowances.get(colony);
+            if (allowance != null && allowance.commitZone != null
+                    && level.getServer().getTickCount() <= allowance.commitUntil) {
+                return false;
+            }
+            return advance(budget);
+        });
+    }
+
+    // A deterministic work-only budget is injectable by GameTests. A yield never discards a frontier.
+    boolean advance(Ground.Budget budget) {
+        if (closed || material == null || budget.exhausted()) {
+            return false;
+        }
+        if (context != null && !context.valid()) {
+            restart();
+        }
+        if (planning == null) {
+            return false;
+        }
+        Map<BlockPos, Job> before = offered;
+        List<Grown> moves = steppingAside;
+        planning.advance(budget);
+        return before != offered || moves != steppingAside;
+    }
+
+    private void restart() {
+        releaseCommit(false);
+        proofs.clear();
+        commitProofs.clear();
+        proving.clear();
+        provingDestinations.clear();
+        context = new Context();
+        planning = new Planning(context);
+        offered = Map.of();
+        steppingAside = List.of();
+        phase = Phase.WAITING;
+    }
+
+    private <T> T allotted(Function<Ground.Budget, T> call) {
+        if (closed) {
+            return call.apply(new Ground.Budget(0, 0));
+        }
+        Allowance allowance = ALLOWANCES.computeIfAbsent(level, any -> new HashMap<>())
+            .computeIfAbsent(colony, any -> new Allowance());
+        long tick = level.getServer().getTickCount();
+        if (allowance.tick != tick) {
+            allowance.tick = tick;
+            allowance.work = limits.work();
+            allowance.nanos = limits.nanos();
+        }
+        Ground.Budget budget = new Ground.Budget(Math.max(0, allowance.work),
+            limits.nanos() <= 0 ? 0 : Math.max(1L, allowance.nanos));
+        long started = System.nanoTime();
+        try {
+            return call.apply(budget);
+        } finally {
+            long elapsed = System.nanoTime() - started;
+            allowance.work = Math.max(0, allowance.work - budget.used());
+            if (limits.nanos() > 0) {
+                allowance.nanos = Math.max(0L, allowance.nanos - elapsed);
+                if (allowance.nanos == 0) {
+                    allowance.work = 0;
+                }
+            }
+            slices++;
+            lastWork = budget.used();
+            totalWork += lastWork;
+            totalNanos += elapsed;
+            maxSliceNanos = Math.max(maxSliceNanos, elapsed);
+        }
+    }
     boolean offered(BlockPos cell) {
         return !closed && offered.containsKey(cell);
     }
 
-    Optional<GroundRefusal> permits(BlockPos cell, BlockState material, Mob worker) {
+    Optional<GroundRefusal> permits(BlockPos cell, BlockState block, Mob worker) {
+        long began = System.nanoTime();
+        commitAttempts++;
+        try {
+            return allotted(budget -> {
+                if (!budget.exhausted() || !offered(cell)) {
+                    releaseCommit(!budget.exhausted());
+                }
+                Optional<GroundRefusal> answer = permits(cell, block, worker, budget);
+                if (answer.filter(reason -> reason == GroundRefusal.FILL_ACCESS_BLOCKED).isPresent() && budget.exhausted()) {
+                    proving.add(cell);
+                    commitBudgetYields++;
+                    yieldToCommit();
+                } else {
+                    proving.remove(cell);
+                    if (answer.isPresent()) {
+                        commitRefused++;
+                    } else {
+                        commitProved++;
+                    }
+                }
+                return answer;
+            });
+        } finally {
+            long elapsed = System.nanoTime() - began;
+            totalCommitNanos += elapsed;
+            maxCommitNanos = Math.max(maxCommitNanos, elapsed);
+        }
+    }
+
+    boolean proving(BlockPos cell) {
+        return !closed && proving.contains(cell);
+    }
+
+    boolean provingDestination(BlockPos feet) {
+        return !closed && provingDestinations.contains(feet);
+    }
+
+    private void yieldToCommit() {
+        Map<UUID, Allowance> allowances = ALLOWANCES.get(level);
+        Allowance allowance = allowances == null ? null : allowances.get(colony);
+        if (allowance != null) {
+            // A failed work node is offered again and winds up before its next attempt. Keep the
+            // allowance through that interval, rather than reserving only an otherwise idle next tick.
+            allowance.commitZone = zone;
+            allowance.commitUntil = level.getServer().getTickCount() + 200L;
+        }
+    }
+
+    private void releaseCommit(boolean any) {
+        Map<UUID, Allowance> allowances = ALLOWANCES.get(level);
+        Allowance allowance = allowances == null ? null : allowances.get(colony);
+        if (allowance != null && (any || zone.equals(allowance.commitZone))) {
+            allowance.commitZone = null;
+        }
+    }
+
+    private Optional<GroundRefusal> permits(BlockPos cell, BlockState block, Mob worker, Ground.Budget budget) {
         if (!offered(cell)) {
             return Optional.of(GroundRefusal.FILL_ACCESS_CHANGED);
         }
-        Context context = new Context();
-        if (!context.people.contains(worker)) {
-            context.people.add(worker);
-        }
-        List<BlockPos> stands = safeStances(context, cell, material, false);
-        Vec3 actual = position(worker);
-        View own = context.view(worker);
-        BlockPos feet = footing(worker, own.ground()).orElse(null);
-        // Work uses the same declared-stance contract as navigation. At the lip of a pit the centre of the
-        // lower cell can be hidden from the body's rounded block position while its valid work stance sees it.
-        if (stands.isEmpty() || feet == null || Reach.stanceHolding(actual, Set.copyOf(stands)).isEmpty()
-                || actual.add(0.0D, worker.getEyeHeight(), 0.0D).distanceToSqr(Vec3.atCenterOf(cell))
-                    > Reach.PLAYER_BLOCK_REACH * Reach.PLAYER_BLOCK_REACH) {
-            changed.run();
+        if (budget.exhausted()) {
             return Optional.of(GroundRefusal.FILL_ACCESS_BLOCKED);
         }
-        // Use this body's own route, including its dimensions and locomotion; the ordinary surveyor only
-        // chooses work to offer. A future promised block is never part of the trial ground.
-        Ground trial = own.ground().with(Map.of(cell, material));
-        if (trial.accessFrom(context.exits).distance(feet) < 0) {
+        if (context == null || !context.valid()) {
+            restart();
+            return Optional.of(GroundRefusal.FILL_ACCESS_CHANGED);
+        }
+        if (!context.advance(budget)) {
+            return Optional.of(GroundRefusal.FILL_ACCESS_BLOCKED);
+        }
+        Candidate proof = proofs.get(cell);
+        if (proof == null || !proof.block.equals(block)) {
+            // Material can be selected from a broad item filter. Its geometry must be proved too; retain
+            // this work across retries instead of redoing a large remaining-work scan on every attempt.
+            proof = commitProofs.computeIfAbsent(cell, any -> new Candidate(context, cell, block, List.of(), null));
+            if (!proof.block.equals(block)) {
+                proof = new Candidate(context, cell, block, List.of(), null);
+                commitProofs.put(cell, proof);
+            }
+            if (!proof.advance(budget) || proof.stands.isEmpty()) {
+                return Optional.of(GroundRefusal.FILL_ACCESS_BLOCKED);
+            }
+        }
+        Context live = context.withPeople();
+        if (!live.people.contains(worker)) {
+            live.people.add(worker);
+        }
+        Candidate check = new Candidate(live, cell, block, live.people, proof);
+        if (!check.advance(budget) || check.stands.isEmpty()) {
+            return Optional.of(GroundRefusal.FILL_ACCESS_BLOCKED);
+        }
+        View own = live.view(worker);
+        if (!own.access().advance(budget)) {
+            return Optional.of(GroundRefusal.FILL_ACCESS_BLOCKED);
+        }
+        FootSearch footing = live.footing(worker, own.ground());
+        if (!footing.advance(budget)) {
+            return Optional.of(GroundRefusal.FILL_ACCESS_BLOCKED);
+        }
+        BlockPos feet = footing.feet;
+        Vec3 actual = position(worker);
+        if (feet == null || Reach.stanceHolding(actual, Set.copyOf(check.stands)).isEmpty()
+                || actual.add(0.0D, worker.getEyeHeight(), 0.0D).distanceToSqr(Vec3.atCenterOf(cell))
+                    > Reach.PLAYER_BLOCK_REACH * Reach.PLAYER_BLOCK_REACH) {
+            return Optional.of(GroundRefusal.FILL_ACCESS_BLOCKED);
+        }
+        Ground.Access escape = live.trial(own, cell, block).access();
+        if (!escape.advance(budget) || escape.distance(feet) < 0) {
             return Optional.of(GroundRefusal.FILL_ACCESS_BLOCKED);
         }
         return Optional.empty();
     }
-
     void committed(BlockPos cell) {
-        cursors.clear();
-        Set<BlockPos> left = new HashSet<>(pending);
-        left.remove(cell);
-        pending = Set.copyOf(left);
+        proving.remove(cell);
+        pending.remove(cell);
         Map<BlockPos, Job> next = new LinkedHashMap<>(offered);
         next.remove(cell);
         offered = Map.copyOf(next);
@@ -241,10 +413,38 @@ final class FillPlan implements AutoCloseable {
     }
 
     boolean safeDestination(LivingEntity body, BlockPos target) {
-        return !closed && clearAsideStance(body, target)
-            && new Context().view(body).access().distance(target) >= 0;
+        return allotted(budget -> {
+            if (!budget.exhausted()) {
+                releaseCommit(true);
+            }
+            boolean answer = safeDestination(body, target, budget);
+            if (!answer && !closed && budget.exhausted()) {
+                provingDestinations.add(target);
+                yieldToCommit();
+            } else {
+                provingDestinations.remove(target);
+            }
+            return answer;
+        });
     }
 
+    private boolean safeDestination(LivingEntity body, BlockPos target, Ground.Budget budget) {
+        if (closed || budget.exhausted() || !clearAsideStance(body, target)) {
+            return false;
+        }
+        if (context == null || !context.valid()) {
+            restart();
+        }
+        if (!context.advance(budget)) {
+            return false;
+        }
+        Context live = context.withPeople();
+        if (!live.valid()) {
+            return false;
+        }
+        Ground.Access access = live.view(body).access();
+        return access.advance(budget) && access.distance(target) >= 0;
+    }
     boolean clearOfFill(LivingEntity body) {
         Vec3 here = position(body);
         return missesPending(body.getBoundingBox().move(here.subtract(body.position())));
@@ -254,135 +454,282 @@ final class FillPlan implements AutoCloseable {
         changed.run();
     }
 
-    private List<BlockPos> safeStances(Context context, BlockPos cell, BlockState material, boolean planning) {
-        if (!Survey.open(level.getBlockState(cell)) || !material.canSurvive(level, cell)
-                || material.getBlock() instanceof FallingBlock && FallingBlock.isFree(level.getBlockState(cell.below()))) {
-            return List.of();
-        }
-        var shape = material.getCollisionShape(level, cell).move(cell.getX(), cell.getY(), cell.getZ());
-        for (LivingEntity body : context.people) {
-            Vec3 here = position(body);
-            AABB box = body.getBoundingBox().move(here.subtract(body.position()));
-            if (shape.toAabbs().stream().anyMatch(box::intersects)) {
-                return List.of();
-            }
-        }
-        View before = context.view(surveyor);
-        Ground after = before.ground().with(Map.of(cell, material));
-        Ground.Access access = after.accessFrom(context.exits);
-        List<BlockPos> approaches = planning ? context.workStances(before.access(), cell)
-            : before.access().stancesFor(cell);
-        List<BlockPos> stands = approaches.stream()
-            .filter(feet -> access.distance(feet) >= 0).toList();
-        if (stands.isEmpty()) {
-            return List.of();
-        }
-        for (LivingEntity body : context.people) {
-            View own = context.view(body);
-            Optional<BlockPos> feet = footing(body, own.ground());
-            if (feet.isEmpty()) {
-                continue;
-            }
-            if (own.access().distance(feet.get()) >= 0) {
-                if (affectsRoute(cell, body, own.access().path(feet.get()))
-                        && own.ground().with(Map.of(cell, material)).accessFrom(context.exits).distance(feet.get()) < 0) {
-                    return List.of();
-                }
-            } else {
-                // A pre-existing trapped neighbour must not freeze an unrelated room, but filling in its
-                // own connected space must wait for a way out, even when the new block misses its body.
-                Ground.Access room = own.ground().accessFrom(List.of(feet.get()));
-                if (room.distance(cell) >= 0 || room.distance(cell.below()) >= 0
-                        || room.distance(cell.above()) >= 0
-                        || Direction.Plane.HORIZONTAL.stream().anyMatch(side -> room.distance(cell.relative(side)) >= 0)) {
-                    return List.of();
-                }
-            }
-        }
-        // Keep entrances to the rest of the loaded world connected too. This protects people beyond the
-        // watch boundary without pretending that reaching an arbitrary boundary is itself an escape.
-        for (BlockPos port : context.ports(before)) {
-            if (access.distance(port) < 0) {
-                return List.of();
-            }
-        }
-        for (Job job : remaining) {
-            if (!job.cell().equals(cell) && pending.contains(job.cell()) && Survey.open(level.getBlockState(job.cell()))) {
-                List<BlockPos> previous = context.workStances(before.access(), job.cell());
-                if (!previous.isEmpty() && previous.stream().noneMatch(feet -> access.canWorkFrom(feet, job.cell()))
-                        && context.workStances(access, job.cell()).isEmpty()) {
-                    return List.of();
-                }
-            }
-        }
-        return stands;
-    }
+    // A candidate is a continuation. The graph search, people, boundary ports and remaining jobs all
+    // retain their own cursor; one large component cannot turn a yield into a restart or hide another.
+    private final class Candidate {
+        final Context source;
+        final BlockPos cell;
+        final BlockState block;
+        final List<LivingEntity> people;
+        final Candidate geometry;
+        final List<AABB> shape;
+        View before;
+        Ground after;
+        Ground.Access access;
+        List<BlockPos> stands = List.of();
+        int stage;
+        int person;
+        int port;
+        int job;
+        View own;
+        FootSearch foot;
+        Ground.Access escape;
+        boolean done;
 
-    private static boolean affectsRoute(BlockPos cell, LivingEntity body, List<BlockPos> route) {
-        int across = (int) Math.ceil(body.getBbWidth()) + 2;
-        int above = (int) Math.ceil(body.getBbHeight()) + 4;
-        // Include the neighbouring blocks read by walking, jumping, support and door checks, not just the
-        // body's occupied cells. A route beyond this envelope remains an unchanged proof of escape.
-        return route.stream().anyMatch(feet -> Math.abs(feet.getX() - cell.getX()) <= across
-            && Math.abs(feet.getZ() - cell.getZ()) <= across
-            && cell.getY() >= feet.getY() - 5 && cell.getY() <= feet.getY() + above);
-    }
+        Candidate(Context source, BlockPos cell, BlockState block, List<LivingEntity> people, Candidate geometry) {
+            this.source = source;
+            this.cell = cell;
+            this.block = block;
+            this.people = people;
+            this.geometry = geometry;
+            shape = block.getCollisionShape(level, cell).move(cell.getX(), cell.getY(), cell.getZ()).toAabbs();
+        }
 
-    private List<Grown> stepAside(Context context, Map<BlockPos, Integer> parts, Set<Integer> activeParts) {
-        List<Grown> moves = new ArrayList<>();
-        for (LivingEntity body : context.people) {
-            if (!(body instanceof Mob mob) || Bodies.of(body).flatMap(held -> held.colonyId())
-                    .filter(colony::equals).isEmpty()) {
-                continue;
+        boolean advance(Ground.Budget budget) {
+            while (!done && !budget.exhausted()) {
+                if (!source.valid()) {
+                    reject();
+                    break;
+                }
+                if (stage > 4 && stage < 8 && own != null && !own.ground().valid()) {
+                    // Movement normally preserves geometry, but waking, rail rules or changed movement
+                    // penalties can replace this person's capability while a search is suspended.
+                    stage = 4;
+                    own = null;
+                    foot = null;
+                    escape = null;
+                }
+                // Searches consume their own units. A wrapper charge would starve one-unit slices.
+                if (stage != 2 && stage != 3 && stage != 4 && stage != 6 && stage != 7 && stage != 8
+                        && !budget.tryStep()) {
+                    return false;
+                }
+                switch (stage) {
+                    case 0 -> {
+                        if (!Survey.open(level.getBlockState(cell)) || !block.canSurvive(level, cell)
+                                || block.getBlock() instanceof FallingBlock
+                                    && FallingBlock.isFree(level.getBlockState(cell.below()))) {
+                            reject();
+                        } else {
+                            stage++;
+                        }
+                    }
+                    case 1 -> {
+                        if (person < people.size()) {
+                            LivingEntity body = people.get(person++);
+                            Vec3 here = position(body);
+                            AABB box = body.getBoundingBox().move(here.subtract(body.position()));
+                            if (shape.stream().anyMatch(box::intersects)) {
+                                reject();
+                            }
+                        } else {
+                            person = 0;
+                            before = source.view(surveyor);
+                            stage++;
+                        }
+                    }
+                    case 2 -> {
+                        if (!before.access().advance(budget)) {
+                            return false;
+                        }
+                        Trial placed = geometry == null ? source.trial(before, cell, block) : null;
+                        after = geometry == null ? placed.ground() : geometry.after;
+                        access = geometry == null ? placed.access() : geometry.access;
+                        stage++;
+                    }
+                    case 3 -> {
+                        if (!access.advance(budget)) {
+                            return false;
+                        }
+                        if (!budget.tryStep()) {
+                            return false;
+                        }
+                        List<BlockPos> approaches = geometry == null
+                            ? source.workStances(before.access(), cell) : before.access().stancesFor(cell);
+                        stands = approaches.stream().filter(feet -> access.distance(feet) >= 0).toList();
+                        if (stands.isEmpty()) {
+                            reject();
+                        } else {
+                            stage++;
+                        }
+                    }
+                    case 4 -> {
+                        if (person == people.size()) {
+                            stage = geometry == null ? 8 : 10;
+                            continue;
+                        }
+                        LivingEntity body = people.get(person);
+                        own = source.view(body);
+                        if (!own.access().advance(budget)) {
+                            return false;
+                        }
+                        foot = source.footing(body, own.ground());
+                        if (!foot.advance(budget)) {
+                            return false;
+                        }
+                        if (foot.feet == null) {
+                            person++;
+                            continue;
+                        }
+                        if (own.access().distance(foot.feet) >= 0) {
+                            // Same-capability bodies share this explicit-exit graph. Checking their
+                            // current footings costs one query each, rather than copying every path.
+                            escape = source.trial(own, cell, block).access();
+                            stage = 6;
+                        } else {
+                            escape = own.ground().beginAccess(List.of(foot.feet));
+                            stage = 7;
+                        }
+                    }
+                    case 6 -> {
+                        if (!escape.advance(budget)) {
+                            return false;
+                        }
+                        if (escape.distance(foot.feet) < 0) {
+                            reject();
+                        } else {
+                            person++;
+                            stage = 4;
+                        }
+                    }
+                    case 7 -> {
+                        if (!escape.advance(budget)) {
+                            return false;
+                        }
+                        if (!escape.exhaustive() || escape.distance(cell) >= 0 || escape.distance(cell.below()) >= 0
+                                || escape.distance(cell.above()) >= 0
+                                || Direction.Plane.HORIZONTAL.stream().anyMatch(side -> escape.distance(cell.relative(side)) >= 0)) {
+                            reject();
+                        } else {
+                            person++;
+                            stage = 4;
+                        }
+                    }
+                    case 8 -> {
+                        if (!source.portsReady(before, budget)) {
+                            return false;
+                        }
+                        if (!budget.tryStep()) {
+                            return false;
+                        }
+                        if (port < source.ports.size()) {
+                            if (access.distance(source.ports.get(port++)) < 0) {
+                                reject();
+                            }
+                        } else {
+                            stage++;
+                        }
+                    }
+                    case 9 -> {
+                        if (job == remaining.size()) {
+                            stage++;
+                            continue;
+                        }
+                        Job next = remaining.get(job++);
+                        if (next.cell().equals(cell) || !pending.contains(next.cell())
+                                || !Survey.open(level.getBlockState(next.cell()))) {
+                            continue;
+                        }
+                        List<BlockPos> previous = source.workStances(before.access(), next.cell());
+                        if (!previous.isEmpty() && previous.stream().noneMatch(feet -> access.canWorkFrom(feet, next.cell()))
+                                && source.workStances(access, next.cell()).isEmpty()) {
+                            reject();
+                        }
+                    }
+                    default -> done = true;
+                }
             }
-            View view = context.view(body);
-            Optional<BlockPos> from = footing(body, view.ground());
-            if (from.isEmpty()) {
-                continue;
-            }
-            List<BlockPos> way = view.access().path(from.get());
-            if (way.isEmpty() || clearOfFill(body) && way.stream().noneMatch(this::occupiesPending)) {
-                continue;
-            }
-            Integer part = parts.get(from.get());
-            if (part == null) {
-                part = parts.get(from.get().above());
-            }
-            if (part == null) {
-                part = parts.get(from.get().below());
-            }
-            if (part == null) {
-                for (BlockPos feet : way) {
-                    part = parts.get(feet);
+            return done;
+        }
+
+        void reject() {
+            stands = List.of();
+            done = true;
+        }
+    }
+    private final class Aside {
+        final Context source;
+        final Map<BlockPos, Integer> parts;
+        final Set<Integer> active;
+        final List<Grown> moves = new ArrayList<>();
+        int person;
+        LivingEntity body;
+        List<BlockPos> way;
+        int cursor;
+        int last;
+        Integer part;
+        boolean crosses;
+
+        Aside(Context source, Map<BlockPos, Integer> parts, Set<Integer> active) {
+            this.source = source;
+            this.parts = parts;
+            this.active = active;
+        }
+
+        boolean advance(Ground.Budget budget) {
+            while (person < source.people.size() && !budget.exhausted()) {
+                if (body == null) {
+                    LivingEntity next = source.people.get(person);
+                    if (!(next instanceof Mob) || Bodies.of(next).flatMap(held -> held.colonyId())
+                            .filter(colony::equals).isEmpty()) {
+                        if (!budget.tryStep()) {
+                            return false;
+                        }
+                        person++;
+                        continue;
+                    }
+                    View view = source.view(next);
+                    if (!view.access().advance(budget)) {
+                        return false;
+                    }
+                    FootSearch search = source.footing(next, view.ground());
+                    if (!search.advance(budget)) {
+                        return false;
+                    }
+                    if (search.feet == null) {
+                        person++;
+                        continue;
+                    }
+                    body = next;
+                    way = view.access().path(search.feet);
+                    part = partAt(search.feet, parts);
+                    cursor = 0;
+                    last = -1;
+                    crosses = false;
+                }
+                if (!budget.tryStep()) {
+                    return false;
+                }
+                if (cursor < way.size()) {
+                    BlockPos at = way.get(cursor);
+                    crosses |= occupiesPending(at);
                     if (part == null) {
-                        part = parts.get(feet.above());
+                        part = partAt(at, parts);
                     }
-                    if (part == null) {
-                        part = parts.get(feet.below());
+                    if (!clearAsideStance(body, at)) {
+                        last = cursor;
                     }
-                    if (part != null) {
-                        break;
+                    cursor++;
+                } else {
+                    if (!way.isEmpty() && (!clearOfFill(body) || crosses)
+                            && (part == null || !active.contains(part)) && last >= 0 && last + 1 < way.size()) {
+                        moves.add(Grown.of(new StepAsideNode(FillPlan.this, zone, (Mob) body, way.get(last + 1), level)));
                     }
+                    body = null;
+                    person++;
                 }
             }
-            if (part != null && activeParts.contains(part)) {
-                continue;
-            }
-            int last = -1;
-            for (int i = 0; i < way.size(); i++) {
-                if (!clearAsideStance(body, way.get(i))) {
-                    last = i;
-                }
-            }
-            // Retire beyond the last part of the route that filling still needs. Merely standing on a finished
-            // patch can leave the resident depending on the very passage that is waiting to close.
-            if (last >= 0 && last + 1 < way.size()) {
-                moves.add(Grown.of(new StepAsideNode(this, zone, mob, way.get(last + 1), level)));
-            }
+            return person == source.people.size();
         }
-        return List.copyOf(moves);
     }
 
+    private static Integer partAt(BlockPos feet, Map<BlockPos, Integer> parts) {
+        Integer part = parts.get(feet);
+        if (part == null) {
+            part = parts.get(feet.above());
+        }
+        return part == null ? parts.get(feet.below()) : part;
+    }
     private boolean occupiesPending(BlockPos feet) {
         return pending.contains(feet) || pending.contains(feet.above()) || pending.contains(feet.below());
     }
@@ -395,8 +742,12 @@ final class FillPlan implements AutoCloseable {
     }
 
     private boolean missesPending(AABB box) {
+        int checked = 0;
         for (BlockPos cell : BlockPos.betweenClosed(BlockPos.containing(box.minX, box.minY, box.minZ),
                 BlockPos.containing(box.maxX, box.maxY, box.maxZ))) {
+            if (++checked > 4096) {
+                return false;
+            }
             if (pending.contains(cell) && box.intersects(new AABB(cell))) {
                 return false;
             }
@@ -404,62 +755,388 @@ final class FillPlan implements AutoCloseable {
         return true;
     }
 
-    private Map<BlockPos, Integer> parts() {
-        Map<BlockPos, Integer> found = new HashMap<>();
-        int index = 0;
-        for (BlockPos cell : pending.stream().sorted(Comparator.comparingLong(BlockPos::asLong)).toList()) {
-            if (found.containsKey(cell)) {
-                continue;
-            }
-            int part = index++;
-            ArrayDeque<BlockPos> open = new ArrayDeque<>();
-            open.add(cell);
-            found.put(cell, part);
-            while (!open.isEmpty()) {
-                BlockPos at = open.removeFirst();
-                for (Direction side : Direction.values()) {
-                    BlockPos next = at.relative(side);
-                    if (pending.contains(next) && found.putIfAbsent(next, part) == null) {
-                        open.addLast(next);
+    private final class Planning {
+        final Context source;
+        final Set<BlockPos> left = new LinkedHashSet<>();
+        final List<Job> jobs = new ArrayList<>();
+        final Map<BlockPos, Integer> parts = new HashMap<>();
+        final ArrayDeque<BlockPos> open = new ArrayDeque<>();
+        final Set<BlockPos> passage = new HashSet<>();
+        final List<Ranked> ranks = new ArrayList<>();
+        final PriorityQueue<Ranked> ordered = new PriorityQueue<>(Comparator
+            .comparingInt((Ranked rank) -> rank.job().cell().getY())
+            .thenComparing(Comparator.comparingInt(Ranked::depth).reversed())
+            .thenComparingLong(rank -> rank.job().cell().asLong()));
+        final Map<Integer, Part> byPart = new LinkedHashMap<>();
+        final List<Part> candidates = new ArrayList<>();
+        Iterator<BlockPos> cellsLeft = cells.iterator();
+        Iterator<BlockPos> seeds;
+        Iterator<BlockPos> path;
+        View view;
+        int step;
+        int part = -1;
+        int person;
+        int job;
+        int rank;
+        int nextPart;
+        int finishedParts;
+        Aside aside;
+        Publication publication;
+        Set<Integer> active = Set.of();
+        boolean done;
+        String stage = "inputs";
+
+        Planning(Context source) {
+            this.source = source;
+        }
+
+        void advance(Ground.Budget budget) {
+            while (!done && !budget.exhausted()) {
+                if (publication != null) {
+                    if (!publication.advance(budget)) {
+                        return;
+                    }
+                    active = publication.active;
+                    publication = null;
+                }
+                switch (step) {
+                    case 0 -> {
+                        if (!budget.tryStep()) {
+                            return;
+                        }
+                        if (cellsLeft.hasNext()) {
+                            BlockPos cell = cellsLeft.next();
+                            if (wanted.contains(Job.keyOf(cell)) && Survey.open(level.getBlockState(cell))) {
+                                left.add(cell);
+                            }
+                        } else {
+                            pending = left;
+                            step++;
+                        }
+                    }
+                    case 1 -> {
+                        if (!budget.tryStep()) {
+                            return;
+                        }
+                        if (job < inputs.size()) {
+                            Job next = inputs.get(job++);
+                            if (pending.contains(next.cell())) {
+                                jobs.add(next);
+                            }
+                        } else {
+                            remaining = Collections.unmodifiableList(jobs);
+                            seeds = pending.iterator();
+                            job = 0;
+                            stage = "components";
+                            step++;
+                        }
+                    }
+                    case 2 -> {
+                        if (!budget.tryStep()) {
+                            return;
+                        }
+                        if (!open.isEmpty()) {
+                            BlockPos at = open.removeFirst();
+                            for (Direction side : Direction.values()) {
+                                BlockPos next = at.relative(side);
+                                if (pending.contains(next) && parts.putIfAbsent(next, part) == null) {
+                                    open.addLast(next);
+                                }
+                            }
+                        } else if (seeds.hasNext()) {
+                            BlockPos seed = seeds.next();
+                            if (!parts.containsKey(seed)) {
+                                parts.put(seed, ++part);
+                                open.add(seed);
+                            }
+                        } else {
+                            stage = "exits";
+                            step++;
+                        }
+                    }
+                    case 3 -> {
+                        if (!source.advance(budget)) {
+                            return;
+                        }
+                        view = source.view(surveyor);
+                        if (!view.access().advance(budget)) {
+                            return;
+                        }
+                        stage = "people routes";
+                        step++;
+                    }
+                    case 4 -> {
+                        if (path != null && path.hasNext()) {
+                            if (!budget.tryStep()) {
+                                return;
+                            }
+                            protect(passage, path.next());
+                            continue;
+                        }
+                        path = null;
+                        if (person == source.people.size()) {
+                            stage = "work routes";
+                            step++;
+                            continue;
+                        }
+                        LivingEntity body = source.people.get(person);
+                        View own = source.view(body);
+                        if (!own.access().advance(budget)) {
+                            return;
+                        }
+                        FootSearch search = source.footing(body, own.ground());
+                        if (!search.advance(budget)) {
+                            return;
+                        }
+                        path = search.feet == null ? Collections.emptyIterator() : own.access().path(search.feet).iterator();
+                        person++;
+                    }
+                    case 5 -> {
+                        if (!budget.tryStep()) {
+                            return;
+                        }
+                        if (path != null && path.hasNext()) {
+                            protect(passage, path.next());
+                            continue;
+                        }
+                        path = null;
+                        if (job == remaining.size()) {
+                            stage = "order";
+                            step++;
+                            continue;
+                        }
+                        Job next = remaining.get(job++);
+                        List<BlockPos> stands = source.workStances(view.access(), next.cell());
+                        if (!stands.isEmpty()) {
+                            BlockPos entry = stands.stream().min(Comparator.comparingInt(view.access()::distance)).orElseThrow();
+                            path = view.access().path(entry).iterator();
+                            ranks.add(new Ranked(next, parts.get(next.cell()), view.access().distance(entry) / BAND, false));
+                        }
+                    }
+                    case 6 -> {
+                        if (!budget.tryStep()) {
+                            return;
+                        }
+                        if (rank < ranks.size()) {
+                            Ranked next = ranks.get(rank++);
+                            ordered.add(new Ranked(next.job(), next.part(), next.depth(), passage.contains(next.job().cell())));
+                        } else {
+                            step++;
+                        }
+                    }
+                    case 7 -> {
+                        if (!budget.tryStep()) {
+                            return;
+                        }
+                        if (!ordered.isEmpty()) {
+                            Ranked next = ordered.remove();
+                            Part group = byPart.get(next.part());
+                            if (group == null) {
+                                group = new Part(next.part());
+                                byPart.put(next.part(), group);
+                                candidates.add(group);
+                            }
+                            group.ranks.add(next);
+                        } else {
+                            stage = "candidates";
+                            step++;
+                        }
+                    }
+                    case 8 -> {
+                        if (candidates.isEmpty()) {
+                            finishCandidates();
+                            continue;
+                        }
+                        // Rotate before advancing. Even a search that needs the entire remaining slice
+                        // yields its turn to the next component on the following tick.
+                        Part group = candidates.get(Math.floorMod(nextPart++, candidates.size()));
+                        if (group.done) {
+                            if (!budget.tryStep()) {
+                                return;
+                            }
+                        } else {
+                            int used = budget.used();
+                            group.advance(budget);
+                            if (budget.used() == used && !budget.tryStep()) {
+                                return;
+                            }
+                            if (group.published) {
+                                publish();
+                                group.published = false;
+                            }
+                        }
+                        if (finishedParts == candidates.size()) {
+                            finishCandidates();
+                        }
+                    }
+                    default -> {
+                        if (aside == null) {
+                            aside = new Aside(source, parts, active);
+                        }
+                        if (!aside.advance(budget)) {
+                            return;
+                        }
+                        steppingAside = List.copyOf(aside.moves);
+                        stage = "complete";
+                        done = true;
                     }
                 }
             }
         }
-        return found;
-    }
 
-    private Optional<BlockPos> footing(LivingEntity body, Ground ground) {
-        Vec3 actual = position(body);
-        BlockPos at = BlockPos.containing(actual);
-        for (int dy : new int[] {0, -1, 1, -2}) {
-            BlockPos feet = at.offset(0, dy, 0);
-            if (ground.standable(feet)) {
-                return Optional.of(feet);
+        void finishCandidates() {
+            publish();
+            stage = "retreat";
+            step = 9;
+        }
+
+        void publish() {
+            publication = new Publication();
+        }
+
+        final class Publication {
+            final Iterator<Part> groups = candidates.iterator();
+            final Map<BlockPos, Job> next = new LinkedHashMap<>();
+            final Set<Integer> active = new HashSet<>();
+            Iterator<Job> jobs = Collections.emptyIterator();
+            boolean retreat;
+            boolean closing = true;
+
+            boolean advance(Ground.Budget budget) {
+                while (budget.tryStep()) {
+                    if (jobs.hasNext()) {
+                        Job job = jobs.next();
+                        next.put(job.cell(), job);
+                        closing &= job.footings().cells().stream().noneMatch(at -> cells.contains(at.block(level)));
+                    } else if (groups.hasNext()) {
+                        Part group = groups.next();
+                        if ((group.ordinary || group.done) && !group.front.isEmpty()) {
+                            jobs = group.front.values().iterator();
+                            active.add(group.id);
+                            retreat |= !group.ordinary;
+                        }
+                    } else {
+                        offered = Collections.unmodifiableMap(next);
+                        phase = next.isEmpty() ? Phase.WAITING : closing ? Phase.CLOSING
+                            : retreat ? Phase.RETREATING : Phase.FILLING;
+                        return true;
+                    }
+                }
+                return false;
             }
         }
-        // A body can stand across the edge of a pit with its centre over air. Navigation's arrival contract
-        // also includes the adjacent supporting stance; do not turn that legitimate position into no footing.
-        List<BlockPos> nearby = new ArrayList<>();
-        for (BlockPos feet : BlockPos.betweenClosed(at.offset(-1, -1, -1), at.offset(1, 1, 1))) {
-            if (Reach.standingAt(actual, feet) && ground.standable(feet)) {
-                nearby.add(feet.immutable());
+
+        final class Part {
+            final int id;
+            final List<Ranked> ranks = new ArrayList<>();
+            final Map<BlockPos, Job> front = new LinkedHashMap<>();
+            int tried;
+            int start = -1;
+            int layer;
+            int depth;
+            boolean ordinary;
+            boolean done;
+            boolean published;
+            Candidate trial;
+            Ranked next;
+
+            Part(int id) {
+                this.id = id;
+            }
+
+            void advance(Ground.Budget budget) {
+                if (start < 0) {
+                    start = Math.floorMod(cursors.getOrDefault(id, 0), ranks.size());
+                }
+                if (trial == null) {
+                    next = ranks.get((start + tried) % ranks.size());
+                    trial = new Candidate(source, next.job().cell(), material, source.people, null);
+                }
+                if (!trial.advance(budget)) {
+                    return;
+                }
+                if (!trial.stands.isEmpty()) {
+                    proofs.put(next.job().cell(), trial);
+                    boolean normal = !next.passage();
+                    int y = next.job().cell().getY();
+                    if (front.isEmpty() || normal && !ordinary || normal == ordinary
+                            && (y < layer || y == layer && next.depth() > depth)) {
+                        front.clear();
+                        layer = y;
+                        depth = next.depth();
+                        ordinary = normal;
+                    }
+                    if (normal == ordinary && y == layer && next.depth() == depth) {
+                        Job job = next.job();
+                        front.put(job.cell(), new Job(job.key(), job.site(), job.cell(), job.cells(), job.canopy(),
+                            Stances.of(level, trial.stands).orElseThrow()));
+                        published = true;
+                    }
+                }
+                trial = null;
+                tried++;
+                // A different part may start placing before this round finishes. Keep the rejected
+                // prefix cursor now, so those placements cannot repeatedly hide candidate 65.
+                cursors.put(id, front.isEmpty() ? (start + tried) % ranks.size() : 0);
+                if (tried == Math.min(MOST_TRIALS, ranks.size())) {
+                    cursors.put(id, front.isEmpty() ? (start + MOST_TRIALS) % ranks.size() : 0);
+                    done = true;
+                    finishedParts++;
+                    published = true;
+                }
             }
         }
-        nearby.sort(Comparator.comparingDouble(feet -> Vec3.atBottomCenterOf(feet).distanceToSqr(actual)));
-        if (!nearby.isEmpty()) {
-            return Optional.of(nearby.getFirst());
-        }
-        return Optional.empty();
     }
 
-    private static void protect(Set<BlockPos> into, List<BlockPos> path) {
-        for (BlockPos feet : path) {
-            into.add(feet);
-            into.add(feet.above());
-            into.add(feet.above(2));
+    private final class FootSearch {
+        final LivingEntity body;
+        final Ground ground;
+        final Vec3 actual;
+        final List<BlockPos> candidates = new ArrayList<>();
+        int index;
+        BlockPos feet;
+        boolean done;
+
+        FootSearch(LivingEntity body, Ground ground) {
+            this.body = body;
+            this.ground = ground;
+            actual = position(body);
+            BlockPos at = BlockPos.containing(actual);
+            for (int dy : new int[] {0, -1, 1, -2}) {
+                candidates.add(at.offset(0, dy, 0));
+            }
+            List<BlockPos> nearby = new ArrayList<>();
+            for (BlockPos near : BlockPos.betweenClosed(at.offset(-1, -1, -1), at.offset(1, 1, 1))) {
+                if (Reach.standingAt(actual, near)) {
+                    nearby.add(near.immutable());
+                }
+            }
+            nearby.sort(Comparator.comparingDouble(near -> Vec3.atBottomCenterOf(near).distanceToSqr(actual)));
+            candidates.addAll(nearby);
+        }
+
+        boolean advance(Ground.Budget budget) {
+            while (!done && index < candidates.size()) {
+                BlockPos at = candidates.get(index);
+                if (!ground.prepare(at, budget) || !budget.tryStep()) {
+                    return false;
+                }
+                index++;
+                if (ground.standable(at)) {
+                    feet = at;
+                    done = true;
+                }
+            }
+            done |= index == candidates.size();
+            return done;
         }
     }
 
+    private static void protect(Set<BlockPos> into, BlockPos feet) {
+        into.add(feet);
+        into.add(feet.above());
+        into.add(feet.above(2));
+    }
     private Vec3 position(LivingEntity body) {
         return WorldSpaces.relative(level, realm, body.position()).orElse(body.position())
             .add(origin.getX(), origin.getY(), origin.getZ());
@@ -513,33 +1190,203 @@ final class FillPlan implements AutoCloseable {
         return feet.distSqr(new BlockPos(x, y, z));
     }
 
+    // Both trusted store approaches and the six boundary faces are enumerated under the same budget as
+    // graph searches. A store no longer hides a synchronous 11 x 11 x 11 Reach.workableCells scan.
     private final class Context {
-
-        private final List<LivingEntity> people;
-        private final List<BlockPos> exits;
-        private final Map<UUID, View> views = new HashMap<>();
-        private final Map<Ground.Access, Map<BlockPos, List<BlockPos>>> approaches = new HashMap<>();
-        private List<BlockPos> ports;
+        private List<LivingEntity> people = new ArrayList<>();
+        private List<BlockPos> exits = List.of();
+        private final Map<UUID, View> views;
+        private final Map<UUID, FootSearch> footings;
+        private final Map<Ground.Access, Map<BlockPos, List<BlockPos>>> approaches;
+        private final Map<Ground.Access, Map<Change, Trial>> trials;
+        private final PriorityQueue<BlockPos> trusted = new PriorityQueue<>(Comparator
+            .comparingDouble(FillPlan.this::apart).thenComparingLong(BlockPos::asLong).reversed());
+        private Iterator<BlockPos> stores;
+        private Iterator<BlockPos> near;
+        private BlockPos store;
+        private final Set<BlockPos> found = new LinkedHashSet<>();
+        private Boundary perimeter;
+        private Boundary edges;
+        private final List<BlockPos> ports;
+        private boolean portsDone;
+        private int stage;
+        private Grounds.Watch source;
+        private long revision = Long.MIN_VALUE;
+        private long liveRevision;
 
         Context() {
-            List<BlockPos> trusted = external.get().stream().filter(FillPlan.this::outsideAll)
-                .filter(feet -> apart(feet) <= MOST_EXIT_DISTANCE * MOST_EXIT_DISTANCE)
-                .filter(feet -> level.isLoaded(feet) && Footing.withFeetAt(level, feet))
-                .sorted(Comparator.comparingDouble(FillPlan.this::apart).thenComparingLong(BlockPos::asLong))
-                .limit(32).toList();
-            reframe(trusted);
-            people = new ArrayList<>(level.getEntitiesOfClass(LivingEntity.class, worldBounds,
+            views = new HashMap<>();
+            footings = new HashMap<>();
+            approaches = new HashMap<>();
+            trials = new HashMap<>();
+            ports = new ArrayList<>();
+            source = watch;
+            liveRevision = LIVE_REVISIONS.getOrDefault(level, 0L);
+        }
+
+        Context(Context earlier) {
+            views = earlier.views;
+            footings = earlier.footings;
+            approaches = earlier.approaches;
+            trials = earlier.trials;
+            exits = earlier.exits;
+            ports = earlier.ports;
+            portsDone = earlier.portsDone;
+            source = earlier.source;
+            revision = earlier.revision;
+            liveRevision = earlier.liveRevision;
+            people = people();
+            stage = 3;
+        }
+
+        Context withPeople() {
+            watch.refresh();
+            return new Context(this);
+        }
+
+        private List<LivingEntity> people() {
+            // A moving realm can change its world projection without changing the local terrain.
+            return new ArrayList<>(level.getEntitiesOfClass(LivingEntity.class, worldBounds(),
                 body -> body.isAlive() && !body.isSpectator()));
-            Set<BlockPos> found = new LinkedHashSet<>(trusted);
-            found.addAll(exits());
-            exits = List.copyOf(found);
+        }
+
+        private void stamp() {
+            source = watch;
+            revision = watch.revision();
+            liveRevision = LIVE_REVISIONS.getOrDefault(level, 0L);
+        }
+
+        boolean valid() {
+            if (closed || source != watch) {
+                return false;
+            }
+            if (revision == Long.MIN_VALUE) {
+                return true;
+            }
+            if (revision != watch.revision()) {
+                return false;
+            }
+            long now = LIVE_REVISIONS.getOrDefault(level, 0L);
+            if (liveRevision != now) {
+                ArrayDeque<Activation> changes = ACTIVATIONS.get(level);
+                if (changes == null || changes.isEmpty() || changes.getFirst().revision() > liveRevision + 1) {
+                    return false;
+                }
+                // Only a newly added fill can turn a proved exterior into future fill space. Removal
+                // merely releases space, and a distant colony cannot affect any exit inside this watch.
+                // The bounded journal also makes this check independent of the total number of zones.
+                for (Activation change : changes) {
+                    if (change.revision() > liveRevision && change.bounds().intersects(bounds)) {
+                        return false;
+                    }
+                }
+                liveRevision = now;
+            }
+            return true;
+        }
+
+        boolean advance(Ground.Budget budget) {
+            if (revision == Long.MIN_VALUE) {
+                if (!budget.tryStep()) {
+                    return false;
+                }
+                stamp();
+            }
+            while (stage < 3 && budget.tryStep()) {
+                if (stage == 0) {
+                    if (stores == null) {
+                        stores = external.get().iterator();
+                    }
+                    if (near != null && near.hasNext()) {
+                        BlockPos feet = near.next().immutable();
+                        if (outsideAll(feet) && apart(feet) <= MOST_EXIT_DISTANCE * MOST_EXIT_DISTANCE
+                                && level.isLoaded(feet) && Footing.withFeetAt(level, feet)
+                                && (!externalTargets || Reach.withinReach(feet, store) && Reach.inSight(level, feet, store))) {
+                            if (!trusted.contains(feet)) {
+                                trusted.add(feet);
+                                if (trusted.size() > 32) {
+                                    trusted.remove();
+                                }
+                            }
+                        }
+                    } else if (stores.hasNext()) {
+                        store = stores.next();
+                        near = externalTargets
+                            ? BlockPos.betweenClosed(store.offset(-5, -5, -5), store.offset(5, 5, 5)).iterator()
+                            : List.of(store).iterator();
+                    } else {
+                        List<BlockPos> ordered = trusted.stream().sorted(Comparator
+                            .comparingDouble(FillPlan.this::apart).thenComparingLong(BlockPos::asLong)).toList();
+                        reframe(ordered);
+                        stamp();
+                        found.addAll(ordered);
+                        perimeter = new Boundary(bounds, false);
+                        people = people();
+                        stage++;
+                    }
+                } else if (stage == 1) {
+                    if (perimeter.hasNext()) {
+                        BlockPos column = perimeter.next();
+                        int x = column.getX();
+                        int z = column.getZ();
+                        if (level.hasChunk(x >> 4, z >> 4)) {
+                            int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+                            BlockPos feet = new BlockPos(x, y, z);
+                            if (bounds.isInside(feet) && outsideAll(feet) && Footing.withFeetAt(level, feet)) {
+                                found.add(feet);
+                            }
+                        }
+                    } else {
+                        // Array construction is split too; very long outer walls need many explicit exits.
+                        near = found.iterator();
+                        stage++;
+                    }
+                } else {
+                    if (near.hasNext()) {
+                        // exits remains private to this continuation until setup finishes.
+                        if (!(exits instanceof ArrayList<?>)) {
+                            exits = new ArrayList<>();
+                        }
+                        exits.add(near.next());
+                    } else {
+                        exits = Collections.unmodifiableList(exits);
+                        edges = new Boundary(bounds, true);
+                        stage++;
+                    }
+                }
+            }
+            return stage == 3;
         }
 
         View view(LivingEntity body) {
-            return views.computeIfAbsent(body.getUUID(), any -> {
+            View view = views.get(body.getUUID());
+            if (view == null || view.body() != body || !view.ground().valid()) {
                 Ground ground = watch.now(body);
-                return new View(ground, ground.accessFrom(exits));
-            });
+                view = new View(body, ground, ground.beginAccess(exits));
+                views.put(body.getUUID(), view);
+            }
+            return view;
+        }
+
+        FootSearch footing(LivingEntity body, Ground ground) {
+            FootSearch search = footings.get(body.getUUID());
+            if (search == null || search.body != body || !search.ground.valid() || !search.actual.equals(position(body))) {
+                search = new FootSearch(body, ground);
+                footings.put(body.getUUID(), search);
+            }
+            return search;
+        }
+
+        Trial trial(View view, BlockPos cell, BlockState block) {
+            Map<Change, Trial> known = trials.computeIfAbsent(view.access(), any -> new HashMap<>());
+            Change change = new Change(cell, block);
+            Trial trial = known.get(change);
+            if (trial == null || !trial.access().valid()) {
+                Ground ground = view.ground().with(Map.of(cell, block));
+                trial = new Trial(ground, ground.beginAccess(exits));
+                known.put(change, trial);
+            }
+            return trial;
         }
 
         List<BlockPos> workStances(Ground.Access access, BlockPos cell) {
@@ -550,71 +1397,105 @@ final class FillPlan implements AutoCloseable {
                     .limit(MOST_STANCES).toList());
         }
 
-        private List<BlockPos> exits() {
-            List<BlockPos> found = new ArrayList<>();
-            for (int x = bounds.minX(); x <= bounds.maxX(); x++) {
-                exterior(found, x, bounds.minZ());
-                exterior(found, x, bounds.maxZ());
-            }
-            for (int z = bounds.minZ() + 1; z < bounds.maxZ(); z++) {
-                exterior(found, bounds.minX(), z);
-                exterior(found, bounds.maxX(), z);
-            }
-            return List.copyOf(found);
-        }
-
-        private void exterior(List<BlockPos> into, int x, int z) {
-            if (!level.hasChunk(x >> 4, z >> 4)) {
-                return;
-            }
-            int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
-            BlockPos feet = new BlockPos(x, y, z);
-            if (bounds.isInside(feet) && outsideAll(feet)
-                    && Footing.withFeetAt(level, feet)) {
-                into.add(feet);
-            }
-        }
-
-        List<BlockPos> ports(View view) {
-            if (ports == null) {
-                Set<BlockPos> found = new LinkedHashSet<>();
-                for (int x = bounds.minX(); x <= bounds.maxX(); x++) {
-                    for (int y = bounds.minY(); y <= bounds.maxY(); y++) {
-                        port(found, view, new BlockPos(x, y, bounds.minZ()));
-                        port(found, view, new BlockPos(x, y, bounds.maxZ()));
+        boolean portsReady(View view, Ground.Budget budget) {
+            while (!portsDone && budget.tryStep()) {
+                if (edges.hasNext()) {
+                    BlockPos feet = edges.next();
+                    if (view.access().distance(feet) >= 0) {
+                        ports.add(feet);
                     }
+                } else {
+                    portsDone = true;
                 }
-                for (int z = bounds.minZ(); z <= bounds.maxZ(); z++) {
-                    for (int y = bounds.minY(); y <= bounds.maxY(); y++) {
-                        port(found, view, new BlockPos(bounds.minX(), y, z));
-                        port(found, view, new BlockPos(bounds.maxX(), y, z));
-                    }
-                    for (int x = bounds.minX(); x <= bounds.maxX(); x++) {
-                        port(found, view, new BlockPos(x, bounds.minY(), z));
-                        port(found, view, new BlockPos(x, bounds.maxY(), z));
-                    }
-                }
-                ports = List.copyOf(found);
             }
-            return ports;
-        }
-
-        private void port(Set<BlockPos> into, View view, BlockPos feet) {
-            if (view.access().distance(feet) >= 0) {
-                into.add(feet);
-            }
+            return portsDone;
         }
     }
 
+    // A constant-space cursor over four exterior columns or six faces; never a materialized volume.
+    private static final class Boundary implements Iterator<BlockPos> {
+        final BoundingBox box;
+        final boolean faces;
+        final long x;
+        final long y;
+        final long z;
+        final long total;
+        long index;
+
+        Boundary(BoundingBox box, boolean faces) {
+            this.box = box;
+            this.faces = faces;
+            x = (long) box.maxX() - box.minX() + 1;
+            y = (long) box.maxY() - box.minY() + 1;
+            z = (long) box.maxZ() - box.minZ() + 1;
+            total = faces ? 2L * (x * y + z * y + x * z) : 2L * (x + z);
+        }
+
+        public boolean hasNext() {
+            return index < total;
+        }
+
+        public BlockPos next() {
+            long at = index++;
+            if (!faces) {
+                if (at < 2 * x) {
+                    return new BlockPos(box.minX() + (int) (at / 2), box.minY(),
+                        at % 2 == 0 ? box.minZ() : box.maxZ());
+                }
+                at -= 2 * x;
+                return new BlockPos(at % 2 == 0 ? box.minX() : box.maxX(), box.minY(), box.minZ() + (int) (at / 2));
+            }
+            if (at < 2 * x * y) {
+                return new BlockPos(box.minX() + (int) (at / 2 / y), box.minY() + (int) (at / 2 % y),
+                    at % 2 == 0 ? box.minZ() : box.maxZ());
+            }
+            at -= 2 * x * y;
+            if (at < 2 * z * y) {
+                return new BlockPos(at % 2 == 0 ? box.minX() : box.maxX(), box.minY() + (int) (at / 2 % y),
+                    box.minZ() + (int) (at / 2 / y));
+            }
+            at -= 2 * z * y;
+            return new BlockPos(box.minX() + (int) (at / 2 % x), at % 2 == 0 ? box.minY() : box.maxY(),
+                box.minZ() + (int) (at / 2 / x));
+        }
+    }
     @Override
     public void close() {
+        if (closed) {
+            return;
+        }
         closed = true;
+        releaseCommit(false);
         offered = Map.of();
         steppingAside = List.of();
         watch.close();
+        planning = null;
+        context = null;
+        proofs.clear();
+        commitProofs.clear();
+        proving.clear();
+        provingDestinations.clear();
+        cursors.clear();
+        inputs = List.of();
+        remaining = List.of();
+        wanted = Set.of();
+        material = null;
+        pending.clear();
+        Map<UUID, Allowance> allowances = ALLOWANCES.get(level);
+        if (allowances != null) {
+            Allowance allowance = allowances.get(colony);
+            if (allowance != null && --allowance.plans == 0) {
+                allowances.remove(colony);
+            }
+            if (allowances.isEmpty()) {
+                ALLOWANCES.remove(level);
+            }
+        }
         Set<FillPlan> live = LIVE.get(level);
         if (live != null && live.remove(this) && live.isEmpty()) {
             LIVE.remove(level);
+            LIVE_REVISIONS.remove(level);
+            ACTIVATIONS.remove(level);
         }
     }
 }

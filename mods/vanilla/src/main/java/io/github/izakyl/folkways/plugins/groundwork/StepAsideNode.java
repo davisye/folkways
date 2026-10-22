@@ -1,9 +1,11 @@
 package io.github.izakyl.folkways.plugins.groundwork;
 
 import io.github.izakyl.folkways.core.api.terms.WorldPos;
+import io.github.izakyl.folkways.core.api.terms.RefusalKind;
 import io.github.izakyl.folkways.core.api.work.Node;
 import io.github.izakyl.folkways.core.api.work.NodeSpec;
 import io.github.izakyl.folkways.core.api.work.Outcome;
+import io.github.izakyl.folkways.core.api.work.Recourse;
 import io.github.izakyl.folkways.core.api.work.Stances;
 import io.github.izakyl.folkways.core.api.work.WorkEffort;
 import io.github.izakyl.folkways.core.api.work.WorkSite;
@@ -53,5 +55,11 @@ final class StepAsideNode implements Node {
         }
         plan.movedAside();
         return Outcome.done();
+    }
+
+    @Override
+    public Recourse failing(ServerLevel level, RefusalKind why) {
+        return why == GroundRefusal.FILL_ACCESS_CHANGED && plan.provingDestination(target)
+            ? Recourse.waitFor(1) : Recourse.FAIL;
     }
 }

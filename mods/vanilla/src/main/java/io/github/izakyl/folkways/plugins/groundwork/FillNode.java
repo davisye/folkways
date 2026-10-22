@@ -4,6 +4,7 @@ import io.github.izakyl.folkways.core.api.terms.ItemSpec;
 import io.github.izakyl.folkways.core.api.terms.RefusalKind;
 import io.github.izakyl.folkways.core.api.work.Need;
 import io.github.izakyl.folkways.core.api.work.Outcome;
+import io.github.izakyl.folkways.core.api.work.Recourse;
 import io.github.izakyl.folkways.core.api.work.WorkNoise;
 import io.github.izakyl.folkways.core.api.work.Worker;
 import io.github.izakyl.folkways.core.api.work.Workload;
@@ -36,6 +37,12 @@ final class FillNode extends GroundNode {
     public Optional<RefusalKind> refusal(ServerLevel level) {
         return plan.offered(spec().focus().orElseThrow()) ? Optional.empty()
             : Optional.of(GroundRefusal.FILL_ACCESS_CHANGED);
+    }
+
+    @Override
+    public Recourse failing(ServerLevel level, RefusalKind why) {
+        return why == GroundRefusal.FILL_ACCESS_BLOCKED && plan.proving(spec().focus().orElseThrow())
+            ? Recourse.waitFor(1) : Recourse.FAIL;
     }
 
     @Override

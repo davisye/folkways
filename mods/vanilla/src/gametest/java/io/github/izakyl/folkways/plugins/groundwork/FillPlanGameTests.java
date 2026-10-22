@@ -1,6 +1,7 @@
 package io.github.izakyl.folkways.plugins.groundwork;
 
 import io.github.izakyl.folkways.FolkwaysMod;
+import io.github.izakyl.folkways.core.api.ground.Ground;
 import io.github.izakyl.folkways.core.api.resident.Resident;
 import io.github.izakyl.folkways.core.api.terms.ItemSpec;
 import io.github.izakyl.folkways.core.api.work.Grown;
@@ -18,6 +19,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
@@ -268,7 +270,14 @@ public final class FillPlanGameTests {
         cells.add(free);
         Mob bystander = resident(helper, path.getLast());
         try (FillPlan plan = plan(helper, UUID.randomUUID(), cells)) {
-            List<Job> jobs = refresh(plan, helper, cells);
+            plan.refresh(new Survey(helper.getLevel(), cells).fill(),
+                cells.stream().map(Job::keyOf).collect(Collectors.toSet()), DIRT);
+            for (int slice = 0; slice < 200_000 && !plan.offered(free); slice++) {
+                Ground.Budget small = new Ground.Budget(31, 0);
+                plan.advance(small);
+                helper.assertTrue(small.used() <= 31, "an independent component cannot borrow a second trial budget");
+            }
+            List<Job> jobs = plan.jobs();
             helper.assertTrue(path.size() > 64 && jobs.stream().anyMatch(job -> job.cell().equals(free)),
                 "more than a trial budget of blocked work cannot starve an independent part");
             helper.assertTrue(jobs.stream().noneMatch(job -> path.contains(job.cell())),
@@ -301,9 +310,128 @@ public final class FillPlanGameTests {
         helper.succeed();
     }
 
+    @GameTest(template = "empty_large", batch = "safe_fill_budget", timeoutTicks = 2000)
+    public static void tinySlicesKeepTheirFrontierAndEventuallyOfferWork(GameTestHelper helper) {
+        floor(helper);
+        Set<BlockPos> cells = Set.of(at(helper, 11, 1, 11));
+        FillPlan plan = plan(helper, UUID.randomUUID(), cells);
+        plan.refresh(new Survey(helper.getLevel(), cells).fill(),
+            cells.stream().map(Job::keyOf).collect(Collectors.toSet()), DIRT);
+        // In particular, a wrapper around the graph must not spend the only available unit forever.
+        for (int i = 0; i < 64; i++) {
+            Ground.Budget one = new Ground.Budget(1, 0);
+            plan.advance(one);
+            helper.assertTrue(one.used() <= 1, "one-unit slices cannot overspend");
+        }
+        helper.assertTrue(plan.jobs().isEmpty(), "a partial proof is never published as a safe route");
+        int[] ticks = {0};
+        helper.onEachTick(() -> {
+            if (plan.stage().equals("complete")) {
+                return;
+            }
+            Ground.Budget slice = new Ground.Budget(256, 0);
+            if (ticks[0] % 10 == 0) {
+                // Repeated remote creation/cancellation used to invalidate every watch in the level.
+                try (FillPlan distant = plan(helper, UUID.randomUUID(), Set.of(at(helper, 1000, 1, 1000)))) {
+                    distant.phase();
+                }
+            }
+            plan.advance(slice);
+            ticks[0]++;
+            helper.assertTrue(slice.used() <= 256, "every later tick shares a real bounded unit count");
+        });
+        helper.startSequence().thenWaitUntil(() -> {
+            helper.assertTrue(plan.stage().equals("complete"), "the small slices finish the same proof");
+            helper.assertTrue(!plan.jobs().isEmpty() && ticks[0] > 1, "work advances across actual server ticks");
+        }).thenExecute(plan::close).thenSucceed();
+    }
+
+    @GameTest(template = "empty_large", batch = "safe_fill_budget", timeoutTicks = 2000)
+    public static void interruptedProofsDiscardChangedTerrainAndConfiguration(GameTestHelper helper) {
+        floor(helper);
+        BlockPos old = at(helper, 9, 1, 9);
+        BlockPos next = at(helper, 15, 1, 15);
+        Set<BlockPos> cells = Set.of(old, next);
+        FillPlan plan = plan(helper, UUID.randomUUID(), cells);
+        plan.refresh(new Survey(helper.getLevel(), cells).fill(), Set.of(Job.keyOf(old), Job.keyOf(next)), DIRT);
+        plan.advance(new Ground.Budget(64, 0));
+        helper.getLevel().setBlock(old, Blocks.STONE.defaultBlockState(), 3);
+        // A settings refresh must not resurrect the old candidate when its pending graph later completes.
+        plan.refresh(new Survey(helper.getLevel(), cells).fill(), Set.of(Job.keyOf(next)), DIRT);
+        helper.onEachTick(() -> {
+            Ground.Budget slice = new Ground.Budget(256, 0);
+            plan.advance(slice);
+            helper.assertTrue(slice.used() <= 256 && !plan.offered(old), "stale intermediate results stay invalid");
+        });
+        helper.startSequence().thenWaitUntil(() -> {
+            helper.assertTrue(plan.stage().equals("complete") && plan.offered(next), "the updated target still makes progress");
+            helper.assertTrue(plan.jobs().size() == 1, "only the current configuration is offered");
+        }).thenExecute(plan::close).thenSucceed();
+    }
+
+    @GameTest(template = "empty_large", batch = "safe_fill_budget", timeoutTicks = 8000)
+    public static void manyIdenticalResidentsAndLargeFillRemainBudgeted(GameTestHelper helper) {
+        floor(helper);
+        Set<BlockPos> cells = box(at(helper, 12, 1, 12), at(helper, 19, 1, 19));
+        List<Mob> people = new ArrayList<>();
+        for (int i = 0; i < 48; i++) {
+            people.add(resident(helper, at(helper, 2 + i % 8, 1, 2 + i / 8)));
+        }
+        FillPlan plan = plan(helper, UUID.randomUUID(), cells);
+        plan.refresh(new Survey(helper.getLevel(), cells).fill(), cells.stream().map(Job::keyOf).collect(Collectors.toSet()), DIRT);
+        long[] observations = {0, 0, 0, 0};
+        helper.onEachTick(() -> {
+            if (plan.stage().equals("complete")) {
+                return;
+            }
+            Ground.Budget slice = new Ground.Budget(4096, 0);
+            long start = System.nanoTime();
+            plan.advance(slice);
+            long elapsed = System.nanoTime() - start;
+            observations[0]++;
+            observations[1] += slice.used();
+            observations[2] += elapsed;
+            observations[3] = Math.max(observations[3], elapsed);
+            helper.assertTrue(slice.used() <= 4096, "48 bodies and 64 trial cells still use a single work allowance");
+        });
+        helper.startSequence().thenWaitUntil(() -> {
+            helper.assertTrue(plan.stage().equals("complete") && !plan.jobs().isEmpty(), "the full large round finishes");
+        }).thenExecute(() -> {
+            org.slf4j.LoggerFactory.getLogger(FillPlanGameTests.class).info(
+                "FILL_BUDGET slices={} work={} totalNanos={} maxSliceNanos={} residents=48 cells=64",
+                observations[0], observations[1], observations[2], observations[3]);
+            plan.close();
+            people.forEach(Mob::discard);
+        }).thenSucceed();
+    }
+
+    @GameTest(template = "empty_large", batch = "safe_fill_budget", timeoutTicks = 100)
+    public static void cancellingAndRedrawingReleasesProofsAndSharedAllowances(GameTestHelper helper)
+            throws ReflectiveOperationException {
+        UUID colony = UUID.randomUUID();
+        Set<BlockPos> cells = Set.of(at(helper, 11, 1, 11));
+        var allowances = FillPlan.class.getDeclaredField("ALLOWANCES");
+        allowances.setAccessible(true);
+        for (int i = 0; i < 32; i++) {
+            FillPlan plan = plan(helper, colony, cells);
+            plan.refresh(List.of(), Set.of(Job.keyOf(cells.iterator().next())), DIRT);
+            plan.advance(new Ground.Budget(8, 0));
+            plan.close();
+            plan.close();
+            helper.assertTrue(!plan.advance() && plan.jobs().isEmpty() && plan.stage().equals("idle"),
+                "cancelled work releases its continuation and cannot recreate an allowance");
+            Map<?, ?> worlds = (Map<?, ?>) allowances.get(null);
+            Map<?, ?> colonies = (Map<?, ?>) worlds.get(helper.getLevel());
+            helper.assertTrue(colonies == null || !colonies.containsKey(colony),
+                "the colony's last cancelled plan releases the shared tick account");
+        }
+        helper.succeed();
+    }
+
     private static FillPlan plan(GameTestHelper helper, UUID colony, Set<BlockPos> cells) {
         return new FillPlan(helper.getLevel(), UUID.randomUUID(), colony, cells,
-            () -> List.of(at(helper, 1, 1, 1)), () -> {});
+            () -> List.of(at(helper, 1, 1, 1)), () -> {}, false,
+            new FillPlan.Limits(Integer.MAX_VALUE, 0));
     }
 
     @GameTest(template = "empty_large", batch = "safe_fill", timeoutTicks = 100)
@@ -401,8 +529,11 @@ public final class FillPlanGameTests {
     }
 
     private static List<Job> refresh(FillPlan plan, GameTestHelper helper, Set<BlockPos> cells) {
-        return plan.refresh(new Survey(helper.getLevel(), cells).fill(),
+        plan.refresh(new Survey(helper.getLevel(), cells).fill(),
             cells.stream().map(Job::keyOf).collect(Collectors.toSet()), DIRT);
+        plan.advance(Ground.Budget.unlimited());
+        helper.assertTrue(plan.stage().equals("complete"), "the explicit unbounded fixture drains one planning round");
+        return plan.jobs();
     }
 
     private static Node node(FillPlan plan, Job job) {

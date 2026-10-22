@@ -7,7 +7,6 @@ import io.github.izakyl.folkways.core.api.colony.Sweep;
 import io.github.izakyl.folkways.base.persist.Reader;
 import io.github.izakyl.folkways.base.persist.Writer;
 import io.github.izakyl.folkways.core.api.terms.Goods;
-import io.github.izakyl.folkways.core.api.terms.Reach;
 import io.github.izakyl.folkways.core.api.terms.ItemSpec;
 import io.github.izakyl.folkways.core.api.terms.WorldPos;
 import io.github.izakyl.folkways.core.api.work.Grown;
@@ -150,8 +149,8 @@ final class GroundPresence implements Facing {
                         fillPlan = new FillPlan(level, zone, colony.id(), view.cells(),
                             () -> colony.storesIn(level.dimension()).stream()
                                 .filter(at -> at.in(level) && at.sameRealm(WorldPos.of(level, view.cells().iterator().next())))
-                                .flatMap(at -> Reach.workableCells(level, at.block(level)).stream()).toList(),
-                            GroundPresence.this::fillChanged);
+                                .map(at -> at.block(level)).toList(),
+                            GroundPresence.this::fillChanged, true, FillPlan.Limits.NORMAL);
                     }
                     Set<String> wanted = new HashSet<>(targets.getOrDefault(GroundworkContent.FILL, Set.of()));
                     Chores existing = works.get(GroundworkContent.FILL);
@@ -242,6 +241,15 @@ final class GroundPresence implements Facing {
                 fillPlan = null;
             }
         }
+
+        void advanceFill() {
+            if (fillPlan != null && filling.isPresent() && fillPlan.advance()) {
+                FillPlan plan = fillPlan;
+                ItemSpec spec = filling.orElseThrow();
+                settle(GroundworkContent.FILL, (at, chore) -> new FillNode(chore, spec, plan), plan.jobs());
+                sweep.nudge();
+            }
+        }
     }
 
     // What a zone's weeding pulls.
@@ -272,6 +280,7 @@ final class GroundPresence implements Facing {
     private final PastDay made = new PastDay();
 
     private final AtomicBoolean fillDirty = new AtomicBoolean();
+    private int nextFillSite;
 
     private void fillChanged() {
         fillDirty.set(true);
@@ -319,6 +328,13 @@ final class GroundPresence implements Facing {
     public void tick(MinecraftServer server) {
         if (fillDirty.getAndSet(false)) {
             refresh(server);
+        }
+        if (!sites.isEmpty()) {
+            List<Site> pending = new ArrayList<>(sites.values());
+            int start = Math.floorMod(nextFillSite++, pending.size());
+            for (int i = 0; i < pending.size(); i++) {
+                pending.get((start + i) % pending.size()).advanceFill();
+            }
         }
         sweep.tick(server, this::refresh, this::goals);
     }
