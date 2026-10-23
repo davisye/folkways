@@ -17,6 +17,7 @@ import java.util.Set;
 import java.util.UUID;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.gametest.framework.GameTest;
 import net.minecraft.gametest.framework.GameTestHelper;
 import net.minecraft.server.level.ServerLevel;
@@ -24,6 +25,7 @@ import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.item.enchantment.Enchantments;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.ScaffoldingBlock;
@@ -106,7 +108,16 @@ public final class ClearOrderGameTests {
             helper.assertTrue(ready.size() == 1 && ready.getFirst().cell().equals(above),
                 "the supported or falling block goes before its floor: " + block);
             helper.assertTrue(new ClearOrder(level).blocked(List.of(support)), "its floor cannot be removed");
-            helper.assertTrue(clear(level, ready.getFirst()) instanceof Outcome.Done done && count(done, block.asItem()) == 1,
+            ItemStack tool = new ItemStack(Items.DIAMOND_PICKAXE);
+            if (block == Blocks.GRAVEL) {
+                tool = new ItemStack(Items.DIAMOND_SHOVEL);
+                // Ordinary gravel loot can be flint. Use a legal real tool so this order test
+                // retains its exact one-gravel delivery assertion without controlling RNG.
+                tool.enchant(level.registryAccess().registryOrThrow(Registries.ENCHANTMENT)
+                    .getHolderOrThrow(Enchantments.SILK_TOUCH), 1);
+            }
+            Outcome outcome = node(level, ready.getFirst(), (cell, state) -> false).commit(level, worker(level, tool));
+            helper.assertTrue(outcome instanceof Outcome.Done done && count(done, block.asItem()) == 1,
                 "the dependent's actual item is delivered once: " + block);
             helper.assertFalse(new ClearOrder(level).blocked(List.of(support)), "its floor is released");
         }
@@ -272,11 +283,15 @@ public final class ClearOrderGameTests {
     }
 
     private static Worker worker(ServerLevel level) {
+        return worker(level, new ItemStack(Items.DIAMOND_PICKAXE));
+    }
+
+    private static Worker worker(ServerLevel level, ItemStack tool) {
         var body = PersonBody.RESIDENT.get().create(level);
         return (Worker) Proxy.newProxyInstance(Worker.class.getClassLoader(), new Class<?>[] {Worker.class},
             (proxy, method, args) -> switch (method.getName()) {
                 case "body" -> body.mob();
-                case "held" -> new ItemStack(Items.DIAMOND_PICKAXE);
+                case "held" -> tool;
                 default -> throw new AssertionError(method.getName());
             });
     }

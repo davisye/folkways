@@ -1,6 +1,7 @@
 package io.github.izakyl.folkways.plugins.groundwork;
 
 import io.github.izakyl.folkways.core.api.terms.WorldPos;
+import io.github.izakyl.folkways.core.api.terms.Reach;
 import io.github.izakyl.folkways.core.api.terms.RefusalKind;
 import io.github.izakyl.folkways.core.api.work.Node;
 import io.github.izakyl.folkways.core.api.work.NodeSpec;
@@ -50,10 +51,12 @@ final class StepAsideNode implements Node {
 
     @Override
     public Outcome commit(ServerLevel level, Worker who) {
-        if (!plan.safeDestination(who.body(), target) || !plan.clearOfFill(who.body())) {
+        // Proving a remote destination is not an arrival receipt. Keep this same task retryable
+        // until the real body arrives and the same-tick proof actually consumes its obligation.
+        if (!Reach.standingAt(who.body().position(), target) || !plan.clearOfFill(who.body())
+                || !plan.safeDestination(who.body(), target) || !plan.movedAside(resident)) {
             return Outcome.failed(GroundRefusal.FILL_ACCESS_CHANGED);
         }
-        plan.movedAside(resident);
         return Outcome.done();
     }
 

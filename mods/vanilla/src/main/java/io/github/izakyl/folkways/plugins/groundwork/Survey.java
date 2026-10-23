@@ -36,6 +36,7 @@ final class Survey {
 
     // How far a body stands from the cell it works: as far as its hands reach.
     private static final int REACH = (int) Math.floor(Reach.PLAYER_BLOCK_REACH);
+    private static final int CLEAR_REACH = (int) Math.ceil(Reach.PLAYER_BLOCK_REACH);
 
     private static final Comparator<BlockPos> DOWNWARD =
         Comparator.comparingInt((BlockPos cell) -> -cell.getY())
@@ -101,7 +102,7 @@ final class Survey {
             Set<BlockPos> barred = new HashSet<>(parts);
             parts.forEach(part -> barred.add(part.above()));
             List<BlockPos> affected = parts;
-            stances(anchor, barred).ifPresent(where -> jobs.add(new Job(Job.keyOf(anchor), site(anchor), anchor,
+            clearStances(anchor, barred).ifPresent(where -> jobs.add(new Job(Job.keyOf(anchor), site(anchor), anchor,
                 affected, List.of(), where)));
         }
         if (discovering || jobs.isEmpty()) {
@@ -247,6 +248,31 @@ final class Survey {
 
     private WorkSite site(BlockPos cell) {
         return new WorkSite.AtBlock(WorldPos.of(level, cell));
+    }
+
+    // High attachments can be reached from the ground without climbing onto their support. Use the same
+    // reach, sight and standing checks as other block work, while keeping the cells this break removes barred.
+    private Optional<Stances> clearStances(BlockPos target, Set<BlockPos> barred) {
+        if (discovering) {
+            return Optional.of(Stances.WHEREVER);
+        }
+        if (!level.isLoaded(target)) {
+            return Optional.empty();
+        }
+        Set<BlockPos> found = new LinkedHashSet<>();
+        for (int dx = -CLEAR_REACH; dx <= CLEAR_REACH; dx++) {
+            for (int dy = -CLEAR_REACH; dy <= CLEAR_REACH; dy++) {
+                for (int dz = -CLEAR_REACH; dz <= CLEAR_REACH; dz++) {
+                    BlockPos feet = target.offset(dx, dy, dz);
+                    if (!barred.contains(feet) && Reach.withinReach(feet, target) && footed.computeIfAbsent(feet,
+                            at -> level.isLoaded(at) && Footing.withFeetAt(level, at))
+                            && Reach.inSight(level, feet, target)) {
+                        found.add(feet);
+                    }
+                }
+            }
+        }
+        return Stances.of(level, found);
     }
 
     // Everywhere a body stands in reach of the cell, from a level below it to one above, but the cells the work

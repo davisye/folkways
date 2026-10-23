@@ -11,6 +11,7 @@ import io.github.izakyl.folkways.core.api.terms.WorldSpaces;
 import io.github.izakyl.folkways.core.api.work.Grown;
 import io.github.izakyl.folkways.core.api.work.Stances;
 import io.github.izakyl.folkways.plugins.person.PersonBody;
+import io.github.izakyl.folkways.plugins.farming.FarmingContent;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -32,6 +33,7 @@ import java.util.function.Supplier;
 import java.util.function.Function;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.nbt.CompoundTag;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
@@ -42,12 +44,12 @@ import net.minecraft.world.level.levelgen.structure.BoundingBox;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 
-// A fill is a changing work face, with a way back out of it. Offers are only a prediction: the real body and
-// material are checked against the live ground again immediately before each block is laid.
+// A fill publishes one head of a verified complete construction and actual-retreat sequence. A retained
+// request is never permission: the complete tail, live dependency lease and real people gate every write.
 final class FillPlan implements AutoCloseable {
 
     enum Phase {
-        FILLING, RETREATING, CLOSING, WAITING;
+        FILLING, RETREATING, CLOSING, WAITING, COMPLETE;
     }
 
     private static final int MARGIN = 8;
@@ -80,7 +82,7 @@ final class FillPlan implements AutoCloseable {
         UUID commitZone;
     }
 
-    private record Activation(long revision, BoundingBox bounds) {
+    private record Activation(long revision, BoundingBox bounds, boolean added) {
     }
 
     private record Ranked(Job job, int part, int depth, boolean passage) {
@@ -95,6 +97,15 @@ final class FillPlan implements AutoCloseable {
     private record Trial(Ground ground, Ground.Access access) {
     }
 
+    // An execution intent is not a safety result. Terrain changes discard its proof, while this
+    // actual supplied material can be re-proved during the runner's next windup.
+    private record CommitRequest(BlockState block, long version, long until) {
+    }
+
+    private enum CommitResult {
+        READY, PENDING, BLOCKED, CHANGED;
+    }
+
     private final ServerLevel level;
     private final UUID zone;
     private final UUID colony;
@@ -102,6 +113,7 @@ final class FillPlan implements AutoCloseable {
     private final Realm realm;
     private final BlockPos origin;
     private final BoundingBox workBox;
+    private final BoundingBox anchorBounds;
     private final Supplier<Collection<BlockPos>> external;
     private final boolean externalTargets;
     private final Limits limits;
@@ -114,6 +126,11 @@ final class FillPlan implements AutoCloseable {
     private List<Job> remaining = List.of();
     private final Map<Integer, Integer> cursors = new HashMap<>();
     private volatile Map<BlockPos, Job> offered = Map.of();
+    // A proved request outlives its current geometry, including the interval before the core claims it.
+    // This map grants no placement permission: every retained node still runs the fresh commit proof.
+    private volatile Map<BlockPos, Job> issued = Map.of();
+    private Set<BlockPos> inputCells = Set.of();
+    private long requestVersion;
     private volatile List<Grown> steppingAside = List.of();
     private volatile Phase phase = Phase.WAITING;
     private volatile boolean closed;
@@ -122,9 +139,21 @@ final class FillPlan implements AutoCloseable {
     private BlockState material;
     private Planning planning;
     private Context context;
+    private CompletionRuntime completion;
+    private final Map<BlockPos, BlockState> receipts = new HashMap<>();
+    private final Set<String> receiptKeys = new HashSet<>();
+    private CompoundTag restoredCompletion;
+    private Runnable persisted = () -> { };
+    private long completionPersistCalls;
+    private long totalCompletionPersistNanos;
+    private long maxCompletionPersistNanos;
+    private Context anchorSource;
+    private Iterator<BlockPos> anchorCursor;
+    private final List<BlockPos> anchors = new ArrayList<>();
     private boolean reconsider;
     private final Map<BlockPos, Candidate> proofs = new HashMap<>();
     private final Map<BlockPos, Candidate> commitProofs = new HashMap<>();
+    private final Map<BlockPos, CommitRequest> commitRequests = new LinkedHashMap<>();
     private final Set<BlockPos> proving = new HashSet<>();
     private final Set<BlockPos> provingDestinations = new HashSet<>();
     // Deliberately observable by the pressure fixture, without enabling chat logging.
@@ -145,6 +174,8 @@ final class FillPlan implements AutoCloseable {
         this(level, zone, colony, cells, external, changed, false, Limits.NORMAL);
     }
 
+    // Explicit non-normal limits inject computation allowances for deterministic model fixtures.
+    // They never bypass world, people, material, certificate or actual-write checks. Production uses NORMAL.
     FillPlan(ServerLevel level, UUID zone, UUID colony, Set<BlockPos> cells,
             Supplier<Collection<BlockPos>> external, Runnable changed, boolean externalTargets, Limits limits) {
         this.level = level;
@@ -161,17 +192,23 @@ final class FillPlan implements AutoCloseable {
         realm = WorldPos.of(level, first).realm();
         origin = new WorldPos(realm, BlockPos.ZERO).block(level);
         workBox = BoundingBox.encapsulatingPositions(cells).orElseThrow();
+        anchorBounds = new BoundingBox(workBox.minX() - MOST_EXIT_DISTANCE, workBox.minY() - MOST_EXIT_DISTANCE,
+            workBox.minZ() - MOST_EXIT_DISTANCE, workBox.maxX() + MOST_EXIT_DISTANCE,
+            workBox.maxY() + MOST_EXIT_DISTANCE, workBox.maxZ() + MOST_EXIT_DISTANCE);
         reframe(List.of());
         surveyor = PersonBody.RESIDENT.get().create(level);
         surveyor.setPos(Vec3.atBottomCenterOf(first));
         LIVE.computeIfAbsent(level, any -> new HashSet<>()).add(this);
+        liveChanged(true);
+        if (limits.equals(Limits.NORMAL)) ServerFillBudget.register(level.getServer(), this);
+    }
+
+    private void liveChanged(boolean added) {
         long revision = LIVE_REVISIONS.merge(level, 1L, Long::sum);
         ArrayDeque<Activation> activations = ACTIVATIONS.computeIfAbsent(level, any -> new ArrayDeque<>());
         activations.addLast(new Activation(revision, new BoundingBox(workBox.minX(), workBox.minY() - 1,
-            workBox.minZ(), workBox.maxX(), workBox.maxY() + 1, workBox.maxZ())));
-        while (activations.size() > 128) {
-            activations.removeFirst();
-        }
+            workBox.minZ(), workBox.maxX(), workBox.maxY() + 1, workBox.maxZ()), added));
+        while (activations.size() > 128) activations.removeFirst();
     }
 
     Phase phase() {
@@ -191,44 +228,196 @@ final class FillPlan implements AutoCloseable {
         if (closed) {
             return List.of();
         }
-        boolean different = !desired.equals(wanted) || !block.equals(material);
+        boolean materialChanged = !block.equals(material);
+        boolean expanded = !wanted.containsAll(desired);
+        boolean different = !desired.equals(wanted);
+        Set<BlockPos> nextInputs = new HashSet<>();
+        jobs.forEach(job -> nextInputs.add(job.cell()));
+        boolean inputsChanged = !nextInputs.equals(inputCells);
         inputs = List.copyOf(jobs);
+        inputCells = Set.copyOf(nextInputs);
         wanted = Set.copyOf(desired);
         material = block;
-        if (different || planning == null) {
+        if (materialChanged) {
+            requestVersion++;
+            issued = Map.of();
+            receipts.clear();
+            receiptKeys.clear();
+            if (completion != null) {
+                completion.close();
+                completion = null;
+            }
+        } else {
+            issued = retainCurrent(issued);
+        }
+        offered = retainCurrent(offered);
+        if (inputsChanged || different) {
+            // The access graph may be reusable, but a placement proof protects this exact work set.
+            proofs.clear();
+            commitProofs.clear();
+        }
+        discardStaleCommits();
+        if (proving.removeIf(cell -> !requested(cell))) {
+            releaseCommit(false);
+        }
+        if (materialChanged || expanded || planning == null) {
             restart();
-        } else if (planning.done) {
+        } else if (planning.done || different || inputsChanged) {
             // A normal sweep is not a revocation. Workers may still be walking to this valid face;
             // keep its offers and proofs while a new people snapshot is considered in the background.
             reconsider = true;
         }
-        return jobs();
+        if (completion == null) {
+            completion = new CompletionRuntime(this, level, zone, colony, cells,
+                this::certificateAnchors, changed);
+            if (restoredCompletion != null) {
+                completion.load(restoredCompletion);
+                restoredCompletion = null;
+            }
+        }
+        Set<BlockPos> targets = new LinkedHashSet<>();
+        for (BlockPos cell : cells) {
+            if (wanted.contains(Job.keyOf(cell)) && !receipts.containsKey(cell)) targets.add(cell);
+        }
+        pending = targets;
+        completion.refresh(Set.copyOf(targets), material, requestVersion);
+        syncCompletion();
+        return requests();
     }
 
     List<Job> jobs() {
         return List.copyOf(offered.values());
     }
 
+    List<Job> requests() {
+        return List.copyOf(issued.values());
+    }
+
+    long requestVersion() {
+        return requestVersion;
+    }
+
+    boolean requested(BlockPos cell, long version) {
+        return version == requestVersion && requested(cell);
+    }
+
+    private boolean requested(BlockPos cell) {
+        return needed(cell) && issued.containsKey(cell) && executable(cell);
+    }
+
+    private boolean needed(BlockPos cell) {
+        return !closed && cells.contains(cell) && wanted.contains(Job.keyOf(cell))
+            && (completion != null || inputCells.contains(cell));
+    }
+
+    private boolean executable(BlockPos cell) {
+        BlockPos below = cell.below();
+        return level.isLoaded(cell) && level.isLoaded(below)
+            && (completion != null || !(cells.contains(below) && Survey.open(level.getBlockState(below))))
+            && !FarmingContent.weed(level.getBlockState(below), false, true);
+    }
+
+    private Map<BlockPos, Job> retainCurrent(Map<BlockPos, Job> jobs) {
+        if (jobs.keySet().stream().allMatch(this::needed)) {
+            return jobs;
+        }
+        Map<BlockPos, Job> kept = new LinkedHashMap<>();
+        jobs.forEach((cell, job) -> {
+            if (needed(cell)) {
+                kept.put(cell, job);
+            }
+        });
+        return Collections.unmodifiableMap(kept);
+    }
+
     String stage() {
-        return planning == null ? "idle" : planning.stage;
+        return completion == null ? planning == null ? "idle" : planning.stage
+            : completion.nextJob().isPresent() ? "complete" : completion.status();
+    }
+
+    String completionStatus() { return completion == null ? "uninitialized" : completion.status(); }
+    String completionReason() { return completion == null ? "awaiting project input" : completion.reason(); }
+    int completionCursor() { return completion == null ? 0 : completion.cursor(); }
+    boolean complete() { return completion != null && completion.complete(); }
+    Optional<UUID> worker() { return completion == null ? Optional.empty() : completion.worker(); }
+
+    void persistCompletionWith(Runnable persist) {
+        persisted = persist;
+    }
+
+    void restoreCompletion(CompoundTag facts) {
+        if (completion != null) throw new IllegalStateException("completion facts must precede the first refresh");
+        restoredCompletion = facts.copy();
+    }
+
+    CompoundTag saveCompletion() {
+        return completion != null ? completion.save()
+            : restoredCompletion == null ? new CompoundTag() : restoredCompletion.copy();
+    }
+
+    boolean receipted(String key) {
+        return receiptKeys.contains(key);
+    }
+
+    private void persistCompletion() {
+        long began = System.nanoTime();
+        try {
+            persisted.run();
+        } finally {
+            long elapsed = System.nanoTime() - began;
+            completionPersistCalls++;
+            totalCompletionPersistNanos += elapsed;
+            maxCompletionPersistNanos = Math.max(maxCompletionPersistNanos, elapsed);
+        }
+    }
+
+    boolean certificateExterior(BlockPos feet) {
+        return !closed && outsideAll(feet) && clearAsideStance(surveyor, feet);
+    }
+
+    private List<BlockPos> certificateAnchors(Ground.Budget budget) {
+        if (closed || budget.exhausted()) return null;
+        // An absent exterior is a discovery result, not a permanent proof. Removing a nearby
+        // fill can release a previously excluded store approach even outside this watch's margin.
+        // This check runs only when the runtime needs anchors; it does not revoke a valid witness.
+        if (context == null || !context.anchorsValid() || !context.valid()) {
+            context = new Context();
+            planning = new Planning(context);
+        }
+        if (!context.advance(budget)) return null;
+        if (anchorSource != context) {
+            anchorSource = context;
+            anchorCursor = new ArrayList<>(context.trusted).iterator();
+            anchors.clear();
+        }
+        while (anchorCursor.hasNext()) {
+            if (!budget.tryStep()) return null;
+            BlockPos feet = anchorCursor.next();
+            if (certificateExterior(feet)) anchors.add(feet);
+        }
+        return List.copyOf(anchors);
+    }
+
+    private void syncCompletion() {
+        if (completion == null) return;
+        Optional<Job> head = completion.nextJob();
+        Map<BlockPos, Job> next = head.map(job -> Map.of(job.cell(), job)).orElse(Map.of());
+        if (!offered.equals(next)) offered = next;
+        if (head.isPresent() || completion.complete()) {
+            if (!issued.equals(next)) issued = next;
+        } else {
+            // An already certified logical request can wait for its replacement proof. This map is
+            // never an execution permission; permits requires the complete current tail certificate.
+            issued = retainCurrent(issued);
+        }
+        List<Grown> moves = completion.steppingAside();
+        if (!steppingAside.equals(moves)) steppingAside = List.copyOf(moves);
+        phase = completion.complete() ? Phase.COMPLETE : !moves.isEmpty() ? Phase.RETREATING
+            : head.isPresent() ? Phase.FILLING : Phase.WAITING;
     }
 
     boolean advance() {
-        return allotted(budget -> {
-            if (budget.exhausted()) {
-                return false;
-            }
-            if (context != null && !context.valid()) {
-                restart();
-            }
-            Map<UUID, Allowance> allowances = ALLOWANCES.get(level);
-            Allowance allowance = allowances == null ? null : allowances.get(colony);
-            if (allowance != null && allowance.commitZone != null
-                    && level.getServer().getTickCount() <= allowance.commitUntil) {
-                return false;
-            }
-            return advance(budget);
-        });
+        return allotted(this::advance);
     }
 
     // A deterministic work-only budget is injectable by GameTests. A yield never discards a frontier.
@@ -236,8 +425,36 @@ final class FillPlan implements AutoCloseable {
         if (closed || material == null || budget.exhausted()) {
             return false;
         }
+        if (completion != null) {
+            Map<BlockPos, Job> previous = issued;
+            Map<BlockPos, Job> face = offered;
+            List<Grown> moves = steppingAside;
+            discardStaleCommits();
+            Map<UUID, Allowance> allowances = ALLOWANCES.get(level);
+            Allowance allowance = allowances == null ? null : allowances.get(colony);
+            if (allowance != null && allowance.commitZone != null && !zone.equals(allowance.commitZone)
+                    && level.getServer().getTickCount() <= allowance.commitUntil) return false;
+            boolean wasComplete = completion.complete();
+            boolean changed = completion.advance(budget);
+            syncCompletion();
+            if (!wasComplete && completion.complete()) persistCompletion();
+            return changed || previous != issued || face != offered || moves != steppingAside;
+        }
+        discardStaleCommits();
         if (context != null && !context.valid()) {
             restart();
+        }
+        if (!commitRequests.isEmpty()) {
+            yieldToCommit();
+        }
+        Map<UUID, Allowance> allowances = ALLOWANCES.get(level);
+        Allowance allowance = allowances == null ? null : allowances.get(colony);
+        if (allowance != null && allowance.commitZone != null
+                && level.getServer().getTickCount() <= allowance.commitUntil) {
+            if (zone.equals(allowance.commitZone)) {
+                advanceCommit(budget);
+            }
+            return false;
         }
         if (reconsider) {
             if (!context.advance(budget) || budget.exhausted()) {
@@ -259,9 +476,10 @@ final class FillPlan implements AutoCloseable {
             return false;
         }
         Map<BlockPos, Job> before = offered;
+        Map<BlockPos, Job> requests = issued;
         List<Grown> moves = steppingAside;
         planning.advance(budget);
-        return before != offered || moves != steppingAside;
+        return before != offered || requests != issued || moves != steppingAside;
     }
 
     private void restart() {
@@ -270,6 +488,8 @@ final class FillPlan implements AutoCloseable {
         commitProofs.clear();
         proving.clear();
         provingDestinations.clear();
+        discardStaleCommits();
+        proving.addAll(commitRequests.keySet());
         context = new Context();
         planning = new Planning(context);
         reconsider = false;
@@ -281,6 +501,22 @@ final class FillPlan implements AutoCloseable {
     private <T> T allotted(Function<Ground.Budget, T> call) {
         if (closed) {
             return call.apply(new Ground.Budget(0, 0));
+        }
+        if (limits.equals(Limits.NORMAL)) {
+            return ServerFillBudget.allotted(level.getServer(), this, budget -> {
+                int before = budget.used();
+                long started = System.nanoTime();
+                try {
+                    return call.apply(budget);
+                } finally {
+                    long elapsed = System.nanoTime() - started;
+                    slices++;
+                    lastWork = budget.used() - before;
+                    totalWork += lastWork;
+                    totalNanos += elapsed;
+                    maxSliceNanos = Math.max(maxSliceNanos, elapsed);
+                }
+            });
         }
         Allowance allowance = ALLOWANCES.computeIfAbsent(level, any -> new HashMap<>())
             .computeIfAbsent(colony, any -> new Allowance());
@@ -320,19 +556,29 @@ final class FillPlan implements AutoCloseable {
         commitAttempts++;
         try {
             return allotted(budget -> {
-                if (!budget.exhausted() || !offered(cell)) {
-                    releaseCommit(!budget.exhausted());
-                }
-                Optional<GroundRefusal> answer = permits(cell, block, worker, budget);
-                if (answer.filter(reason -> reason == GroundRefusal.FILL_ACCESS_BLOCKED).isPresent() && budget.exhausted()) {
+                // Cancellation takes priority even when another check has spent this tick's budget.
+                discardStaleCommits();
+                CommitResult result = permits(cell, block, worker, budget);
+                Optional<GroundRefusal> answer = switch (result) {
+                    case READY -> Optional.empty();
+                    case CHANGED -> Optional.of(GroundRefusal.FILL_ACCESS_CHANGED);
+                    default -> Optional.of(GroundRefusal.FILL_ACCESS_BLOCKED);
+                };
+                if (result == CommitResult.PENDING) {
                     proving.add(cell);
+                    commitRequests.put(cell, new CommitRequest(block, requestVersion,
+                        level.getServer().getTickCount() + 200L));
                     commitBudgetYields++;
                     yieldToCommit();
                 } else {
+                    commitRequests.remove(cell);
                     proving.remove(cell);
+                    if (commitRequests.isEmpty()) {
+                        releaseCommit(false);
+                    }
                     if (answer.isPresent()) {
                         commitRefused++;
-                        if (answer.get() == GroundRefusal.FILL_ACCESS_BLOCKED && offered.containsKey(cell)) {
+                        if (answer.get() == GroundRefusal.FILL_ACCESS_BLOCKED && requested(cell)) {
                             reconsider = true;
                             changed.run();
                         }
@@ -354,17 +600,20 @@ final class FillPlan implements AutoCloseable {
     }
 
     boolean provingDestination(BlockPos feet) {
-        return !closed && provingDestinations.contains(feet);
+        return !closed && (completion == null ? provingDestinations.contains(feet) : completion.provingDestination(feet));
     }
 
     private void yieldToCommit() {
         Map<UUID, Allowance> allowances = ALLOWANCES.get(level);
         Allowance allowance = allowances == null ? null : allowances.get(colony);
-        if (allowance != null) {
-            // A failed work node is offered again and winds up before its next attempt. Keep the
-            // allowance through that interval, rather than reserving only an otherwise idle next tick.
+        long tick = level.getServer().getTickCount();
+        if (allowance != null && (allowance.commitZone == null || zone.equals(allowance.commitZone)
+                || tick > allowance.commitUntil)) {
+            // Keep one zone's continuation through the runner's windup. A different active owner
+            // cannot be displaced by a later worker merely joining its own execution queue.
             allowance.commitZone = zone;
-            allowance.commitUntil = level.getServer().getTickCount() + 200L;
+            allowance.commitUntil = commitRequests.isEmpty() ? tick + 200L
+                : commitRequests.values().iterator().next().until();
         }
     }
 
@@ -376,117 +625,141 @@ final class FillPlan implements AutoCloseable {
         }
     }
 
-    private Optional<GroundRefusal> permits(BlockPos cell, BlockState block, Mob worker, Ground.Budget budget) {
-        if (!offered(cell)) {
-            return Optional.of(GroundRefusal.FILL_ACCESS_CHANGED);
+    private void discardStaleCommits() {
+        long tick = level.getServer().getTickCount();
+        commitRequests.entrySet().removeIf(entry -> {
+            CommitRequest request = entry.getValue();
+            if (request.version() != requestVersion || tick > request.until() || !requested(entry.getKey())) {
+                proving.remove(entry.getKey());
+                commitProofs.remove(entry.getKey());
+                return true;
+            }
+            return false;
+        });
+        if (commitRequests.isEmpty() && provingDestinations.isEmpty()) {
+            releaseCommit(false);
         }
-        if (budget.exhausted()) {
-            return Optional.of(GroundRefusal.FILL_ACCESS_BLOCKED);
+    }
+
+    // Only geometry advances here. People, their capabilities, current footings and the actual worker
+    // are sampled afresh by permits; no background result can approve a placement by itself.
+    private void advanceCommit(Ground.Budget budget) {
+        if (commitRequests.isEmpty() || !context.advance(budget)) {
+            return;
         }
-        if (context == null || !context.valid()) {
-            restart();
-            return Optional.of(GroundRefusal.FILL_ACCESS_CHANGED);
+        int left = commitRequests.size();
+        while (left-- > 0 && !commitRequests.isEmpty() && !budget.exhausted()) {
+            int used = budget.used();
+            Map.Entry<BlockPos, CommitRequest> next = commitRequests.entrySet().iterator().next();
+            Candidate proof = commitProof(next.getKey(), next.getValue().block());
+            if (!proof.advance(budget)) {
+                return;
+            }
+            commitRequests.remove(next.getKey());
+            if (proof.stands.isEmpty()) {
+                // A complete counterexample is a real refusal, not an indefinitely renewable budget wait.
+                proving.remove(next.getKey());
+                reconsider = true;
+                changed.run();
+            } else {
+                // A ready proof keeps its short lease for the runner's fresh check. Rotate it behind
+                // unfinished requests, including when a slice has only one unit left.
+                commitRequests.put(next.getKey(), next.getValue());
+            }
+            // Completed entries cost one no-work visit. At most the initial queue size is visited;
+            // unfinished searches retain the whole slice and never lose their only unit to a wrapper.
+            if (budget.used() == used && !budget.tryStep()) {
+                return;
+            }
         }
-        if (!context.advance(budget)) {
-            return Optional.of(GroundRefusal.FILL_ACCESS_BLOCKED);
+        if (commitRequests.isEmpty()) {
+            releaseCommit(false);
         }
+    }
+
+    private boolean counterexample(BlockPos cell, BlockState block) {
+        Candidate proof = commitProofs.get(cell);
+        // Even with no remaining work, a completed current-epoch counterexample is terminal.
+        // An expired negative becomes unknown and is re-proved; it never grants a placement.
+        return proof != null && context != null && proof.block.equals(block)
+            && proof.done && proof.stands.isEmpty() && proof.source.exits.equals(context.exits)
+            && context.valid() && proof.source.valid() && (proof.access == null || proof.access.valid());
+    }
+
+    private Candidate commitProof(BlockPos cell, BlockState block) {
         Candidate proof = proofs.get(cell);
-        if (proof == null || !proof.block.equals(block) || !proof.source.valid() || !proof.access.valid()
-                || !proof.source.exits.equals(context.exits)) {
-            // Material can be selected from a broad item filter. Its geometry must be proved too; retain
-            // this work across retries instead of redoing a large remaining-work scan on every attempt.
+        if (proof == null || !proof.block.equals(block) || !proof.source.valid()
+                || !proof.source.exits.equals(context.exits) || proof.access != null && !proof.access.valid()) {
+            // Broad item filters can supply a different material from the planner's prediction.
             proof = commitProofs.computeIfAbsent(cell, any -> new Candidate(context, cell, block, List.of(), null));
             if (!proof.block.equals(block) || !proof.source.valid()
-                    || !proof.source.exits.equals(context.exits)
-                    || proof.access != null && !proof.access.valid()) {
+                    || !proof.source.exits.equals(context.exits) || proof.access != null && !proof.access.valid()) {
                 proof = new Candidate(context, cell, block, List.of(), null);
                 commitProofs.put(cell, proof);
             }
-            if (!proof.advance(budget) || proof.stands.isEmpty()) {
-                return Optional.of(GroundRefusal.FILL_ACCESS_BLOCKED);
-            }
         }
-        Context live = context.withPeople();
-        if (!live.people.contains(worker)) {
-            live.people.add(worker);
-        }
-        Candidate check = new Candidate(live, cell, block, live.people, proof);
-        if (!check.advance(budget) || check.stands.isEmpty()) {
-            return Optional.of(GroundRefusal.FILL_ACCESS_BLOCKED);
-        }
-        View own = live.view(worker);
-        if (!own.access().advance(budget)) {
-            return Optional.of(GroundRefusal.FILL_ACCESS_BLOCKED);
-        }
-        FootSearch footing = live.footing(worker, own.ground());
-        if (!footing.advance(budget)) {
-            return Optional.of(GroundRefusal.FILL_ACCESS_BLOCKED);
-        }
-        BlockPos feet = footing.feet;
-        Vec3 actual = position(worker);
-        if (feet == null || Reach.stanceHolding(actual, Set.copyOf(check.stands)).isEmpty()
-                || actual.add(0.0D, worker.getEyeHeight(), 0.0D).distanceToSqr(Vec3.atCenterOf(cell))
-                    > Reach.PLAYER_BLOCK_REACH * Reach.PLAYER_BLOCK_REACH) {
-            return Optional.of(GroundRefusal.FILL_ACCESS_BLOCKED);
-        }
-        Ground.Access escape = live.trial(own, cell, block).access();
-        if (!escape.advance(budget) || escape.distance(feet) < 0) {
-            return Optional.of(GroundRefusal.FILL_ACCESS_BLOCKED);
-        }
-        return Optional.empty();
+        return proof;
     }
-    void committed(BlockPos cell) {
+
+    private CommitResult permits(BlockPos cell, BlockState block, Mob worker, Ground.Budget budget) {
+        if (!requested(cell)) return CommitResult.CHANGED;
+        if (completion == null) return CommitResult.PENDING;
+        CompletionRuntime.Permit answer = completion.permits(cell, block, worker, budget);
+        syncCompletion();
+        return switch (answer) {
+            case READY -> CommitResult.READY;
+            case PENDING -> CommitResult.PENDING;
+            case BLOCKED -> CommitResult.BLOCKED;
+            case CHANGED -> CommitResult.CHANGED;
+        };
+    }
+    void committed(BlockPos cell, BlockState block, Mob worker) {
+        // This callback is only reached after this node's own successful setBlock. External occupancy
+        // never consumes a witness prefix or creates a material receipt.
+        receipts.put(cell, block);
+        receiptKeys.add(Job.keyOf(cell));
+        if (completion != null) completion.committed(cell, block, worker);
+        commitRequests.remove(cell);
         proving.remove(cell);
         pending.remove(cell);
         Map<BlockPos, Job> next = new LinkedHashMap<>(offered);
         next.remove(cell);
         offered = Map.copyOf(next);
+        Map<BlockPos, Job> requests = new LinkedHashMap<>(issued);
+        requests.remove(cell);
+        issued = Map.copyOf(requests);
+        commitProofs.remove(cell);
+        releaseCommit(false);
+        // Save the real receipt and retreat obligation before a normal save can observe targets empty.
+        // This is fact persistence, never a saved placement permission.
+        persistCompletion();
         changed.run();
     }
 
     boolean safeDestination(LivingEntity body, BlockPos target) {
-        return allotted(budget -> {
-            if (!budget.exhausted()) {
-                releaseCommit(true);
-            }
-            boolean answer = safeDestination(body, target, budget);
-            if (!answer && !closed && budget.exhausted()) {
-                provingDestinations.add(target);
-                yieldToCommit();
-            } else {
-                provingDestinations.remove(target);
-            }
-            return answer;
-        });
+        return allotted(budget -> completion != null && completion.safeDestination(body, target, budget));
     }
 
-    private boolean safeDestination(LivingEntity body, BlockPos target, Ground.Budget budget) {
-        if (closed || budget.exhausted() || !clearAsideStance(body, target)) {
-            return false;
-        }
-        if (context == null || !context.valid()) {
-            restart();
-        }
-        if (!context.advance(budget)) {
-            return false;
-        }
-        Context live = context.withPeople();
-        if (!live.valid()) {
-            return false;
-        }
-        Ground.Access access = live.view(body).access();
-        return access.advance(budget) && access.distance(target) >= 0;
-    }
     boolean clearOfFill(LivingEntity body) {
         Vec3 here = position(body);
         return missesPending(body.getBoundingBox().move(here.subtract(body.position())));
     }
 
-    void movedAside(UUID resident) {
-        steppingAside = steppingAside.stream().filter(move -> move.nodes().stream()
-            .noneMatch(node -> node.worker().filter(resident::equals).isPresent())).toList();
-        reconsider = true;
+    boolean movedAside(UUID resident) {
+        if (closed) return false;
+        if (completion != null) {
+            if (!completion.movedAside(resident)) return false;
+            syncCompletion();
+            persistCompletion();
+        } else {
+            List<Grown> before = steppingAside;
+            steppingAside = steppingAside.stream().filter(move -> move.nodes().stream()
+                .noneMatch(node -> node.worker().filter(resident::equals).isPresent())).toList();
+            if (before.size() == steppingAside.size()) return false;
+            reconsider = true;
+        }
         changed.run();
+        return true;
     }
 
     // A candidate is a continuation. The graph search, people, boundary ports and remaining jobs all
@@ -518,7 +791,7 @@ final class FillPlan implements AutoCloseable {
             this.block = block;
             this.people = people;
             this.geometry = geometry;
-            jobs = remaining;
+            jobs = inputs;
             shape = block.getCollisionShape(level, cell).move(cell.getX(), cell.getY(), cell.getZ()).toAabbs();
         }
 
@@ -663,7 +936,7 @@ final class FillPlan implements AutoCloseable {
                             continue;
                         }
                         Job next = jobs.get(job++);
-                        if (next.cell().equals(cell) || !pending.contains(next.cell())
+                        if (next.cell().equals(cell) || !needed(next.cell())
                                 || !Survey.open(level.getBlockState(next.cell()))) {
                             continue;
                         }
@@ -886,6 +1159,7 @@ final class FillPlan implements AutoCloseable {
         final Map<Integer, Part> byPart = new LinkedHashMap<>();
         final List<Part> candidates = new ArrayList<>();
         final Set<BlockPos> rejected = new HashSet<>();
+        final Map<BlockPos, Job> refreshedRequests = new HashMap<>();
         final List<Job> inputJobs = inputs;
         final Set<String> targetKeys = wanted;
         Iterator<BlockPos> cellsLeft = cells.iterator();
@@ -1115,8 +1389,10 @@ final class FillPlan implements AutoCloseable {
 
         final class Publication {
             final Iterator<Part> groups = candidates.iterator();
+            final Iterator<Job> requests = issued.values().iterator();
             final Iterator<Job> previous = offered.values().iterator();
             final Map<BlockPos, Job> next = new LinkedHashMap<>();
+            final Map<BlockPos, Job> nextRequests = new LinkedHashMap<>();
             final Set<Integer> active = new HashSet<>();
             Iterator<Job> jobs = Collections.emptyIterator();
             boolean retreat;
@@ -1124,9 +1400,14 @@ final class FillPlan implements AutoCloseable {
 
             boolean advance(Ground.Budget budget) {
                 while (budget.tryStep()) {
-                    if (previous.hasNext()) {
+                    if (requests.hasNext()) {
+                        Job job = requests.next();
+                        if (needed(job.cell()) && executable(job.cell()) && !rejected.contains(job.cell())) {
+                            nextRequests.put(job.cell(), refreshedRequests.getOrDefault(job.cell(), job));
+                        }
+                    } else if (previous.hasNext()) {
                         Job job = previous.next();
-                        if (pending.contains(job.cell()) && !rejected.contains(job.cell())) {
+                        if (needed(job.cell()) && pending.contains(job.cell()) && !rejected.contains(job.cell())) {
                             next.put(job.cell(), job);
                             Integer part = parts.get(job.cell());
                             if (part != null) {
@@ -1136,17 +1417,21 @@ final class FillPlan implements AutoCloseable {
                         }
                     } else if (jobs.hasNext()) {
                         Job job = jobs.next();
-                        next.put(job.cell(), job);
-                        closing &= job.footings().cells().stream().noneMatch(at -> cells.contains(at.block(level)));
+                        if (needed(job.cell()) && executable(job.cell())) {
+                            next.put(job.cell(), job);
+                            nextRequests.put(job.cell(), job);
+                            closing &= job.footings().cells().stream().noneMatch(at -> cells.contains(at.block(level)));
+                        }
                     } else if (groups.hasNext()) {
                         Part group = groups.next();
-                        if ((group.ordinary || group.done) && !group.front.isEmpty()) {
+                        if (!group.front.isEmpty()) {
                             jobs = group.front.values().iterator();
                             active.add(group.id);
                             retreat |= !group.ordinary;
                         }
                     } else {
                         offered = Collections.unmodifiableMap(next);
+                        issued = Collections.unmodifiableMap(nextRequests);
                         phase = next.isEmpty() ? Phase.WAITING : closing ? Phase.CLOSING
                             : retreat ? Phase.RETREATING : Phase.FILLING;
                         return true;
@@ -1187,6 +1472,10 @@ final class FillPlan implements AutoCloseable {
                 }
                 if (!trial.stands.isEmpty()) {
                     proofs.put(next.job().cell(), trial);
+                    Job proved = next.job();
+                    Job refreshed = new Job(proved.key(), proved.site(), proved.cell(), proved.cells(), proved.canopy(),
+                        Stances.of(level, trial.stands).orElseThrow());
+                    refreshedRequests.put(proved.cell(), refreshed);
                     boolean normal = !next.passage();
                     int y = next.job().cell().getY();
                     if (front.isEmpty() || normal && !ordinary || normal == ordinary
@@ -1197,9 +1486,7 @@ final class FillPlan implements AutoCloseable {
                         ordinary = normal;
                     }
                     if (normal == ordinary && y == layer && next.depth() == depth) {
-                        Job job = next.job();
-                        front.put(job.cell(), new Job(job.key(), job.site(), job.cell(), job.cells(), job.canopy(),
-                            Stances.of(level, trial.stands).orElseThrow()));
+                        front.put(refreshed.cell(), refreshed);
                         published = true;
                     }
                 } else {
@@ -1346,6 +1633,7 @@ final class FillPlan implements AutoCloseable {
         private Grounds.Watch source;
         private long revision = Long.MIN_VALUE;
         private long liveRevision;
+        private long anchorRevision;
 
         Context() {
             views = new HashMap<>();
@@ -1355,6 +1643,7 @@ final class FillPlan implements AutoCloseable {
             ports = new ArrayList<>();
             source = watch;
             liveRevision = LIVE_REVISIONS.getOrDefault(level, 0L);
+            anchorRevision = liveRevision;
         }
 
         Context(Context earlier) {
@@ -1370,6 +1659,7 @@ final class FillPlan implements AutoCloseable {
             source = earlier.source;
             revision = earlier.revision;
             liveRevision = earlier.liveRevision;
+            anchorRevision = earlier.anchorRevision;
             people = people();
             stage = 3;
         }
@@ -1389,6 +1679,18 @@ final class FillPlan implements AutoCloseable {
             source = watch;
             revision = watch.revision();
             liveRevision = LIVE_REVISIONS.getOrDefault(level, 0L);
+        }
+
+        boolean anchorsValid() {
+            long now = LIVE_REVISIONS.getOrDefault(level, 0L);
+            if (anchorRevision == now) return true;
+            ArrayDeque<Activation> changes = ACTIVATIONS.get(level);
+            if (changes == null || changes.isEmpty() || changes.getFirst().revision() > anchorRevision + 1) return false;
+            for (Activation change : changes) {
+                if (change.revision() > anchorRevision && change.bounds().intersects(anchorBounds)) return false;
+            }
+            anchorRevision = now;
+            return true;
         }
 
         boolean valid() {
@@ -1411,7 +1713,7 @@ final class FillPlan implements AutoCloseable {
                 // merely releases space, and a distant colony cannot affect any exit inside this watch.
                 // The bounded journal also makes this check independent of the total number of zones.
                 for (Activation change : changes) {
-                    if (change.revision() > liveRevision && change.bounds().intersects(bounds)) {
+                    if (change.added() && change.revision() > liveRevision && change.bounds().intersects(bounds)) {
                         return false;
                     }
                 }
@@ -1600,14 +1902,29 @@ final class FillPlan implements AutoCloseable {
             return;
         }
         closed = true;
+        if (limits.equals(Limits.NORMAL)) ServerFillBudget.close(level.getServer(), this);
+        if (completion != null) {
+            completion.close();
+            completion = null;
+        }
+        receipts.clear();
+        receiptKeys.clear();
+        restoredCompletion = null;
+        persisted = () -> { };
+        anchors.clear();
+        anchorCursor = null;
+        anchorSource = null;
         releaseCommit(false);
         offered = Map.of();
+        issued = Map.of();
+        inputCells = Set.of();
         steppingAside = List.of();
         watch.close();
         planning = null;
         context = null;
         proofs.clear();
         commitProofs.clear();
+        commitRequests.clear();
         proving.clear();
         provingDestinations.clear();
         cursors.clear();
@@ -1628,10 +1945,13 @@ final class FillPlan implements AutoCloseable {
             }
         }
         Set<FillPlan> live = LIVE.get(level);
-        if (live != null && live.remove(this) && live.isEmpty()) {
-            LIVE.remove(level);
-            LIVE_REVISIONS.remove(level);
-            ACTIVATIONS.remove(level);
+        if (live != null && live.remove(this)) {
+            liveChanged(false);
+            if (live.isEmpty()) {
+                LIVE.remove(level);
+                LIVE_REVISIONS.remove(level);
+                ACTIVATIONS.remove(level);
+            }
         }
     }
 }
