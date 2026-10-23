@@ -4,6 +4,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
 import java.util.Objects;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.Opcodes;
@@ -56,14 +57,22 @@ public final class DiagnosticsCheck {
         System.out.println("Diagnostics " + args[0] + ": " + checks + " checks passed");
     }
 
+    @SuppressWarnings("deprecation")
     private static void checkClientHook(boolean nightly) throws Exception {
         String config = "/folkways-nightly-diagnostics.mixins.json";
         String mixin = "/io/github/izakyl/folkways/diagnostics/mixin/SparkClientBackgroundMixin.class";
         require((DiagnosticsCheck.class.getResource(config) != null) == nightly, "client hook config follows channel");
         require((DiagnosticsCheck.class.getResource(mixin) != null) == nightly, "client hook class follows channel");
-        try (var input = DiagnosticsCheck.class.getResourceAsStream("/META-INF/neoforge.mods.toml")) {
-            require(input != null && new String(input.readAllBytes(), StandardCharsets.UTF_8)
-                .contains("folkways-nightly-diagnostics.mixins.json") == nightly, "client hook registration follows channel");
+        // Every mod has the common metadata path. Anchor it to Core's unique resource so Spark or a
+        // classpath dependency cannot satisfy this assertion with a different mod's metadata.
+        var anchor = DiagnosticsCheck.class.getResource("/META-INF/folkways/build.properties");
+        require(anchor != null, "Core metadata resource anchor");
+        try (var input = new URL(anchor, "../neoforge.mods.toml").openStream()) {
+            String metadata = new String(input.readAllBytes(), StandardCharsets.UTF_8);
+            require(metadata.contains("modId=\"folkways_core\"") || metadata.contains("modId = \"folkways_core\""),
+                "diagnostics registration is read from Core's own metadata");
+            require(metadata.contains("folkways-nightly-diagnostics.mixins.json") == nightly,
+                "client hook registration follows channel");
         }
         if (!nightly) return;
 
