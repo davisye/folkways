@@ -24,6 +24,10 @@
 
 Nightly Core 内置未修改的 [Spark NeoForge 1.21.1 版本](https://modrinth.com/mod/spark/version/1.10.124-neoforge-1.21.1)，
 启动后默认对服务器和客户端进行后台 CPU 采样，采用 Spark 默认的 10 毫秒间隔。
+该固定 Spark 版本本身会硬性拒绝客户端自动采样，即使配置已开启。Nightly 通过仅客户端加载的
+兼容 Mixin，让 Spark 自己的后台管理器按合并后的 `backgroundProfiler` 设置决定是否开启，仍保留
+用户关闭设置；Release 不包含该 Mixin 类或其注册。Folkways 启动日志只表示请求采样，实际状态须
+分别通过服务器和客户端的 `profiler info` 确认。
 调度心跳日志也默认开启。Release 不内置或启动 Spark，新建服务器配置的心跳日志默认
 关闭。两个渠道都保留用户已保存的设置。
 
@@ -46,7 +50,8 @@ Linux 和 macOS；Windows 使用 Java 采样器采集 CPU 调用栈。详见
 [采样引擎说明](https://spark.lucko.me/docs/misc/Using-async-profiler)。
 
 `./gradlew :core:checkDiagnostics :core:verifyDiagnostics` 可在不启动 Minecraft 的情况下
-检查所选渠道的默认行为、关闭设置及包内分析器的校验和。`build` 已包含这两项检查。
+检查所选渠道的默认行为、关闭设置、实际 Spark 构造器／字段兼容性、客户端挂钩注册及包内分析器
+的校验和。`build` 已包含这两项检查。
 
 ## NeoForge GameTests
 

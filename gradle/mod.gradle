@@ -77,6 +77,8 @@ def expanded = [
     "minecraft_requirement": project.minecraft_requirement,
     "neoforge_requirement": project.neoforge_requirement,
     "ldlib_requirement": project.ldlib_requirement,
+    "nightly_diagnostics_mixins": (project.modId == "folkways_core" && rootProject.nightlyBuild
+        ? '[[mixins]]\nconfig = "folkways-nightly-diagnostics.mixins.json"' : ""),
 ]
 
 processResources {

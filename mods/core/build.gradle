@@ -16,6 +16,7 @@ if (rootProject.nightlyBuild) {
         }
     }
     dependencies {
+        compileOnly "maven.modrinth:spark:${project.spark_version}"
         jarJar("maven.modrinth:spark") {
             version {
                 strictly "[${project.spark_version}]"
@@ -24,6 +25,7 @@ if (rootProject.nightlyBuild) {
             transitive = false
         }
     }
+    sourceSets.main.java.srcDir("src/nightly/java")
     sourceSets.main.resources.srcDir("src/nightly/resources")
 }
 
@@ -63,9 +65,16 @@ tasks.register("verifyDiagnostics") {
             }
             contents.matching { include "META-INF/LICENSE_spark.txt" }.singleFile
             contents.matching { include "META-INF/NOTICE_spark.txt" }.singleFile
+            contents.matching { include "folkways-nightly-diagnostics.mixins.json" }.singleFile
+            contents.matching { include "io/github/izakyl/folkways/diagnostics/mixin/SparkClientBackgroundMixin.class" }.singleFile
+            def modInfo = contents.matching { include "META-INF/neoforge.mods.toml" }.singleFile.text
+            if (!modInfo.contains('config = "folkways-nightly-diagnostics.mixins.json"')) {
+                throw new GradleException("Nightly Spark client compatibility hook is not registered")
+            }
         } else if (!contents.matching {
             include "META-INF/jarjar/*spark*.jar", "me/lucko/spark/**"
             include "META-INF/LICENSE_spark.txt", "META-INF/NOTICE_spark.txt"
+            include "folkways-nightly-diagnostics.mixins.json", "io/github/izakyl/folkways/diagnostics/mixin/**"
         }.isEmpty()) {
             throw new GradleException("Nightly profiler files leaked into ${archive.name}")
         }
@@ -80,6 +89,12 @@ sourceSets {
     diagnosticsTest {
         compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
         runtimeClasspath += sourceSets.main.output + sourceSets.main.runtimeClasspath
+    }
+}
+
+if (rootProject.nightlyBuild) {
+    dependencies {
+        diagnosticsTestRuntimeOnly "maven.modrinth:spark:${project.spark_version}"
     }
 }
 

@@ -26,6 +26,11 @@ channel's collected jars from `build/libs/`.
 Nightly Core includes the unmodified [Spark NeoForge 1.21.1 build](https://modrinth.com/mod/spark/version/1.10.124-neoforge-1.21.1)
 as a Jar-in-Jar mod. It enables background CPU sampling for both the server and
 client, at Spark's default 10 ms interval. Planning heartbeat logs default to on.
+The fixed Spark release otherwise rejects automatic client sampling even when opted in.
+Nightly registers a client-only compatibility mixin so Spark's own background manager honours
+its merged `backgroundProfiler` setting; saved opt-outs still win. Release contains neither
+that mixin class nor its registration. The early Folkways log requests sampling; confirm
+that Spark actually started it with `profiler info` on each side.
 Release Core does not bundle Spark or enable its profiler, and new Release
 server configs default to disabled heartbeat logs. Existing user preferences
 take priority in both channels.
@@ -53,7 +58,8 @@ macOS; on Windows its Java sampler provides CPU stack samples. See
 [profiler engines](https://spark.lucko.me/docs/misc/Using-async-profiler).
 
 `./gradlew :core:checkDiagnostics :core:verifyDiagnostics` checks the selected
-channel's defaults, opt-outs and packaged profiler checksum without launching
+channel's defaults, opt-outs, actual Spark constructor/field compatibility, client-hook registration
+and packaged profiler checksum without launching
 Minecraft. Both checks are included in `build`.
 
 ## NeoForge GameTests

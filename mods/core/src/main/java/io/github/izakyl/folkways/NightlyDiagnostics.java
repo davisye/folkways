@@ -37,6 +37,6 @@ final class NightlyDiagnostics {
             return;
         }
         System.setProperty(BACKGROUND, "true");
-        LogUtils.getLogger().info("[folkways/diagnostics] Nightly Spark background sampling enabled (client and server, 10 ms default)");
+        LogUtils.getLogger().info("[folkways/diagnostics] Nightly Spark background sampling requested (client and server, 10 ms default); use profiler info to confirm");
     }
 }
