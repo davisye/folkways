@@ -15,25 +15,38 @@ Complete the [development setup](../../CONTRIBUTING.md#development-setup) first.
 | `./gradlew check`         | Module checks, game test source compilation, and checks for tabs and trailing whitespace; does not launch game tests |
 | `./gradlew build`         | Gradle checks, jar packaging and collection                                                                          |
 
-## Nightly diagnostics
+## Development diagnostics
 
 `./gradlew build` produces Release jars. `./gradlew -PbuildChannel=nightly build`
-produces jars with a `-nightly` version suffix. CI builds and checks both channels;
+produces jars with a `-nightly` version suffix. `dev`, `snapshot`, `rc`, `beta` and
+`alpha` channels also append their channel to the version; channel names are case-insensitive.
+CI builds and checks Release and Nightly;
 its GameTests and client smoke test run the Nightly channel. The Nightly release
 publishes only that channel's jars. Switching channels also clears the previous
 channel's collected jars from `build/libs/`.
 
-Nightly Core includes the unmodified [Spark NeoForge 1.21.1 build](https://modrinth.com/mod/spark/version/1.10.124-neoforge-1.21.1)
-as a Jar-in-Jar mod. It enables background CPU sampling for both the server and
-client, at Spark's default 10 ms interval. Planning heartbeat logs default to on.
-The fixed Spark release otherwise rejects automatic client sampling even when opted in.
-Nightly registers a client-only compatibility mixin so Spark's own background manager honours
-its merged `backgroundProfiler` setting; saved opt-outs still win. Release contains neither
-that mixin class nor its registration. The early Folkways log requests sampling; confirm
+Automatic background sampling and planning heartbeat defaults require **both** a development
+version and Spark in NeoForge's installed mod list. A jar on a compile/test classpath does not count.
+The actual loaded Core version takes priority over the packaged channel. Version markers
+`release`, `rc`, `beta` and `alpha` exclude automatic diagnostics, even beside `nightly` or `dev`.
+Markers are whole runs of letters, case-insensitive: `RC1` and `alpha.2` exclude diagnostics;
+ordinary words such as `alphabet`, `betamax` and `releaseNotes` do not. `dev`, `snapshot`,
+`nightly` and other custom version labels qualify. A numeric version such as `0.1.0` with the
+explicit `release` channel stays off; a missing version and channel do not opt in.
+
+For example, `./gradlew -Pmod_version=0.1.0-dev build` uses the default Release channel but
+produces a development version. It enables these defaults only if Spark is separately installed.
+Without Spark, it leaves the heartbeat default off and does not mutate Spark properties or files.
+Saved heartbeat and Spark preferences always take priority.
+
+Only Nightly Core includes the unmodified [Spark NeoForge 1.21.1 build](https://modrinth.com/mod/spark/version/1.10.124-neoforge-1.21.1)
+as a Jar-in-Jar mod. Other channels never bundle Spark. The fixed Spark release rejects automatic
+client sampling even when opted in, so development versions package a client-only compatibility
+mixin that lets Spark's own background manager honour its merged `backgroundProfiler` setting.
+An optional loading guard and string target skip this hook when Spark is absent; ordinary
+Release/RC/Beta/Alpha versions contain neither the hook nor its registration.
+Sampling uses Spark's default 10 ms interval. The early Folkways log requests sampling; confirm
 that Spark actually started it with `profiler info` on each side.
-Release Core does not bundle Spark or enable its profiler, and new Release
-server configs default to disabled heartbeat logs. Existing user preferences
-take priority in both channels.
 
 After reproducing a slowdown, save the server profile locally with
 `/spark profiler stop --save-to-file`; for rendering stalls use
@@ -43,12 +56,12 @@ and `profiler start` to begin another recording. Bare `profiler open` or
 `profiler stop` uploads profiling data to Spark's viewer; automatic background
 sampling does not upload a profile.
 
-To opt out of Nightly background sampling, set `backgroundProfiler` to `false`
+To opt out of automatic development sampling, set `backgroundProfiler` to `false`
 in `config/spark/config.json`, or launch Java with `-Dspark.backgroundProfiler=false`
 or `SPARK_BACKGROUNDPROFILER=false`. A saved `diagnostics.logPlanHeartbeat`
 preference in `folkways_core-server.toml` controls the heartbeat log separately.
 Per-player chat diagnostics remain opt-in. A separately installed Spark mod
-keeps its own settings when using Release.
+keeps its own settings with a formal Release/RC/Beta/Alpha version.
 
 Use Java 21's JFR for deeper investigations of allocations, GC pauses or locks;
 start a short recording when needed. Nightly does not start a second continuous
@@ -58,8 +71,8 @@ macOS; on Windows its Java sampler provides CPU stack samples. See
 [profiler engines](https://spark.lucko.me/docs/misc/Using-async-profiler).
 
 `./gradlew :core:checkDiagnostics :core:verifyDiagnostics` checks the selected
-channel's defaults, opt-outs, actual Spark constructor/field compatibility, client-hook registration
-and packaged profiler checksum without launching
+version boundaries, Spark-presence gating, saved opt-outs, actual Spark constructor/field compatibility,
+optional client-hook registration and packaged profiler checksum without launching
 Minecraft. Both checks are included in `build`.
 
 ## NeoForge GameTests

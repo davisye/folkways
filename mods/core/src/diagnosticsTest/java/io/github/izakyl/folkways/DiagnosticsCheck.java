@@ -1,11 +1,13 @@
 package io.github.izakyl.folkways;
 
+import com.electronwill.nightconfig.core.CommentedConfig;
+import com.google.gson.JsonParser;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
 import java.util.Objects;
-import java.net.URL;
-import java.nio.charset.StandardCharsets;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.tree.ClassNode;
@@ -16,36 +18,49 @@ public final class DiagnosticsCheck {
     private static int checks;
 
     public static void main(String[] args) throws Exception {
-        boolean nightly = "nightly".equals(args[0]);
+        boolean nightly = "nightly".equalsIgnoreCase(args[0]);
+        boolean development = Boolean.parseBoolean(args[2]);
         require(BuildChannel.nightly() == nightly, "packaged build channel");
-        require(FolkwaysConfig.logPlanHeartbeat() == nightly, "heartbeat default follows channel");
-        checkClientHook(nightly);
+        require(BuildChannel.version().equals(args[1]), "packaged version follows mod metadata");
+        require(BuildChannel.development(args[1], args[0]) == development, "runtime and packaging version policies agree");
+        require(!BuildChannel.automaticDiagnostics(), "Spark on test classpath is not an installed mod");
+        require(!FolkwaysConfig.logPlanHeartbeat(), "development without installed Spark does not enable heartbeat");
+        checkVersionPolicy();
+        checkClientHook(development);
+        var saved = CommentedConfig.inMemory();
+        saved.set("diagnostics.logPlanHeartbeat", false);
+        FolkwaysConfig.SPEC.correct(saved);
+        require(Boolean.FALSE.equals(saved.get("diagnostics.logPlanHeartbeat")), "saved heartbeat opt-out survives correction");
         Path directory = Files.createTempDirectory("folkways-diagnostics-");
         String previous = System.getProperty(BACKGROUND);
         Path config = directory.resolve("config.json");
         try {
             System.clearProperty(BACKGROUND);
             NightlyDiagnostics.installDefaults(config);
-            require(Objects.equals(nightly ? "true" : null, System.getProperty(BACKGROUND)), "fresh install default");
+            require(System.getProperty(BACKGROUND) == null, "no installed Spark means no default mutation");
+            NightlyDiagnostics.installDefaults(config, false);
+            require(System.getProperty(BACKGROUND) == null, "ineligible build cannot default sampling on");
+            NightlyDiagnostics.installDefaults(config, true);
+            require("true".equals(System.getProperty(BACKGROUND)), "eligible development and installed Spark default");
             require(!Files.exists(config), "no persistent Spark preference written");
 
             System.setProperty(BACKGROUND, "false");
-            NightlyDiagnostics.installDefaults(config);
+            NightlyDiagnostics.installDefaults(config, true);
             require("false".equals(System.getProperty(BACKGROUND)), "explicit JVM opt-out");
 
             System.clearProperty(BACKGROUND);
             Files.writeString(config, "{\"backgroundProfiler\":false,\"other\":123}");
-            NightlyDiagnostics.installDefaults(config);
+            NightlyDiagnostics.installDefaults(config, true);
             require(System.getProperty(BACKGROUND) == null, "saved Spark opt-out");
             require(Files.readString(config).equals("{\"backgroundProfiler\":false,\"other\":123}"), "saved config preserved");
 
             Files.writeString(config, "{}");
-            NightlyDiagnostics.installDefaults(config);
-            require(nightly == "true".equals(System.getProperty(BACKGROUND)), "config with no profiler preference");
+            NightlyDiagnostics.installDefaults(config, true);
+            require("true".equals(System.getProperty(BACKGROUND)), "config with no profiler preference");
 
             System.clearProperty(BACKGROUND);
             Files.writeString(config, "invalid-json");
-            NightlyDiagnostics.installDefaults(config);
+            NightlyDiagnostics.installDefaults(config, true);
             require(System.getProperty(BACKGROUND) == null, "invalid config does not force sampling");
         } finally {
             if (previous == null) System.clearProperty(BACKGROUND);
@@ -57,12 +72,57 @@ public final class DiagnosticsCheck {
         System.out.println("Diagnostics " + args[0] + ": " + checks + " checks passed");
     }
 
+    private record VersionCase(String version, String channel, boolean development) {
+    }
+
+    private static void checkVersionPolicy() {
+        var cases = new VersionCase[] {
+            new VersionCase("0.1.0-nightly", "release", true),
+            new VersionCase("0.1.0-DEV", "release", true),
+            new VersionCase("0.1.0-SNAPSHOT.7", "release", true),
+            new VersionCase("0.1.0-release", "nightly", false),
+            new VersionCase("0.1.0-ReLeAsE2", "nightly", false),
+            new VersionCase("0.1.0-rc.1", "nightly", false),
+            new VersionCase("0.1.0RC1", "nightly", false),
+            new VersionCase("0.1.0-ALPHA2", "nightly", false),
+            new VersionCase("0.1.0-beta+nightly", "nightly", false),
+            new VersionCase("0.1.0-dev+release", "nightly", false),
+            new VersionCase("0.1.0-dev", "beta", false),
+            new VersionCase("0.1.0-dev", "RC1", false),
+            new VersionCase("0.1.0-releaseNotes", "release", true),
+            new VersionCase("0.1.0-alphabet", "release", true),
+            new VersionCase("0.1.0-betamax", "release", true),
+            new VersionCase("0.1.0-arc", "release", true),
+            new VersionCase("0.1.0-20261023-abcdef", "release", true),
+            new VersionCase("0.1.0", "release", false),
+            new VersionCase("20261023", "release", false),
+            new VersionCase("0.1.0", "dev", true),
+            new VersionCase("0.1.0", "snapshot", true),
+            new VersionCase("0.1.0", "", true),
+            new VersionCase("0.1.0", null, true),
+            new VersionCase("", "nightly", true),
+            new VersionCase("", "release", false),
+            new VersionCase(null, null, false),
+            new VersionCase(" 0.1.0-dEv ", " Release ", true),
+        };
+        for (var entry : cases) {
+            String label = String.valueOf(entry.version()) + "/" + entry.channel();
+            require(BuildChannel.development(entry.version(), entry.channel()) == entry.development(), "version boundary " + label);
+            require(BuildChannel.automaticDiagnostics(entry.version(), entry.channel(), true) == entry.development(),
+                "installed Spark policy " + label);
+            require(!BuildChannel.automaticDiagnostics(entry.version(), entry.channel(), false), "absent Spark policy " + label);
+        }
+    }
+
     @SuppressWarnings("deprecation")
-    private static void checkClientHook(boolean nightly) throws Exception {
-        String config = "/folkways-nightly-diagnostics.mixins.json";
+    private static void checkClientHook(boolean development) throws Exception {
+        String config = "/folkways-diagnostics.mixins.json";
         String mixin = "/io/github/izakyl/folkways/diagnostics/mixin/SparkClientBackgroundMixin.class";
-        require((DiagnosticsCheck.class.getResource(config) != null) == nightly, "client hook config follows channel");
-        require((DiagnosticsCheck.class.getResource(mixin) != null) == nightly, "client hook class follows channel");
+        String plugin = "io.github.izakyl.folkways.diagnostics.SparkDiagnosticsPlugin";
+        require((DiagnosticsCheck.class.getResource(config) != null) == development, "client hook config follows version policy");
+        require((DiagnosticsCheck.class.getResource(mixin) != null) == development, "client hook class follows version policy");
+        require((DiagnosticsCheck.class.getResource("/" + plugin.replace('.', '/') + ".class") != null) == development,
+            "optional client hook plugin follows version policy");
         // Every mod has the common metadata path. Anchor it to Core's unique resource so Spark or a
         // classpath dependency cannot satisfy this assertion with a different mod's metadata.
         var anchor = DiagnosticsCheck.class.getResource("/META-INF/folkways/build.properties");
@@ -71,10 +131,27 @@ public final class DiagnosticsCheck {
             String metadata = new String(input.readAllBytes(), StandardCharsets.UTF_8);
             require(metadata.contains("modId=\"folkways_core\"") || metadata.contains("modId = \"folkways_core\""),
                 "diagnostics registration is read from Core's own metadata");
-            require(metadata.contains("folkways-nightly-diagnostics.mixins.json") == nightly,
-                "client hook registration follows channel");
+            require(metadata.contains("folkways-diagnostics.mixins.json") == development,
+                "client hook registration follows version policy");
         }
-        if (!nightly) return;
+        if (!development) return;
+
+        try (var input = DiagnosticsCheck.class.getResourceAsStream(config)) {
+            var options = JsonParser.parseString(new String(Objects.requireNonNull(input).readAllBytes(), StandardCharsets.UTF_8))
+                .getAsJsonObject();
+            require(plugin.equals(options.get("plugin").getAsString()), "client hook has optional loading guard");
+            require(options.getAsJsonArray("client").size() == 1 && !options.has("mixins"), "hook is client-only");
+        }
+        Object guard = Class.forName(plugin).getConstructor().newInstance();
+        require(Boolean.FALSE.equals(guard.getClass().getMethod("shouldApplyMixin", String.class, String.class)
+            .invoke(guard, "me.lucko.spark.common.sampler.BackgroundSamplerManager", mixin)),
+            "no installed Spark skips the hook before target resolution");
+        try (var input = DiagnosticsCheck.class.getResourceAsStream(mixin)) {
+            ClassNode hook = new ClassNode();
+            new ClassReader(Objects.requireNonNull(input)).accept(hook, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+            require(hook.invisibleAnnotations.stream().anyMatch(annotation -> annotation.desc.equals("Lorg/spongepowered/asm/mixin/Pseudo;")),
+                "optional hook target does not require Spark presence");
+        }
 
         // Check the actual fixed Spark artifact, rather than a fake option holder which misses its client veto.
         try (var input = DiagnosticsCheck.class.getResourceAsStream("/me/lucko/spark/common/sampler/BackgroundSamplerManager.class")) {

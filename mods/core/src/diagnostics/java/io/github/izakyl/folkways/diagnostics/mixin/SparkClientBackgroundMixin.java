@@ -2,11 +2,11 @@ package io.github.izakyl.folkways.diagnostics.mixin;
 
 import me.lucko.spark.common.SparkPlatform;
 import me.lucko.spark.common.platform.PlatformInfo;
-import me.lucko.spark.common.sampler.BackgroundSamplerManager;
 import me.lucko.spark.common.util.config.Configuration;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Mutable;
+import org.spongepowered.asm.mixin.Pseudo;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -14,8 +14,9 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 // Spark 1.10.124 ignores even an explicit client opt-in. Let its own manager honour the merged setting,
 // retaining Spark's normal sampler, history bounds, thread selection, shutdown and restart lifecycle.
-// This class and its config are compiled and registered only in the Nightly channel.
-@Mixin(value = BackgroundSamplerManager.class, remap = false)
+// Compiled only for development versions; the plugin skips it when Spark is not installed.
+@Pseudo
+@Mixin(targets = "me.lucko.spark.common.sampler.BackgroundSamplerManager", remap = false)
 public abstract class SparkClientBackgroundMixin {
 
     @Shadow

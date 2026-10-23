@@ -15,21 +15,32 @@
 | `./gradlew check`         | 各模组检查、游戏测试源码编译，以及制表符和行尾空白检查；不启动游戏测试 |
 | `./gradlew build`         | Gradle 检查、jar 打包与汇总                                            |
 
-## Nightly 诊断工具
+## 开发版本诊断工具
 
 `./gradlew build` 生成 Release；`./gradlew -PbuildChannel=nightly build`
-生成版本号带 `-nightly` 的测试版。CI 会构建并检查两个渠道，游戏测试及客户端冒烟测试
+生成版本号带 `-nightly` 的测试版。`dev`、`snapshot`、`rc`、`beta`、`alpha` 渠道也会追加
+对应版本后缀，渠道名称不区分大小写。CI 会构建并检查 Release 与 Nightly，游戏测试及客户端冒烟测试
 使用 Nightly。Nightly 发布只取对应渠道的包。切换渠道时，`build/libs/` 中上个渠道
 收集的包会被清理，避免混用。
 
-Nightly Core 内置未修改的 [Spark NeoForge 1.21.1 版本](https://modrinth.com/mod/spark/version/1.10.124-neoforge-1.21.1)，
-启动后默认对服务器和客户端进行后台 CPU 采样，采用 Spark 默认的 10 毫秒间隔。
-该固定 Spark 版本本身会硬性拒绝客户端自动采样，即使配置已开启。Nightly 通过仅客户端加载的
-兼容 Mixin，让 Spark 自己的后台管理器按合并后的 `backgroundProfiler` 设置决定是否开启，仍保留
-用户关闭设置；Release 不包含该 Mixin 类或其注册。Folkways 启动日志只表示请求采样，实际状态须
-分别通过服务器和客户端的 `profiler info` 确认。
-调度心跳日志也默认开启。Release 不内置或启动 Spark，新建服务器配置的心跳日志默认
-关闭。两个渠道都保留用户已保存的设置。
+自动后台采样和调度心跳日志必须同时满足：**属于开发版本，且 NeoForge 已安装的模组列表中有 Spark**。
+仅在编译或测试类路径中找到 Spark 不算已安装。以实际加载的 Core 版本为准，构建渠道作为补充。
+版本中出现 `release`、`rc`、`beta`、`alpha` 标记时优先排除，即使同时带有 `nightly` 或 `dev`。
+标记不区分大小写，按完整连续字母判断：`RC1`、`alpha.2` 会被排除，普通单词 `alphabet`、
+`betamax`、`releaseNotes` 不会被子串误判。`dev`、`snapshot`、`nightly` 及其他自定义版本标签
+视为开发版本。`0.1.0` 这样的纯数字版本若明确使用 `release` 渠道，则保持关闭；版本和渠道都缺失
+也不会自行开启。
+
+例如 `./gradlew -Pmod_version=0.1.0-dev build` 虽沿用默认 Release 构建渠道，但产物属于开发版本，
+仅在另外安装 Spark 后才自动记录。未安装 Spark 时，心跳日志默认关闭，也不修改 Spark 属性或文件。
+已经保存的心跳日志、Spark 开关始终优先。
+
+只有 Nightly Core 内置未修改的 [Spark NeoForge 1.21.1 版本](https://modrinth.com/mod/spark/version/1.10.124-neoforge-1.21.1)，
+其他渠道均不内置 Spark。该固定版本会硬性拒绝客户端自动采样，即使配置已开启。因此开发版本
+包含仅客户端使用的兼容 Mixin，让 Spark 自己的后台管理器按合并后的 `backgroundProfiler` 设置
+决定是否开启。可选模组加载守卫和字符串目标会在缺少 Spark 时跳过该钩子；普通 Release／RC／Beta／Alpha
+版本不含钩子或其注册。采样采用 Spark 默认的 10 毫秒间隔。Folkways 启动日志只表示请求采样，实际状态
+须分别通过服务器和客户端的 `profiler info` 确认。
 
 复现卡顿后，执行 `/spark profiler stop --save-to-file` 保存服务器采样；
 画面卡顿则使用 `/sparkc profiler stop --save-to-file`。文件保存在 `config/spark/`。
@@ -37,20 +48,20 @@ Nightly Core 内置未修改的 [Spark NeoForge 1.21.1 版本](https://modrinth.
 直接执行 `profiler open` 或不带 `--save-to-file` 的 `profiler stop` 会上传数据至
 Spark 查看器；后台采样本身不会上传分析报告。
 
-要关闭 Nightly 自动采样，在 `config/spark/config.json` 中设置
+要关闭开发版本自动采样，在 `config/spark/config.json` 中设置
 `"backgroundProfiler": false`，或通过 Java 参数 `-Dspark.backgroundProfiler=false`
 或环境变量 `SPARK_BACKGROUNDPROFILER=false` 关闭。心跳日志单独由
 `folkways_core-server.toml` 的 `diagnostics.logPlanHeartbeat` 控制。
-个人聊天诊断仍需自行开启。在 Release 中自行安装的 Spark 使用它自己的设置。
+个人聊天诊断仍需自行开启。在正式 Release／RC／Beta／Alpha 版本中自行安装的 Spark 使用自己的设置。
 
 需要分析对象分配、GC 停顿或锁等待时，再使用 Java 21 自带的 JFR 短时采集。
 Nightly 不会在 Spark 之外再常驻一套 JFR 录制。Spark 的原生 async profiler 支持
-Linux 和 macOS；Windows 使用 Java 采样器采集 CPU 调用栈。详见
+Linux 和 macOS；Windows 使用 Java 采样器采集包含等待的执行调用栈，不能直接当作纯 CPU 时间。详见
 [Spark 命令说明](https://spark.lucko.me/docs/Command-Usage)和
 [采样引擎说明](https://spark.lucko.me/docs/misc/Using-async-profiler)。
 
 `./gradlew :core:checkDiagnostics :core:verifyDiagnostics` 可在不启动 Minecraft 的情况下
-检查所选渠道的默认行为、关闭设置、实际 Spark 构造器／字段兼容性、客户端挂钩注册及包内分析器
+检查版本标记边界、Spark 存在条件、已保存的关闭设置、实际 Spark 构造器／字段兼容性、可选客户端挂钩注册及包内分析器
 的校验和。`build` 已包含这两项检查。
 
 ## NeoForge GameTests
