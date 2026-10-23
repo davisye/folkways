@@ -372,3 +372,10 @@ architectury = { target = ["server", "client"] }
 # Native Cookery alone must not activate the separately installed Folkways extension.
 [profile.cookery-native.mods]
 kaleidoscope_cookery = { target = ["server", "client"] }
+
+# Complete block sweep fixtures: every block-provider mod installed in the local test pack.
+[profile.sweep-all.mods]
+folkways_cookery = { target = ["server", "client"] }
+kaleidoscope_cookery = { target = ["server", "client"] }
+sable = { target = ["server", "client"] }
+touhou_little_maid = { target = ["server", "client"] }
