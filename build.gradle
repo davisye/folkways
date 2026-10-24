@@ -2,7 +2,21 @@ plugins {
     id "net.neoforged.moddev" version "2.0.141"
 }
 
-// The root builds no mod of its own: it runs the modules under mods/ together for the game tests.
+// The root builds no mod of its own: it hosts the modules needed by each GameTest suite.
+
+ext.buildChannel = providers.gradleProperty("buildChannel").getOrElse("release").toLowerCase(Locale.ROOT)
+if (!(buildChannel in ["release", "nightly", "dev", "snapshot", "rc", "beta", "alpha"])) {
+    throw new GradleException("Unknown buildChannel '${buildChannel}'; choose release, nightly, dev, snapshot, rc, beta or alpha")
+}
+ext.nightlyBuild = buildChannel == "nightly"
+ext.buildVersion = project.mod_version + (buildChannel == "release" ? "" : "-${buildChannel}")
+// Keep this packaging decision aligned with BuildChannel.development; checkDiagnostics compares both.
+def versionWords = (buildVersion.toLowerCase(Locale.ROOT) =~ /[a-z]+/).collect { it }
+def channelWords = (buildChannel =~ /[a-z]+/).collect { it }
+def formalWords = ["release", "rc", "beta", "alpha"]
+ext.diagnosticsBuild = (!versionWords.any { it in formalWords }
+    && !channelWords.any { it in ["rc", "beta", "alpha"] }
+    && (!versionWords.isEmpty() || !channelWords.any { it in formalWords }))
 
 def modProjects = [
     folkways_core: ":core",
@@ -16,12 +30,32 @@ modProjects.values().each { evaluationDependsOn(it) }
 // The game tests run without Modular Golems, so its Folkways mod stays out of that run.
 def cookeryTests = providers.gradleProperty("cookeryTests").map { it.toBoolean() }.getOrElse(false)
 def testedMods = modProjects.findAll { id, path -> path != ":modulargolems" && (path != ":cookery" || cookeryTests) }
+def gameTestMod = providers.gradleProperty("gameTestMod").getOrElse("")
+if (gameTestMod && !(gameTestMod in ["core", "vanilla", "create", "cookery"])) {
+    throw new GradleException("Unknown GameTest mod '${gameTestMod}'; choose core, vanilla, create or cookery")
+}
+if (gameTestMod == "cookery" && !cookeryTests) {
+    throw new GradleException("Cookery GameTests require -PcookeryTests=true")
+}
+def suiteMods = testedMods.findAll { id, path -> !gameTestMod || path == ":${gameTestMod}" }
+def gameTestDirectory = gameTestMod
+    ? "run/gametest/${gameTestMod}/${cookeryTests ? 'cookery' : 'base'}"
+    : "run/gametest"
 
 repositories {
     mavenCentral()
     maven { url = "https://libraries.minecraft.net/" }
     maven { url = "https://maven.createmod.net" }
     maven { url = "https://maven.firstdark.dev/snapshots" }
+}
+
+if (nightlyBuild) {
+    repositories {
+        exclusiveContent {
+            forRepository { maven { url = "https://api.modrinth.com/maven" } }
+            filter { includeModule("maven.modrinth", "spark") }
+        }
+    }
 }
 
 java {
@@ -41,9 +75,14 @@ neoForge {
             def mod = project(path)
             create(id) {
                 sourceSet mod.sourceSets.main
-                sourceSet mod.sourceSets.gametest
-                if (cookeryTests && path in [":core", ":vanilla"]) {
-                    sourceSet mod.sourceSets.cookeryTest
+                if (path == ":core") {
+                    sourceSet mod.sourceSets.gameTestFixtures
+                }
+                if (suiteMods.containsKey(id)) {
+                    sourceSet mod.sourceSets.gametest
+                    if (cookeryTests && path in [":core", ":vanilla"]) {
+                        sourceSet mod.sourceSets.cookeryTest
+                    }
                 }
             }
         }
@@ -52,9 +91,11 @@ neoForge {
     runs {
         gameTestServer {
             type = "gameTestServer"
-            gameDirectory = layout.projectDirectory.dir("run/gametest")
+            gameDirectory = layout.projectDirectory.dir(gameTestDirectory)
             programArgument "--nogui"
-            systemProperty "neoforge.enabledGameTestNamespaces", "folkways,ldlib2"
+            // Keep the existing dependency tests with Core, without repeating them in every mod's check.
+            systemProperty "neoforge.enabledGameTestNamespaces",
+                !gameTestMod || gameTestMod == "core" ? "folkways,ldlib2" : "folkways"
         }
     }
 }
@@ -69,12 +110,16 @@ configurations {
 dependencies {
     testedMods.values().each { path ->
         runtimeOnly project(path).sourceSets.main.output
+    }
+    runtimeOnly core.sourceSets.gameTestFixtures.output
+    suiteMods.values().each { path ->
         runtimeOnly project(path).sourceSets.gametest.output
         if (cookeryTests && path in [":core", ":vanilla"]) {
             runtimeOnly project(path).sourceSets.cookeryTest.output
         }
     }
     runtimeOnly ldlib2Coordinate
+    if (nightlyBuild) { runtimeOnly "maven.modrinth:spark:${project.spark_version}" }
     runtimeOnly core.lib("create")
     if (cookeryTests) { runtimeOnly core.lib("kaleidoscope_cookery") }
     additionalRuntimeClasspath("com.eed3si9n.starlark:starlark:${project.starlark_version}") {
@@ -96,7 +141,7 @@ tasks.named("jar") {
 }
 
 // Every mod's jar into build/libs, where the e2e instances find them.
-def collectJars = tasks.register("collectJars", Copy) {
+def collectJars = tasks.register("collectJars", Sync) {
     modProjects.values().each { path -> from(project(path).tasks.named("jar")) }
     into layout.buildDirectory.dir("libs")
 }

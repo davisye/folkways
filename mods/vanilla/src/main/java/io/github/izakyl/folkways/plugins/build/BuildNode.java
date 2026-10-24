@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.function.Predicate;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.item.ItemStack;
@@ -37,6 +38,7 @@ abstract class BuildNode implements Node {
     private final BuildJob job;
     private final Ends ends;
     private final NodeSpec spec;
+    private Predicate<BlockPos> met = cell -> false;
 
     BuildNode(BuildJob job, Ends ends) {
         this.job = job;
@@ -56,12 +58,17 @@ abstract class BuildNode implements Node {
     static BuildNode of(BuildJob job, Ends ends, TemporaryScaffolds temporary) {
         return switch (job.kind()) {
             case LAY -> new LayNode(job, ends);
-            case POUR -> new PourNode(job, ends);
             case STRIP -> new StripNode(job, ends);
             case DRAIN -> new DrainNode(job, ends);
             case RAISE, LOWER -> new ScaffoldNode(job, ends, temporary);
             case JOIN -> new JoinNode(job, ends);
+            case SOAK -> new SoakNode(job, ends);
         };
+    }
+
+    final BuildNode keeping(Predicate<BlockPos> met) {
+        this.met = met;
+        return this;
     }
 
     @Override
@@ -123,6 +130,18 @@ abstract class BuildNode implements Node {
         return blocks;
     }
 
+    /** Execution must neither inspect nor replace a target cell whose completion has been latched. */
+    final Map<BlockPos, BlockState> remaining(ServerLevel level, Map<WorldPos, BlockState> cells, boolean readWorld) {
+        Map<BlockPos, BlockState> remaining = new LinkedHashMap<>();
+        cells.forEach((cell, state) -> {
+            BlockPos pos = cell.block(level);
+            if (!met.test(pos)) {
+                remaining.put(pos, readWorld ? level.getBlockState(pos) : state);
+            }
+        });
+        return remaining;
+    }
+
     // What stands in the job's cells now, whatever the plan saw there: the work takes the world as it finds it.
     static Map<BlockPos, BlockState> standing(ServerLevel level, Map<WorldPos, BlockState> cells) {
         Map<BlockPos, BlockState> blocks = new LinkedHashMap<>();
@@ -154,7 +173,7 @@ abstract class BuildNode implements Node {
     boolean finished(ServerLevel level) {
         for (Map.Entry<WorldPos, BlockState> cell : job.after().entrySet()) {
             BlockPos pos = cell.getKey().block(level);
-            if (!BuildPlanner.satisfied(level.getBlockState(pos), cell.getValue())) {
+            if (!met.test(pos) && !BuildPlanner.satisfied(level.getBlockState(pos), cell.getValue())) {
                 return false;
             }
         }

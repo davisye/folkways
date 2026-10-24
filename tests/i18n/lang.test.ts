@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import test from "node:test";
 import { calls, patternWords } from "./patterns.ts";
 
@@ -46,6 +46,7 @@ const english = catalogs.get("en_us.json")!;
 // Every mod's sources, each named from its own src/main/java.
 const sources = readdirSync(MODS, { encoding: "utf8" }).flatMap(mod => {
   const java = new URL(`${mod}/src/main/java/`, MODS);
+  if (!existsSync(java)) return [];
   return readdirSync(java, { recursive: true, encoding: "utf8" }).filter(name => name.endsWith(".java"))
     .map(name => ({ name, text: read(new URL(name.replaceAll("\\", "/"), java)) }));
 });

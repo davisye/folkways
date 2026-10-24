@@ -7,7 +7,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Function;
-import java.util.function.Predicate;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.level.BlockGetter;
@@ -16,9 +15,7 @@ import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.ChestBlock;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.GrowingPlantBlock;
-import net.minecraft.world.level.block.LiquidBlock;
 import net.minecraft.world.level.block.PitcherCropBlock;
-import net.minecraft.world.level.block.piston.MovingPistonBlock;
 import net.minecraft.world.level.block.piston.PistonBaseBlock;
 import net.minecraft.world.level.block.piston.PistonHeadBlock;
 import net.minecraft.world.level.block.state.BlockState;
@@ -61,20 +58,11 @@ public final class Footprints {
         (around, cell, state) -> piston(cell, state),
         Footprints::column));
 
-    private static final List<Predicate<BlockState>> UNLAID = new CopyOnWriteArrayList<>(List.of(
-        state -> state.getBlock() instanceof PistonHeadBlock || state.getBlock() instanceof MovingPistonBlock,
-        state -> state.getBlock() instanceof PitcherCropBlock
-            && state.getValue(BlockStateProperties.DOUBLE_BLOCK_HALF) == DoubleBlockHalf.UPPER));
-
     private Footprints() {
     }
 
     public static void register(Rule rule) {
         RULES.addFirst(rule);
-    }
-
-    public static void unlaid(Predicate<BlockState> part) {
-        UNLAID.add(part);
     }
 
     public static Footprint of(Function<BlockPos, BlockState> around, BlockPos cell, BlockState state) {
@@ -87,27 +75,6 @@ public final class Footprints {
         return Footprint.single(cell, state);
     }
 
-    static boolean unlaid(BlockState state) {
-        return UNLAID.stream().anyMatch(part -> part.test(state));
-    }
-
-    static boolean formed(Footprint print) {
-        return Column.of(print.cells().get(print.anchor()).getBlock()).map(column -> {
-            List<BlockState> parts = List.copyOf(print.cells().values());
-            for (int at = 0; at < parts.size(); at++) {
-                if (!parts.get(at).is(at == parts.size() - 1 ? column.tip() : column.body())) {
-                    return false;
-                }
-            }
-            return true;
-        }).orElse(true);
-    }
-
-    static BlockState alone(Footprint print) {
-        BlockState anchor = print.cells().get(print.anchor());
-        return Column.of(anchor.getBlock()).map(column -> column.tip().withPropertiesOf(anchor)).orElse(anchor);
-    }
-
     static Map<BlockPos, BlockState> standing(BlockGetter world, BlockPos cell) {
         BlockState state = world.getBlockState(cell);
         Map<BlockPos, BlockState> found = new LinkedHashMap<>();
@@ -117,36 +84,11 @@ public final class Footprints {
                 continue;
             }
             BlockState there = world.getBlockState(part.getKey());
-            if (Fidelity.same(there, part.getValue())) {
+            if (there == part.getValue()) {
                 found.put(part.getKey(), there);
             }
         }
         return found;
-    }
-
-    static Map<BlockPos, BlockState> complete(Map<BlockPos, BlockState> cells) {
-        Map<BlockPos, BlockState> laid = new LinkedHashMap<>();
-        cells.forEach((cell, state) -> {
-            if (!unlaid(state)) {
-                laid.put(cell, state.getBlock() instanceof LiquidBlock ? state : Fidelity.laid(state));
-            }
-        });
-        Map<BlockPos, BlockState> whole = new LinkedHashMap<>();
-        Map<BlockPos, BlockState> anchored = new LinkedHashMap<>();
-        Function<BlockPos, BlockState> around = pos -> laid.getOrDefault(pos, Blocks.AIR.defaultBlockState());
-        laid.forEach((cell, state) -> {
-            Footprint print = of(around, cell, state);
-            if (print.cells().size() == 1) {
-                whole.put(cell, state);
-            } else {
-                BlockState anchor = laid.get(print.anchor());
-                if (anchor == null || anchor == Fidelity.laid(print.cells().get(print.anchor()))) {
-                    print.cells().forEach((part, partState) -> anchored.put(part, Fidelity.laid(partState)));
-                }
-            }
-        });
-        whole.putAll(anchored);
-        return whole;
     }
 
     private static Optional<Footprint> twoHigh(BlockPos cell, BlockState state) {

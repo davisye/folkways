@@ -149,9 +149,7 @@ public final class DraftCityWallGameTests {
         helper.assertTrue(DraftKit.explanationKey(DraftKit.refused(helper,
             draw(pattern, settings, on(0, 0), on(40, 0), on(0, 5)))).equals(DraftKit.key(pattern, "error.wall.corner")),
             "a path doubling back is refused");
-        helper.assertTrue(DraftKit.explanationKey(DraftKit.refused(helper,
-            draw(pattern, settings, on(0, 0), on(130, 0)))).equals(DraftKit.key(pattern, "error.wall.length")),
-            "an overlong wall is refused");
+        DraftKit.ready(helper, draw(pattern, settings, on(0, 0), on(130, 0)));
         helper.assertValueEqual(DraftKit.refused(helper, pattern.drawOn(new Commission(DraftKit.zone(20, 4, 20),
             settings, new DraftKit.Ground(GROUND), Direction.NORTH, 0L))).why(), DraftRefusal.WRONG_MARK,
             "a zone is not a wall line");

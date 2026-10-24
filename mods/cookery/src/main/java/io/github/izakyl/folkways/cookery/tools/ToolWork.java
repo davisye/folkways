@@ -18,13 +18,6 @@ import io.github.izakyl.folkways.core.api.work.Unmet;
 import io.github.izakyl.folkways.core.api.work.WorkEffort;
 import io.github.izakyl.folkways.core.api.work.Worker;
 import io.github.izakyl.folkways.core.api.work.Workload;
-import io.github.izakyl.folkways.core.api.work.batch.BatchAction;
-import io.github.izakyl.folkways.core.api.work.batch.BatchCommit;
-import io.github.izakyl.folkways.core.api.work.batch.BatchSession;
-import io.github.izakyl.folkways.core.api.work.batch.BatchSpec;
-import io.github.izakyl.folkways.core.api.work.batch.InventoryTransfer;
-import io.github.izakyl.folkways.core.api.work.batch.StepReceipt;
-import io.github.izakyl.folkways.core.api.work.batch.StepResult;
 import io.github.izakyl.folkways.cookery.CookeryRefusal;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -35,10 +28,10 @@ import java.util.UUID;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.item.ItemStack;
 
-class ToolWork implements Node, Workload.Within {
+final class ToolWork implements Node, Workload.Within {
 
     private final TaskTools service;
-    protected final Node original;
+    private final Node original;
     private final NodeSpec spec;
     private final List<ItemSpec> declared;
     private List<ItemSpec> families;
@@ -47,13 +40,9 @@ class ToolWork implements Node, Workload.Within {
     private volatile UUID borrower;
     private boolean started;
     private boolean actionIssued;
-    protected boolean workDone;
-    protected boolean complete;
-    protected RefusalKind failure;
-
-    static ToolWork of(TaskTools service, Node original) {
-        return original.spec().workload() instanceof BatchSession ? new Batched(service, original) : new ToolWork(service, original);
-    }
+    private boolean workDone;
+    private boolean complete;
+    private RefusalKind failure;
 
     ToolWork(TaskTools service, Node original) {
         this.service = service;
@@ -178,7 +167,7 @@ class ToolWork implements Node, Workload.Within {
         }
         if (!workDone) {
             if (original.spec().workload() instanceof Within within) {
-                Turn turn = delegatedTurn(level, new LoanWorker(who, service, loans), within);
+                Turn turn = within.next(level, new LoanWorker(who, service, loans));
                 if (turn instanceof Turn.Piece piece) {
                     if (!equipped(piece.node(), who)) {
                         failure = CookeryRefusal.NOTHING_TO_WORK_WITH;
@@ -221,10 +210,6 @@ class ToolWork implements Node, Workload.Within {
         complete = true;
         io.github.izakyl.folkways.core.api.resident.body.TaskTools.release(id());
         return LEAVE;
-    }
-
-    protected Turn delegatedTurn(ServerLevel level, Worker who, Within within) {
-        return within.next(level, who);
     }
 
     @Override
@@ -300,9 +285,7 @@ class ToolWork implements Node, Workload.Within {
         if (node == original) {
             actionIssued = true;
         }
-        if (node instanceof InventoryTransfer) return new TransferAction(node);
-        return node instanceof Staged ? node instanceof BatchAction ? new StagedAcceptedAction(node) : new StagedAction(node)
-            : node instanceof BatchAction ? new AcceptedAction(node) : new Action(node);
+        return node instanceof Staged ? new StagedAction(node) : new Action(node);
     }
 
     private class Action implements Node {
@@ -337,12 +320,8 @@ class ToolWork implements Node, Workload.Within {
         public void changed(ServerLevel level, NodeState state) { delegate.changed(level, state); }
 
         public Outcome commit(ServerLevel level, Worker who) {
-            return executeDelegate(level, who).outcome();
-        }
-
-        BatchCommit executeDelegate(ServerLevel level, Worker who) {
             if (!equipped(delegate, who)) {
-                return BatchCommit.of(Outcome.failed(CookeryRefusal.NOTHING_TO_WORK_WITH));
+                return Outcome.failed(CookeryRefusal.NOTHING_TO_WORK_WITH);
             }
             Map<KitchenTools.Lease, ItemStack> held = new LinkedHashMap<>();
             for (KitchenTools.Lease lease : loans.values()) {
@@ -352,9 +331,7 @@ class ToolWork implements Node, Workload.Within {
                 }
             }
             try {
-                Worker supplied = new LoanWorker(who, service, loans);
-                return delegate instanceof BatchAction action ? action.execute(level, supplied)
-                    : BatchCommit.of(delegate.commit(level, supplied));
+                return delegate.commit(level, new LoanWorker(who, service, loans));
             } finally {
                 held.forEach((lease, tool) -> {
                     if (tool.isEmpty()) {
@@ -368,69 +345,7 @@ class ToolWork implements Node, Workload.Within {
         }
     }
 
-    private final class AcceptedAction extends Action implements BatchAction {
-        AcceptedAction(Node delegate) { super(delegate); }
-        public BatchCommit execute(ServerLevel level, Worker who) { return executeDelegate(level, who); }
-    }
-
-    private final class TransferAction extends Action implements InventoryTransfer {
-        TransferAction(Node delegate) { super(delegate); }
-    }
-
-    private static final class Batched extends ToolWork implements BatchSession {
-        private StepResult delegated;
-        private final BatchSession batch;
-
-        Batched(TaskTools service, Node original) {
-            super(service, original);
-            batch = (BatchSession) original.spec().workload();
-        }
-
-        public BatchSpec batch() { return batch.batch(); }
-        public boolean drainsAfterFailure() { return true; }
-
-        @Override
-        protected Turn delegatedTurn(ServerLevel level, Worker who, Within within) {
-            delegated = batch.advance(level, who);
-            return switch (delegated) {
-                case StepResult.Step step -> new Turn.Piece(step.node());
-                case StepResult.Auxiliary auxiliary -> new Turn.Piece(auxiliary.node());
-                case StepResult.Wait ignored -> WAIT;
-                case StepResult.Pause ignored -> WAIT;
-                case StepResult.Complete ignored -> LEAVE;
-                case StepResult.Failed failed -> {
-                    failure = failed.why();
-                    yield LEAVE;
-                }
-            };
-        }
-
-        public StepResult advance(ServerLevel level, Worker who) {
-            delegated = null;
-            Turn turn = super.next(level, who);
-            if (turn instanceof Turn.Piece piece) {
-                return delegated instanceof StepResult.Step step ? new StepResult.Step(step.key(), piece.node())
-                    : new StepResult.Auxiliary(piece.node());
-            }
-            if (turn instanceof Turn.Wait) {
-                return delegated instanceof StepResult.Pause pause ? pause
-                    : delegated instanceof StepResult.Wait wait ? wait : new StepResult.Wait(10);
-            }
-            return new StepResult.Complete();
-        }
-
-        public void settled(ServerLevel level, StepReceipt receipt) {
-            batch.settled(level, receipt);
-            receipt.stop().ifPresent(why -> { failure = why; workDone = true; });
-        }
-
-        public Outcome finish(ServerLevel level, Worker who) {
-            if (!complete) return Outcome.failed(CookeryRefusal.STATION_BUSY);
-            return failure == null ? batch.finish(level, who) : Outcome.failed(failure);
-        }
-    }
-
-    private class StagedAction extends Action implements Staged {
+    private final class StagedAction extends Action implements Staged {
         StagedAction(Node delegate) { super(delegate); }
 
         public Drawn draw(ServerLevel level, Worker who) {
@@ -439,11 +354,6 @@ class ToolWork implements Node, Workload.Within {
         public void restore(ServerLevel level, Worker who, List<ItemStack> goods) {
             ((Staged) delegate).restore(level, new LoanWorker(who, service, loans), goods);
         }
-    }
-
-    private final class StagedAcceptedAction extends StagedAction implements BatchAction {
-        StagedAcceptedAction(Node delegate) { super(delegate); }
-        public BatchCommit execute(ServerLevel level, Worker who) { return executeDelegate(level, who); }
     }
 
     static NodeSpec copy(NodeSpec from, UUID id, Workload workload, List<ToolUse> tools,

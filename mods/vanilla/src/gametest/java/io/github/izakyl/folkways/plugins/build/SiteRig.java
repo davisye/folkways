@@ -37,8 +37,13 @@ final class SiteRig implements BuildSite.Asks {
     }
 
     static SiteRig start(ServerLevel level, BuildTarget target, TemporaryScaffolds temporary, Set<BlockPos> met) {
+        return start(level, target, temporary, met, Set.of());
+    }
+
+    static SiteRig start(ServerLevel level, BuildTarget target, TemporaryScaffolds temporary, Set<BlockPos> met,
+            Set<io.github.izakyl.folkways.plugins.build.draft.Joint> joined) {
         SiteRig rig = new SiteRig(target, temporary);
-        rig.site.start(level, met);
+        rig.site.start(level, met, joined);
         return rig;
     }
 

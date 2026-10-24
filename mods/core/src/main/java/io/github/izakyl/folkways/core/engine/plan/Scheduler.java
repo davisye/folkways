@@ -40,7 +40,7 @@ public final class Scheduler {
         }
     }
 
-    public record Timing(long applyNanos, long scheduleNanos) {
+    public record Timing(long applyNanos, long scheduleNanos, long improvementWork, boolean limited) {
     }
 
     // The routes that changed, by resident (an empty route where one ended), the work left unassigned and why,
@@ -68,9 +68,18 @@ public final class Scheduler {
         long applied = System.nanoTime();
         if (ways == null) {
             return new Scheduled(Map.of(), List.of(), false, Long.MAX_VALUE, Map.of(),
-                new Timing(applied - started, 0), tick);
+                new Timing(applied - started, 0, 0, false), tick);
         }
-        Schedule schedule = tours.schedule(weave, fresh, crew, ways, tick, retry);
+        Schedule schedule;
+        try {
+            schedule = tours.schedule(weave, fresh, crew, ways, tick, retry);
+        } catch (RuntimeException | Error broken) {
+            // Inputs are now part of the weave. Only the route projection is suspect: rebuilding it must not
+            // replay messages, regrow material demands, or discard the last routes handed to the colony.
+            // A new Tours reads every vertex, including its pins and the crew's work already in hand.
+            tours = new Tours();
+            throw broken;
+        }
         tellStructural(schedule);
         Map<UUID, Tour> changed = new LinkedHashMap<>();
         schedule.tours().forEach((resident, tour) -> {
@@ -89,7 +98,7 @@ public final class Scheduler {
             hands |= CREW_COULD_ANSWER.contains(nobody.why());
         }
         return new Scheduled(changed, schedule.unassigned(), hands, tours.wakeAt(), laid,
-            new Timing(applied - started, System.nanoTime() - applied), tick);
+            new Timing(applied - started, System.nanoTime() - applied, tours.improvementWork(), tours.limited()), tick);
     }
 
     public int size() {

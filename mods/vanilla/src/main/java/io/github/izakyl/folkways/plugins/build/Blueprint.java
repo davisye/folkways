@@ -17,13 +17,16 @@ import net.minecraft.core.HolderLookup;
 import net.minecraft.core.Vec3i;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Mirror;
 import net.minecraft.world.level.block.Rotation;
 import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplate;
 
 public record Blueprint(UUID id, String name, List<BlueprintBlock> blocks, List<UnloadedBlock> unloaded,
-        List<Joint> joints, BlueprintVolume volume, long createdGameTime) {
+        List<Joint> joints, BlueprintVolume volume, long createdGameTime, boolean confirmed) {
+    // Targets resolved by earlier rules are resolved again under the schematicannon's.
+    private static final String TAG_CONFIRMED = "printed";
     private static final String TAG_ID = "id";
     private static final String TAG_NAME = "name";
     private static final String TAG_BLOCKS = "blocks";
@@ -48,6 +51,19 @@ public record Blueprint(UUID id, String name, List<BlueprintBlock> blocks, List<
     }
 
     public Blueprint(UUID id, String name, List<BlueprintBlock> blocks, List<UnloadedBlock> unloaded,
+            List<Joint> joints, BlueprintVolume volume, long createdGameTime) {
+        this(id, name, blocks, unloaded, joints, volume, createdGameTime, false);
+    }
+
+    /**
+     * Freezes the construction target before it becomes an order: the blueprint as the schematicannon would print
+     * it. A target is resolved once; reloading, placing or building it never resolves it again.
+     */
+    public Blueprint confirm(ServerLevel level) {
+        return confirmed ? this : SchematicPlacement.resolve(level, this);
+    }
+
+    public Blueprint(UUID id, String name, List<BlueprintBlock> blocks, List<UnloadedBlock> unloaded,
             BlueprintVolume volume, long createdGameTime) {
         this(id, name, blocks, unloaded, List.of(), volume, createdGameTime);
     }
@@ -68,7 +84,8 @@ public record Blueprint(UUID id, String name, List<BlueprintBlock> blocks, List<
         Function<BlockPos, BlockPos> moved = offset ->
             StructureTemplate.transform(offset, mirror, rotation, BlockPos.ZERO).subtract(corner);
         List<BlueprintBlock> turned = blocks.stream()
-            .map(cell -> new BlueprintBlock(moved.apply(cell.offset()), cell.state().mirror(mirror).rotate(rotation)))
+            .map(cell -> new BlueprintBlock(moved.apply(cell.offset()), cell.state().mirror(mirror).rotate(rotation),
+                cell.data().turned(mirror, rotation)))
             .toList();
         List<UnloadedBlock> turnedUnloaded = unloaded.stream()
             .map(cell -> cell.turned(moved.apply(cell.offset()), mirror, rotation))
@@ -79,7 +96,7 @@ public record Blueprint(UUID id, String name, List<BlueprintBlock> blocks, List<
         boolean swapsAxes = rotation == Rotation.CLOCKWISE_90 || rotation == Rotation.COUNTERCLOCKWISE_90;
         return BlueprintVolume
             .of(swapsAxes ? size.getZ() : size.getX(), size.getY(), swapsAxes ? size.getX() : size.getZ())
-            .map(space -> new Blueprint(id, name, turned, turnedUnloaded, turnedJoints, space, createdGameTime));
+            .map(space -> new Blueprint(id, name, turned, turnedUnloaded, turnedJoints, space, createdGameTime, false));
     }
 
     public CompoundTag save(HolderLookup.Provider provider) {
@@ -87,6 +104,7 @@ public record Blueprint(UUID id, String name, List<BlueprintBlock> blocks, List<
         List<CompoundTag> cells = Stream.concat(blocks.stream().map(block -> block.save(provider)),
             unloaded.stream().map(UnloadedBlock::save)).toList();
         return Writer.of()
+            .flag(TAG_CONFIRMED, confirmed)
             .uuid(TAG_ID, id)
             .string(TAG_NAME, name)
             .longValue(TAG_CREATED_GAME_TIME, createdGameTime)
@@ -110,12 +128,13 @@ public record Blueprint(UUID id, String name, List<BlueprintBlock> blocks, List<
             if (offset.isEmpty() || state.isEmpty()) {
                 continue;
             }
-            UnloadedBlock written = new UnloadedBlock(offset.get(), state.get(), UnloadedBlock.turnsOf(cell));
+            UnloadedBlock written = new UnloadedBlock(offset.get(), state.get(), UnloadedBlock.turnsOf(cell),
+                BlockData.load(cell.blob(BlueprintBlock.TAG_DATA).orElseGet(CompoundTag::new)));
             BlueprintBlock.read(known, state.get()).ifPresentOrElse(
-                read -> blocks.add(new BlueprintBlock(offset.get(), written.turn(read))),
+                read -> blocks.add(new BlueprintBlock(offset.get(), written.turn(read), written.data())),
                 () -> unloaded.add(written));
         }
-        if (id.isEmpty() || blocks.isEmpty() && unloaded.isEmpty()) {
+        if (id.isEmpty() || blocks.isEmpty() && unloaded.isEmpty() && !reader.flag(TAG_CONFIRMED).orElse(false)) {
             return Optional.empty();
         }
         List<Joint> joints = new ArrayList<>();
@@ -134,7 +153,8 @@ public record Blueprint(UUID id, String name, List<BlueprintBlock> blocks, List<
             .map(stored -> BlueprintVolume.of(stored[0], stored[1], stored[2]))
             .orElseGet(() -> BlueprintVolume.around(offsets));
         return volume.map(parsed -> new Blueprint(id.get(), reader.string(TAG_NAME).orElse(""), blocks, unloaded,
-            joints, parsed, reader.longValue(TAG_CREATED_GAME_TIME).orElse(0L)));
+            joints, parsed, reader.longValue(TAG_CREATED_GAME_TIME).orElse(0L),
+            reader.flag(TAG_CONFIRMED).orElse(false)));
     }
 
     private static String normalizeName(String value) {

@@ -259,11 +259,6 @@ public final class Task {
                 Math.hypot(delta[0], delta[1]) >= 12);
             verified++;
         }
-        for (int width : new int[] {2,16}) {
-            if (!(draw(pattern, BlockPos.ZERO, new BlockPos(24,0,0), new Materials(width, stone.blocks)) instanceof Drawn.Refused))
-                throw new AssertionError("accepted width " + width);
-            verified++;
-        }
         for (int dy : new int[] {-4,4}) {
             var result = ready(draw(pattern, BlockPos.ZERO, new BlockPos(24,dy,0), stone));
             verify(result);

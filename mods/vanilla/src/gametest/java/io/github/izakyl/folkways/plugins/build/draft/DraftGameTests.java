@@ -88,11 +88,15 @@ public final class DraftGameTests {
 
     @GameTest(template = TEMPLATE, timeoutTicks = 80)
     public static void aDrawingLargerThanOnePatternMayFillIsRefused(GameTestHelper helper) {
+        int edge = 1;
+        while ((long) edge * edge * edge <= Lattice.maxCells()) {
+            edge++;
+        }
         Pattern pattern = parse("""
             def draw(site):
-                return [part("wall", site.zone.outset(x = 100, z = 100, y = 1), ["minecraft:cobblestone"])]
+                return [part("wall", site.zone, ["minecraft:cobblestone"])]
             """);
-        helper.assertValueEqual(refused(helper, draw(pattern, zone(3, 1, 3))).why(), DraftRefusal.SITE_TOO_LARGE,
+        helper.assertValueEqual(refused(helper, draw(pattern, zone(edge, edge, edge))).why(), DraftRefusal.SITE_TOO_LARGE,
             "the refusal");
         helper.succeed();
     }

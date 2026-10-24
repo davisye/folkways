@@ -9,6 +9,7 @@ import io.github.izakyl.folkways.core.api.work.WorkNoise;
 import io.github.izakyl.folkways.core.api.work.Worker;
 import io.github.izakyl.folkways.core.api.work.Xp;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -30,13 +31,16 @@ final class LayNode extends BuildNode {
     Outcome work(ServerLevel level, Worker who) {
         BlockPos at = cell(level);
         BlockState goal = job().goal();
-        Map<BlockPos, BlockState> before = standing(level, job().before());
-        Map<BlockPos, BlockState> after = blocks(level, job().after());
-        if (!Bystanders.clear(level, after, who.body(), stances(level))) {
+        Map<BlockPos, BlockState> before = remaining(level, job().before(), true);
+        Map<BlockPos, BlockState> after = remaining(level, job().after(), false);
+        if (!Bystanders.clear(level, after, stances(level))) {
             return refuse(BuildRefusal.OCCUPIED);
         }
+        Set<BlockPos> shot = new LinkedHashSet<>();
+        job().shot().forEach(cell -> shot.add(cell.block(level)));
         if (job().adjusts()) {
-            Rubble.swap(level, who.body(), before, after, ItemStack.EMPTY, true);
+            Rubble.lay(level, who.body(), before, after, shot, at, data(level), ItemStack.EMPTY,
+                SchematicPlacement.icon(job().cost()), false);
             return new Outcome.Done(List.of(WorkNoise.placed(at, goal)), List.of(), Optional.empty());
         }
         for (Map.Entry<BlockPos, BlockState> cell : before.entrySet()) {
@@ -52,7 +56,8 @@ final class LayNode extends BuildNode {
             }
         });
         ItemStack tool = job().broken().map(state -> who.held(new ToolNeed.SuitableFor(state))).orElse(ItemStack.EMPTY);
-        List<ItemStack> made = new ArrayList<>(Rubble.swap(level, who.body(), before, after, tool, true));
+        List<ItemStack> made = new ArrayList<>(Rubble.lay(level, who.body(), before, after, shot, at, data(level), tool,
+            SchematicPlacement.icon(job().cost()), true));
         heard.add(WorkNoise.placed(at, goal));
         for (ItemStack stack : drawn) {
             if (stack.getItem() instanceof BucketItem) {
@@ -61,6 +66,12 @@ final class LayNode extends BuildNode {
         }
         return new Outcome.Done(List.copyOf(heard), List.copyOf(made),
             Optional.of(new Xp(BuildContent.trade(), 1)));
+    }
+
+    private Map<BlockPos, BlockData> data(ServerLevel level) {
+        Map<BlockPos, BlockData> addressed = new java.util.LinkedHashMap<>();
+        job().data().forEach((pos, payload) -> addressed.put(pos.block(level), payload));
+        return addressed;
     }
 
     // The cells the worker may stand in for this work, where the world keeps them.

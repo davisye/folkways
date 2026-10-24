@@ -10,7 +10,6 @@ import com.lowdragmc.lowdraglib2.gui.ui.elements.Toggle;
 import com.lowdragmc.lowdraglib2.gui.ui.event.UIEvents;
 import dev.vfyjxf.taffy.style.FlexDirection;
 import io.github.izakyl.folkways.core.api.terms.ItemFilter;
-import io.github.izakyl.folkways.base.task.Jobs;
 import io.github.izakyl.folkways.front.api.Ghost;
 import io.github.izakyl.folkways.front.api.Schema;
 import io.github.izakyl.folkways.FolkwaysMod;
@@ -28,7 +27,6 @@ import io.github.izakyl.folkways.front.ui.screen.RememberedSettings;
 import io.github.izakyl.folkways.plugins.build.draft.Commission;
 import io.github.izakyl.folkways.plugins.build.draft.Drafting;
 import io.github.izakyl.folkways.plugins.build.draft.DraftTemplate;
-import io.github.izakyl.folkways.plugins.build.draft.DraftRefusal;
 import io.github.izakyl.folkways.plugins.build.draft.Drawn;
 import io.github.izakyl.folkways.plugins.build.draft.Face;
 import io.github.izakyl.folkways.plugins.build.draft.Growth;
@@ -70,19 +68,19 @@ public final class DraftPanel {
     private static final int MOST_ICONS = 6;
 
     /**
-     * Where a locally drawn site goes: its encoded file, the corner it stands from, the name it was given, and whether a
+     * Where a locally drawn site goes: its file, the corner it stands from, the name it was given, and whether a
      * creative player raises it at once rather than handing it to the colony.
      */
     @FunctionalInterface
     interface HandOff {
-        void send(byte[] file, BlockPos corner, String siteName, boolean raise);
+        void send(CompoundTag file, BlockPos corner, String siteName, boolean raise);
     }
 
     /**
      * What the page held when its last preview went out: the pattern, its knobs and the name, and the way it
      * faced, so the page opens on them again and builds what was looked at.
      */
-    private record Kept(Hint hint, Pattern pattern, KnobValues values, String name, Direction front) {
+    private record Kept(Hint hint, ResourceLocation pattern, KnobValues values, String name, Direction front) {
     }
 
     private static Kept kept;
@@ -97,8 +95,7 @@ public final class DraftPanel {
     private final Hint hint;
     private final HandOff handOff;
     private final Taking taking;
-    private List<Pattern> patterns = List.of();
-    private final Jobs.Scope files = LocalPatterns.scope();
+    private final List<Pattern> patterns;
     private final Optional<Kept> resumed;
     private final Direction front;
 
@@ -115,13 +112,14 @@ public final class DraftPanel {
     private Pattern chosen;
     private KnobValues values;
     private Asked asked;
-    private UIElement page;
-    private byte[] upload;
 
     private DraftPanel(Hint hint, HandOff handOff, Taking taking) {
         this.hint = hint;
         this.handOff = handOff;
         this.taking = taking;
+        this.patterns = LocalPatterns.available().stream().filter(pattern -> pattern.accepts(hint))
+            .sorted(Comparator.comparing(LocalPatterns::local).thenComparing(pattern -> pattern.id().toString()))
+            .toList();
         this.resumed = Optional.ofNullable(kept).filter(held -> held.hint().equals(hint) && taking.previewed());
         // The way the player faced when the page first opened stands until it is built, wherever they have
         // walked off to look at the preview.
@@ -145,7 +143,7 @@ public final class DraftPanel {
         Tokens.name(patternPress, TOKEN + ".choose");
         patternRow.addChildren(Rows.name(Component.translatable(TOKEN)), patternPress);
         patternRow.setDisplay(!patterns.isEmpty());
-        empty.setText(Component.translatable("folkways.library.loading"));
+        empty.setText(Component.translatable(TOKEN + ".none"));
         empty.setDisplay(patterns.isEmpty());
 
         refusal.setDisplay(false);
@@ -174,41 +172,12 @@ public final class DraftPanel {
         ScrollerView scroller = Rows.fills(Rows.box());
         scroller.addScrollViewChild(stack);
 
-        page = Rows.page().addChildren(scroller, name.row(), Rows.actions(preview, confirm, raiseNow));
+        UIElement page = Rows.page().addChildren(scroller, name.row(), Rows.actions(preview, confirm, raiseNow));
         page.layout(layout -> layout.flexGrow(1).flexShrink(1).minWidth(0).minHeight(0));
         // A drawing is taken up only while the page is open; one that comes back after it has closed is let go.
-        page.addEventListener(UIEvents.REMOVED, event -> {
-            if (event.target == page) {
-                files.close();
-                asked = null;
-            }
-        });
-        patternPress.setActive(false);
-        refresh();
-        LocalPatterns.patterns(files, page, loaded -> available(loaded)).whenComplete((loaded, broken) -> {
-            if (broken != null) {
-                Minecraft.getInstance().execute(() -> {
-                    if (files.isOpen() && LocalPatterns.visible(page)) {
-                        available(Patterns.all());
-                        empty.setText(Component.translatable("folkways.library.failed"));
-                        empty.setDisplay(true);
-                    }
-                });
-            }
-        });
-        return page;
-    }
-
-    private void available(List<Pattern> loaded) {
-        patterns = loaded.stream().filter(pattern -> pattern.accepts(hint))
-            .sorted(Comparator.comparing(LocalPatterns::local).thenComparing(pattern -> pattern.id().toString()))
-            .toList();
-        patternPress.setActive(true);
-        patternRow.setDisplay(!patterns.isEmpty());
-        empty.setText(Component.translatable(TOKEN + ".none"));
-        empty.setDisplay(patterns.isEmpty());
+        page.addEventListener(UIEvents.TICK, event -> tick());
         Optional<Pattern> previewed = resumed.flatMap(held -> patterns.stream()
-            .filter(pattern -> LocalPatterns.sameContent(held.pattern(), pattern)).findFirst());
+            .filter(pattern -> pattern.id().equals(held.pattern())).findFirst());
         if (previewed.isPresent()) {
             choose(previewed.get(), resumed.get().values());
             name.retype(resumed.get().name());
@@ -216,6 +185,7 @@ public final class DraftPanel {
             // Nothing is chosen to begin with: the knobs come once a pattern has been picked.
             refresh();
         }
+        return page;
     }
 
     // The patterns stand in folders with a search over them; a click on one takes it and comes back to the page.
@@ -296,7 +266,8 @@ public final class DraftPanel {
         preview.setDisplay(chosen != null);
         // Nothing is built that has not first been looked at where it would stand: its knobs may still be
         // turned once it has, but another pattern is previewed first.
-        boolean buildable = previewMatches();
+        boolean buildable = chosen != null && kept != null && kept.hint().equals(hint)
+            && kept.pattern().equals(chosen.id()) && taking.previewed();
         confirm.setDisplay(buildable);
         // A creative player may also raise it at once instead of handing it to the colony.
         raiseNow.setDisplay(buildable && creative());
@@ -315,14 +286,9 @@ public final class DraftPanel {
 
     private void preview() {
         draw(preview, ready -> {
-            kept = new Kept(hint, chosen, values, name.typed(), front);
+            kept = new Kept(hint, chosen.id(), values, name.typed(), front);
             taking.preview(ghostsOf(ready));
         });
-    }
-
-    private boolean previewMatches() {
-        return chosen != null && kept != null && kept.hint().equals(hint)
-            && LocalPatterns.sameContent(kept.pattern(), chosen) && taking.previewed();
     }
 
     private static boolean creative() {
@@ -331,15 +297,14 @@ public final class DraftPanel {
     }
 
     private void raise(Button by, boolean now) {
-        if (!previewMatches()) {
-            refresh();
+        if (chosen == null) {
             return;
         }
         Chosen settings = Chosen.of(chosen.knobs(), values);
         String typed = name.typed();
         draw(by, ready -> {
             if (LocalPatterns.local(chosen)) {
-                handOff.send(upload, ready.corner(), typed, now);
+                handOff.send(fileOf(ready), ready.corner(), typed, now);
             } else {
                 DraftOffer.commission(chosen, hint, settings, front, typed, now);
             }
@@ -369,20 +334,19 @@ public final class DraftPanel {
         // The knobs are copied as they stand, as they may be turned while it is drawn.
         Commission commission = new Commission(hint, Chosen.of(chosen.knobs(), values), world, front,
             Patterns.seedOf(chosen, hint));
-        upload = null;
-        Asked request = new Asked(Drafting.draw(chosen, commission), by, then);
-        asked = request;
+        asked = new Asked(Drafting.draw(chosen, commission), by, then);
         refusal.setDisplay(false);
         refresh();
-        request.drawn().whenComplete((drawn, broken) -> Minecraft.getInstance().execute(() -> {
-            if (asked != request || !files.isOpen() || !LocalPatterns.visible(page)) {
-                return;
-            }
-            asked = null;
-            refresh();
-            checked(broken == null ? drawn : Drawn.refused(DraftRefusal.PATTERN_FAILED,
-                String.valueOf(broken.getMessage()))).ifPresent(request.then());
-        }));
+    }
+
+    private void tick() {
+        if (asked == null || !asked.drawn().isDone()) {
+            return;
+        }
+        Asked done = asked;
+        asked = null;
+        refresh();
+        checked(done.drawn().join()).ifPresent(done.then());
     }
 
     /** What came back, if it can be built from here; otherwise the page says why not. */
@@ -395,11 +359,9 @@ public final class DraftPanel {
             if (chosen.grows()) {
                 return refuse(Component.translatable(TOKEN + ".grow.local"));
             }
-            Optional<byte[]> encoded = DraftOffer.bytesOf(fileOf(ready));
-            if (encoded.isEmpty()) {
+            if (!DraftOffer.fits(fileOf(ready))) {
                 return refuse(Component.translatable(TOKEN + ".too_big_to_send"));
             }
-            upload = encoded.get();
         }
         refusal.setDisplay(false);
         return Optional.of(ready);

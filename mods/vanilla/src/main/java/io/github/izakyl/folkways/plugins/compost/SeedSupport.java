@@ -27,7 +27,7 @@ import net.minecraft.world.level.block.ChestBlock;
 import net.minecraft.world.level.block.state.properties.ChestType;
 
 /** Server-thread bridge from real colony inventory, current plan claims and persisted player orders. */
-public class SeedSupport {
+public final class SeedSupport {
     private final Colony colony;
     private final MinecraftServer server;
     private final SeedBudget budget;
@@ -35,31 +35,14 @@ public class SeedSupport {
     public SeedSupport(Colony colony, MinecraftServer server) {
         this.colony = colony;
         this.server = server;
-        budget = new SeedBudget(this::snapshot, this::catalogue);
+        budget = new SeedBudget(this::snapshot, this::catalogue,
+            item -> CompostSettings.reserve(colony, item));
     }
 
     public SeedBudget budget(ServerLevel level) { return budget; }
     public Set<Item> catalogue() { return CropSeeds.catalogue(server.overworld(), BlockPos.ZERO); }
 
-    // Observe real packs before growing a fixed parent budget. Actual tools, meals and clothing
-    // keep their occupied cells; the normal planner still accounts for its own keeps and routing.
-    public int batchLimit(Item seed, int limit) {
-        int most = 0;
-        for (Body body : loadedBodies().values()) {
-            if (body.licences().of(io.github.izakyl.folkways.plugins.farming.FarmingContent.trade()).isEmpty()) continue;
-            net.minecraft.world.SimpleContainer preview = new net.minecraft.world.SimpleContainer(body.pack().getContainerSize());
-            for (int slot = 0; slot < preview.getContainerSize(); slot++) preview.setItem(slot, body.pack().getItem(slot).copy());
-            if (!Containers.insert(preview, new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.BONE_MEAL, 3)).isEmpty()) continue;
-            long held = Goods.countIn(body.pack(), Goods.specOf(seed.getDefaultInstance()));
-            if (held >= limit) { most = limit; continue; }
-            int want = (int) Math.max(0, limit - held);
-            int left = Containers.insert(preview, new net.minecraft.world.item.ItemStack(seed, want)).getCount();
-            most = Math.max(most, (int) Math.min(limit, held + want - left));
-        }
-        return most;
-    }
-
-    protected Map<UUID, Body> loadedBodies() {
+    private Map<UUID, Body> loadedBodies() {
         Map<UUID, Body> found = new LinkedHashMap<>();
         for (var resident : colony.residents()) {
             for (ServerLevel level : server.getAllLevels()) {
@@ -84,7 +67,6 @@ public class SeedSupport {
                 WorldPos readable = colony.storesIn(level.dimension()).contains(canonical) ? canonical : offered;
                 Optional<Container> store = colony.store(level, readable);
                 if (store.isPresent()) stores.put(canonical, stock("store/" + canonical, SeedBudget.Location.store(canonical), store.get()));
-                else complete = false;
             }
             reserved.addAll(colony.reservedInputs(level));
         }

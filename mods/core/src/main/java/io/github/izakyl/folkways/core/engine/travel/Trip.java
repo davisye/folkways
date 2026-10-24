@@ -6,7 +6,6 @@ import io.github.izakyl.folkways.core.api.resident.Conveyance;
 import io.github.izakyl.folkways.core.api.resident.Going;
 import io.github.izakyl.folkways.core.api.resident.Locomotion;
 import io.github.izakyl.folkways.core.api.resident.Resident;
-import io.github.izakyl.folkways.core.api.terms.Closures;
 import io.github.izakyl.folkways.core.api.terms.RefusalKind;
 import io.github.izakyl.folkways.core.api.terms.WorldPos;
 import io.github.izakyl.folkways.core.api.terms.WorldSpaces;
@@ -18,7 +17,6 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Supplier;
-import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.phys.Vec3;
@@ -33,18 +31,22 @@ public final class Trip implements Conveyance {
     }
 
     private final List<Stage> stages;
+    private final Locomotion moving;
+    private final Resident who;
     private int at;
     private long setOutAt = -1L;
 
-    private Trip(List<Stage> stages) {
+    private Trip(List<Stage> stages, Locomotion moving, Resident who) {
         this.stages = stages;
+        this.moving = moving;
+        this.who = who;
     }
 
     public static Optional<Trip> afoot(Locomotion moving, Set<WorldPos> footings, double speed,
             RefusalKind lost) {
         return footings.isEmpty()
             ? Optional.empty()
-            : Optional.of(new Trip(List.of(new Stage(moving.along(speed, lost), footings, Optional.empty(), false))));
+            : Optional.of(new Trip(List.of(new Stage(moving.along(speed, lost), footings, Optional.empty(), false)), moving, null));
     }
 
     public static Optional<Trip> to(Supplier<Ways> ways, Resident who, Locomotion moving, Mob body,
@@ -58,14 +60,14 @@ public final class Trip implements Conveyance {
             return Optional.empty();
         }
         return switch (ways.get().journey(who, Feet.of(body), footings, urgency)) {
-            case Faring.Yes(Journey journey) -> following(journey, moving, footings, speed, lost);
+            case Faring.Yes(Journey journey) -> following(journey, who, moving, footings, speed, lost);
             case Faring.Later ignored -> Optional.of(new Trip(List.of(new Stage(
-                new Awaiting(ways, who, moving, speed, lost, urgency), footings, Optional.empty(), false))));
+                new Awaiting(ways, who, moving, speed, lost, urgency), footings, Optional.empty(), false)), moving, who));
             case Faring.No ignored -> Optional.empty();
         };
     }
 
-    private static Optional<Trip> following(Journey best, Locomotion moving,
+    private static Optional<Trip> following(Journey best, Resident who, Locomotion moving,
             Set<WorldPos> footings, double speed, RefusalKind lost) {
         List<Leg> legs = ridden(best.legs());
         List<Stage> stages = new ArrayList<>(legs.size());
@@ -91,7 +93,7 @@ public final class Trip implements Conveyance {
                 : leg + 1 >= legs.size() - 1 ? footings : legs.get(leg + 1).to();
             stages.add(new Stage(ran.get().aboard(hop.get()), onward, Optional.empty(), false));
         }
-        return Optional.of(new Trip(stages));
+        return Optional.of(new Trip(stages, moving, who));
     }
 
     private record Passing(Conveyance walking) implements Conveyance {
@@ -160,7 +162,7 @@ public final class Trip implements Conveyance {
                     case Faring.Later ignored -> { return Going.UNDERWAY; }
                     case Faring.No ignored -> { return new Going.Failed(lost); }
                     case Faring.Yes(Journey journey) -> {
-                        resolved = following(journey, moving, to, speed, lost).orElse(null);
+                        resolved = following(journey, who, moving, to, speed, lost).orElse(null);
                         if (resolved == null) {
                             return new Going.Failed(lost);
                         }
@@ -220,15 +222,6 @@ public final class Trip implements Conveyance {
             && Hops.laid(first).map(passage -> passage.through(first, next)).orElse(false);
     }
 
-    private static boolean shutIn(ServerLevel level, Mob body) {
-        for (Closures.Closed closed : Closures.in(level)) {
-            if (closed.holds(body.blockPosition())) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     // The stage under way, for a log: which of how many, by what, from where, toward which cells.
     public String describe() {
         if (at >= stages.size()) {
@@ -260,23 +253,13 @@ public final class Trip implements Conveyance {
             Stage stage = stages.get(at);
             Set<WorldPos> toward = at == stages.size() - 1 ? to : stage.to();
             Going going = stage.carrying().step(level, body, toward);
-            // Ground closed over, such as a site, is left by walking to a door of it, and nothing there is laid
-            // out to walk by: a body whose walk to the door gives out, shut in by work done round it, is set
-            // down at the door rather than left where no way will ever reach it.
-            if (going instanceof Going.Failed && at == 0 && stages.size() > 1 && stage.from().isEmpty()
-                    && !stage.passing() && toward.size() == 1 && shutIn(level, body)) {
-                WorldPos door = toward.iterator().next();
-                Optional<Vec3> out = WorldSpaces.world(level, door);
-                if (out.isPresent()) {
-                    body.getNavigation().stop();
-                    Vec3 feet = Vec3.atBottomCenterOf(BlockPos.containing(out.get()));
-                    body.teleportTo(feet.x, feet.y, feet.z);
-                    going = Going.ARRIVED;
-                }
-            }
             if (going instanceof Going.Failed && stage.from().isPresent()) {
                 for (WorldPos goal : toward) {
-                    ColonyWays.wrongEdge(level, stage.from().get(), goal);
+                    if (stage.passing() && who != null) {
+                        ColonyWays.wrongEdge(level, who, moving, body, stage.from().get(), goal);
+                    } else {
+                        ColonyWays.wrongEdge(level, stage.from().get(), goal);
+                    }
                 }
             }
             if (!(going instanceof Going.Arrived)) {

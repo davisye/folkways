@@ -12,8 +12,6 @@ import io.github.izakyl.folkways.plugins.build.draft.Round;
 import io.github.izakyl.folkways.plugins.build.draft.Templates;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
-import java.util.LinkedHashMap;
-import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import net.minecraft.core.BlockPos;
@@ -24,10 +22,8 @@ import net.minecraft.nbt.NbtIo;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Mirror;
 import net.minecraft.world.level.block.Rotation;
-import net.minecraft.world.level.block.state.BlockState;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
 import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
 import net.neoforged.neoforge.network.handling.IPayloadContext;
@@ -220,14 +216,8 @@ public final class BuildPackets {
     }
 
     private static void raise(ServerLevel level, ServerPlayer player, Blueprint blueprint, BlockPos anchor) {
-        Map<BlockPos, BlockState> before = new LinkedHashMap<>();
-        Map<BlockPos, BlockState> after = new LinkedHashMap<>();
-        for (BlueprintBlock block : blueprint.blocks()) {
-            BlockPos at = block.worldPos(anchor);
-            before.put(at, level.getBlockState(at));
-            after.put(at, block.state());
-        }
-        Rubble.swap(level, player, before, after, ItemStack.EMPTY, true);
+        blueprint = blueprint.confirm(level);
+        SchematicPlacement.print(level, blueprint, anchor);
         // What runs between two of the blocks, as a track's slopes and bends do, is laid as a builder lays it.
         for (Joint joint : blueprint.joints()) {
             Joint between = joint.moved(anchor);

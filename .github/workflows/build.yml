@@ -7,6 +7,57 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        channel: [release, nightly]
+    name: Build (${{ matrix.channel }})
+    env:
+      ORG_GRADLE_PROJECT_buildChannel: ${{ matrix.channel }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: gradle/actions/setup-gradle@v5
+      - uses: actions/cache@v5
+        with:
+          path: .blockwright-store
+          key: blockwright-mods-${{ hashFiles('blockwright.toml') }}
+      - run: npm ci
+      - run: npm run format:md:check
+      - run: npm run setup
+      - run: ./gradlew build
+      - run: npm run typecheck
+      - run: npm run test:unit
+      - uses: actions/upload-artifact@v6
+        with:
+          name: folkways-${{ matrix.channel }}-jars
+          path: build/libs/*.jar
+          if-no-files-found: error
+  game-tests:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    env:
+      ORG_GRADLE_PROJECT_buildChannel: nightly
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mod: core
+            profiles: base cookery
+          - mod: vanilla
+            profiles: base cookery
+          - mod: create
+            profiles: base
+          - mod: cookery
+            profiles: cookery
+    name: GameTests (${{ matrix.mod }})
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-java@v5
@@ -24,18 +75,90 @@ jobs:
           key: blockwright-mods-${{ hashFiles('blockwright.toml') }}
       - run: npm ci
       - run: npm run setup
-      - run: ./gradlew build
-      - run: npm run typecheck
-      - run: npm run test:unit
+      - name: Run ${{ matrix.mod }} GameTests
+        shell: bash
+        env:
+          GAME_TEST_MOD: ${{ matrix.mod }}
+          GAME_TEST_PROFILES: ${{ matrix.profiles }}
+        run: |
+          mkdir -p run/gametest/ci
+          set -o pipefail
+          failed=0
+          for profile in $GAME_TEST_PROFILES; do
+            game_dir="run/gametest/$GAME_TEST_MOD/$profile"
+            mkdir -p "$game_dir"
+            printf 'eula=true\n' > "$game_dir/eula.txt"
+            gradle_args=("-PgameTestMod=$GAME_TEST_MOD")
+            if [[ "$profile" == cookery ]]; then
+              gradle_args+=(-PcookeryTests=true)
+            fi
+            status=failure
+            if timeout --signal=TERM --kill-after=60s 50m ./gradlew "${gradle_args[@]}" --console=plain runGameTestServer 2>&1 | tee "run/gametest/ci/$GAME_TEST_MOD-$profile.log"; then
+              status=success
+            else
+              failed=1
+            fi
+            if ! node scripts/ci/write-game-test-junit.mjs "$GAME_TEST_MOD-$profile" "$status"; then
+              failed=1
+            fi
+          done
+          exit "$failed"
       - uses: actions/upload-artifact@v6
+        if: always()
         with:
-          name: folkways-jars
-          path: build/libs/*.jar
-          if-no-files-found: error
+          name: gametest-${{ matrix.mod }}-reports
+          path: |
+            run/gametest/ci/*.xml
+            run/gametest/ci/*.log
+            run/gametest/${{ matrix.mod }}/**/logs/**
+            run/gametest/${{ matrix.mod }}/**/crash-reports/**
+          if-no-files-found: warn
+  client-smoke:
+    needs: build
+    name: Client smoke (founding)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      ORG_GRADLE_PROJECT_buildChannel: nightly
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: gradle/actions/setup-gradle@v5
+      - uses: actions/cache@v5
+        with:
+          path: .blockwright-store
+          key: blockwright-mods-${{ hashFiles('blockwright.toml') }}
+      - name: Install Linux client libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libgl1-mesa-dri libx11-6 libxrandr2 libxcursor1 libxi6 libxinerama1 libxxf86vm1 libasound2t64
+      - run: npm ci
+      - run: npm run setup
+      - name: Run focused real-client smoke tests
+        env:
+          LIBGL_ALWAYS_SOFTWARE: '1'
+          PLAYWRIGHT_JUNIT_OUTPUT_FILE: ${{ github.workspace }}/tests/out/e2e/playwright/junit.xml
+        run: >-
+          npm exec -- playwright test --config tests/e2e/playwright.config.ts
+          tests/e2e/founding-smoke.spec.ts
+          --workers=1 --reporter=line,junit
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: client-smoke-results
+          path: tests/out/
+          if-no-files-found: warn
   nightly:
     # Every push to master replaces the "nightly" prerelease with that commit's jars.
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-    needs: build
+    needs: [build, game-tests, client-smoke]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -45,7 +168,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v6
         with:
-          name: folkways-jars
+          name: folkways-nightly-jars
           path: jars
       - name: Replace the nightly release
         env:
@@ -54,12 +177,18 @@ jobs:
         run: |
           rm -f jars/*-sources.jar
           gh release delete nightly --cleanup-tag --yes || true
-          cat > notes.md <<EOF
-          Built automatically from master at ${GITHUB_SHA::7}. Untested pre-release; back up your world before trying it.
-
+          printf 'Built automatically from master at %s. Pre-release; back up your world before trying it.\n\n' "${GITHUB_SHA::7}" > notes.md
+          cat >> notes.md <<'EOF'
           Install **folkways-core** and **folkways-vanilla**, plus LDLib2. Add **folkways-create** only with Create,
           **folkways-modulargolems** only with Modular Golems, and **folkways-cookery** only with Kaleidoscope Cookery 1.6.0.
           All Folkways jars must come from the same build.
+
+          Nightly Core includes Spark 1.10.124 for NeoForge 1.21.1. Background CPU sampling is enabled
+          for the client and server at Spark's default 10 ms interval, unless you have opted out.
+          To save a local profile, run `/spark profiler stop --save-to-file` (server) or
+          `/sparkc profiler stop --save-to-file` (client). Profiles are saved under `config/spark/`.
+          The usual `open`/`stop` commands without `--save-to-file` upload data to Spark's viewer.
+          Release builds do not include Spark and default to disabled planning heartbeat logs.
           EOF
           gh release create nightly jars/*.jar --prerelease --target "$GITHUB_SHA" \
             --title "Nightly build" \

@@ -7,7 +7,7 @@ import net.minecraft.core.Vec3i;
 
 public record Extent(Vec3i size) {
 
-    public static final int MAX_EDGE = 512;
+    public static final int MAX_EDGE = 1024;
 
     public Extent {
         if (size.getX() <= 0 || size.getY() <= 0 || size.getZ() <= 0) {

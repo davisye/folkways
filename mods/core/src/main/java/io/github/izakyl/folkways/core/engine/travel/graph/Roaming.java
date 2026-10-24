@@ -2,6 +2,8 @@ package io.github.izakyl.folkways.core.engine.travel.graph;
 
 import io.github.izakyl.folkways.core.api.passage.Hop;
 import io.github.izakyl.folkways.core.api.passage.Passage;
+import io.github.izakyl.folkways.core.api.resident.Locomotion;
+import io.github.izakyl.folkways.core.api.resident.Resident;
 import io.github.izakyl.folkways.core.api.terms.Closures;
 import io.github.izakyl.folkways.core.api.terms.Reach;
 import io.github.izakyl.folkways.core.api.terms.Realm;
@@ -39,6 +41,7 @@ import net.minecraft.Util;
 import net.minecraft.core.BlockPos;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.entity.Mob;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -743,6 +746,34 @@ public final class Roaming {
         PathfindingLoad.edgeWalked();
     }
 
+    public void wrongEdge(Resident who, Locomotion moving,
+            Mob body, WorldPos from, WorldPos to) {
+        if (!from.sameRealm(to) || body.level() != level || body.isRemoved()
+                || !who.id().equals(body.getUUID())) return;
+        Tract tract = new Tract(new Sort(moving.id(), Bulk.of(body)), from.realm());
+        Waypoints net = nets.get(tract);
+        if (net == null) return;
+        long now = level.getGameTime();
+        // A normal failed walk may be congestion or a bad edge. Only an exact, currently known
+        // waypoint that this actual native evaluator calls BLOCKED is a point-level counterexample.
+        if (net.at(to.cell().asLong()) >= 0 && Look.blocked(level, to, moving, body)) {
+            net.blockedAt(to.cell().asLong());
+            frozen.remove(tract);
+            nextFreeze = now;
+            shelved.keySet().removeIf(key -> key.kind().equals(who.kind()) && key.realm().equals(from.realm()));
+            if (quest != null && quest.on(net)) {
+                Ask retry = quest.ask();
+                quest = null;
+                // Do not turn this invalidated epoch's GAVE_UP into another negative shelf.
+                receive(retry, now);
+            }
+            settled = true;
+            PathfindingLoad.edgeStruck();
+        } else if (net.wrongEdge(from.cell().asLong(), to.cell().asLong(), now)) {
+            PathfindingLoad.edgeStruck();
+        }
+    }
+
     private static List<Crossing> crossingsOf(List<Hop> hops) {
         List<Crossing> laid = new ArrayList<>(hops.size());
         for (Hop hop : hops) {
@@ -829,7 +860,7 @@ public final class Roaming {
         boolean fresh = false;
         long first = Long.MIN_VALUE;
         for (WorldPos cell : footings.cells()) {
-            if (!cell.sameRealm(anchor)) {
+            if (!cell.sameRealm(anchor) || shut(cell)) {
 
                 continue;
             }
@@ -851,7 +882,7 @@ public final class Roaming {
     private void site(Map<ResourceLocation, Sort> sorts, Collection<WorldPos> sites, long now) {
         LongOpenHashSet held = new LongOpenHashSet();
         for (WorldPos site : sites) {
-            if (site.realm().equals(home)) {
+            if (site.realm().equals(home) && !shut(site)) {
                 held.add(site.cell().asLong());
             }
         }
@@ -874,6 +905,7 @@ public final class Roaming {
                     }
                     reckoned++;
                     footings = Reach.workableCells(level, BlockPos.of(site)).stream()
+                        .filter(cell -> !shut(new WorldPos(home, cell)))
                         .mapToLong(BlockPos::asLong).toArray();
                     footingsOf.put(site, footings);
                 }
@@ -898,6 +930,10 @@ public final class Roaming {
             }
             return fresh;
         });
+    }
+
+    private boolean shut(WorldPos cell) {
+        return closed.stream().anyMatch(one -> one.holds(cell));
     }
 
     // Ground closed since the last tick has its ways taken up; ground opened again may be come through once more,

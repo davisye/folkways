@@ -61,6 +61,10 @@ public sealed interface Workload {
 
         Turn next(ServerLevel level, Worker who);
 
+        // Presentation can continue while an inner piece winds up, without delaying its work clock.
+        default void tick(ServerLevel level, Worker who) {
+        }
+
         // How a piece handed out ended, once for each.
         default void ended(ServerLevel level, Node piece, Ending how) {
         }

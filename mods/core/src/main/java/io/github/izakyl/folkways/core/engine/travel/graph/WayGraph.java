@@ -37,8 +37,6 @@ public final class WayGraph implements Ways {
     public static final WayGraph UNBUILT =
         new WayGraph(Map.of(), Map.of(), List.of(), Map.of(), new Asked(), new Trodden(), List.of(), 0L);
 
-    private static final int MOST_DOORS_TRIED = 8;
-
     // How far apart, in blocks, an asker and its goals may stand for the walk between them to be asked outright.
     private static final int NEAR = 128;
 
@@ -50,8 +48,6 @@ public final class WayGraph implements Ways {
     private final Trodden trodden;
 
     private final List<Closures.Closed> closed;
-
-    private final List<List<WorldPos>> doors;
 
     private final long at;
 
@@ -67,7 +63,6 @@ public final class WayGraph implements Ways {
         this.asked = asked;
         this.trodden = trodden;
         this.closed = List.copyOf(closed);
-        this.doors = doorsOf(this.closed);
         this.at = at;
     }
 
@@ -153,118 +148,116 @@ public final class WayGraph implements Ways {
         return said;
     }
 
-    /**
-     * Ground closed over is not on the ways: a goal in it is come to by way of its doors and walked to from there,
-     * and a body in it walks out by the door nearest first. Two places in the same closed ground are walked between.
-     */
+    // Closed work areas have no public waypoints. A walk involving one stays with the body's native navigation,
+    // without asking the public graph to learn paths through changing construction geometry.
     private Faring fare(Asker asker, Sort sort, WorldPos from, Set<WorldPos> goals) {
-        if (closed.isEmpty() || goals.isEmpty()) {
-            return direct(asker, sort, from, goals, Map.of());
-        }
-        int leaving = closedAt(closed, from);
-        Map<Integer, Set<WorldPos>> within = new LinkedHashMap<>();
-        Set<WorldPos> open = new LinkedHashSet<>();
+        boolean leaving = closedAt(from);
+        Set<WorldPos> walking = new LinkedHashSet<>();
         for (WorldPos goal : goals) {
-            int in = closedAt(closed, goal);
-            if (in < 0) {
-                open.add(goal);
-            } else {
-                within.computeIfAbsent(in, key -> new LinkedHashSet<>()).add(goal);
+            if (from.sameRealm(goal) && (leaving || closedAt(goal))) {
+                walking.add(goal);
             }
         }
-        if (leaving >= 0 && within.containsKey(leaving)) {
-            Set<WorldPos> here = within.get(leaving);
-            return Faring.yes(Journey.afoot(walk(from, here), here));
-        }
-        Map<WorldPos, Set<WorldPos>> beyond = new LinkedHashMap<>();
-        within.forEach((in, inside) -> {
-            for (WorldPos door : doorsNear(in, inside)) {
-                beyond.computeIfAbsent(door, key -> new LinkedHashSet<>()).addAll(inside);
-                open.add(door);
-            }
-        });
-        if (leaving < 0) {
-            return direct(asker, sort, from, open, beyond);
-        }
-        // Out by the nearest door that has a way on; failing all, the way on is asked from the nearest.
-        List<WorldPos> out = doorsNear(leaving, Set.of(from));
-        if (out.isEmpty()) {
-            return Faring.NO;
-        }
-        Asker quiet = new Asker(asker.kind(), asker.urgency(), false, asker.reckoning());
-        Faring said = Faring.NO;
-        for (WorldPos door : out) {
-            Faring onward = direct(quiet, sort, door, open, beyond);
-            if (onward instanceof Faring.Yes(Journey by)) {
-                return Faring.yes(outBy(from, door, by));
-            }
-            if (onward instanceof Faring.Later) {
-                said = Faring.LATER;
-            }
-        }
-        if (said instanceof Faring.Later && asker.noting()) {
-            direct(asker, sort, out.getFirst(), open, beyond);
-        }
-        return said;
-    }
-
-    private static Journey outBy(WorldPos from, WorldPos door, Journey by) {
-        List<Leg> legs = new ArrayList<>(by.legs().size() + 1);
-        legs.add(Leg.afoot(Set.of(door)));
-        legs.addAll(by.legs());
-        return new Journey(by.walkTicks() + walk(from, Set.of(door)), by.rideTicks(), legs);
-    }
-
-    // Which of the closures holds the cell, or -1.
-    private static int closedAt(List<Closures.Closed> closed, WorldPos cell) {
-        for (int at = 0; at < closed.size(); at++) {
-            if (closed.get(at).holds(cell)) {
-                return at;
-            }
-        }
-        return -1;
-    }
-
-    // Each closure's doors that stand in no other closure, worked out once for the graph.
-    private static List<List<WorldPos>> doorsOf(List<Closures.Closed> closed) {
-        List<List<WorldPos>> doors = new ArrayList<>(closed.size());
-        for (Closures.Closed one : closed) {
-            List<WorldPos> open = new ArrayList<>(one.doors().size());
-            for (WorldPos door : one.doors()) {
-                if (closedAt(closed, door) < 0) {
-                    open.add(door);
+        if (!walking.isEmpty()) {
+            boolean near = walking.stream().anyMatch(goal -> from.cell().distSqr(goal.cell()) < (double) NEAR * NEAR);
+            if (!near) {
+                Faring along = usingPublicWays(asker, sort, from, goals, leaving);
+                if (along instanceof Faring.Yes) {
+                    return along;
                 }
             }
-            doors.add(List.copyOf(open));
+            return Faring.yes(Journey.afoot(walk(from, walking), walking));
         }
-        return List.copyOf(doors);
+        if (leaving || goals.stream().anyMatch(this::closedAt)) {
+            return usingPublicWays(asker, sort, from, goals, leaving);
+        }
+        return direct(asker, sort, from, goals);
     }
 
-    // The doors of the closure nearest any of the places, the nearest first.
-    private List<WorldPos> doorsNear(int closure, Set<WorldPos> places) {
-        List<WorldPos> doors = this.doors.get(closure);
-        int most = Math.min(MOST_DOORS_TRIED, doors.size());
-        WorldPos[] best = new WorldPos[most];
-        double[] apart = new double[most];
-        int held = 0;
-        for (WorldPos door : doors) {
-            double far = Double.MAX_VALUE;
-            for (WorldPos place : places) {
-                far = Math.min(far, door.cell().distSqr(place.cell()));
+    private boolean closedAt(WorldPos cell) {
+        return closed.stream().anyMatch(one -> one.holds(cell));
+    }
+
+    // A long approach can use the public network, and a different realm still needs its normal passage.
+    // Native navigation joins the existing waypoints to the actual work positions; no boundary points are made.
+    private Faring usingPublicWays(Asker asker, Sort sort, WorldPos from, Set<WorldPos> goals, boolean leaving) {
+        Web web = webs.computeIfAbsent(sort, this::weave);
+        Faring best = Faring.NO;
+        long least = Long.MAX_VALUE;
+        for (WorldPos goal : goals) {
+            // One reverse search accepts every existing public endpoint in the destination's realm, weighted
+            // by its native last leg. A disconnected nearest point cannot hide a usable passage farther away.
+            Map<Integer, Integer> ends = new LinkedHashMap<>();
+            if (closedAt(goal)) {
+                for (int vertex : web.in(goal.realm())) {
+                    ends.put(vertex, walk(web.cellAt(vertex), Set.of(goal)));
+                }
+            } else {
+                int vertex = web.at(goal);
+                if (vertex >= 0) {
+                    ends.put(vertex, web.approach(goal, vertex));
+                }
             }
-            if (held == most && far >= apart[most - 1]) {
+            IntArrayList starts = leaving ? web.in(from.realm()) : new IntArrayList();
+            if (!leaving && web.at(from) >= 0) {
+                starts.add(web.at(from));
+            }
+            if (ends.isEmpty() || starts.isEmpty()) {
+                // Unknown ordinary endpoints may still ask to join the public graph. Never ask it to discover
+                // the work area's changing interior.
+                WorldPos start = leaving ? web.nearest(from).orElse(null) : from;
+                WorldPos end = closedAt(goal) ? web.nearest(goal).orElse(null) : goal;
+                if (start != null && end != null) {
+                    Faring answer = direct(new Asker(asker.kind(), asker.urgency(), asker.noting()), sort,
+                        start, Set.of(end));
+                    if (answer instanceof Faring.Later && best instanceof Faring.No) {
+                        best = Faring.LATER;
+                    }
+                }
                 continue;
             }
-            int at = held == most ? most - 1 : held++;
-            while (at > 0 && apart[at - 1] > far) {
-                best[at] = best[at - 1];
-                apart[at] = apart[at - 1];
-                at--;
+            web.backwards();
+            Field field = new Field(web, asker.kind(), ends, at, true);
+            int chosen = -1;
+            long shortest = Long.MAX_VALUE;
+            for (int vertex : starts) {
+                if (!field.reaches(vertex)) {
+                    continue;
+                }
+                int extra = leaving ? walk(from, Set.of(web.cellAt(vertex))) : web.approach(from, vertex);
+                long ticks = (long) extra + field.ticks(vertex);
+                if (ticks < shortest) {
+                    shortest = ticks;
+                    chosen = vertex;
+                }
             }
-            best[at] = door;
-            apart[at] = far;
+            if (chosen < 0) {
+                continue;
+            }
+            WorldPos start = leaving ? web.cellAt(chosen) : from;
+            WorldPos end = closedAt(goal) ? web.cellAt(field.goal(chosen)) : goal;
+            Faring answer = direct(new Asker(asker.kind(), asker.urgency(), asker.noting()), sort, start, Set.of(end));
+            if (answer instanceof Faring.Yes(Journey by)) {
+                long extra = (long) walk(from, Set.of(start)) + walk(end, Set.of(goal));
+                long ticks = (long) by.ticks() + extra;
+                if (ticks < least) {
+                    List<Leg> legs = new ArrayList<>();
+                    if (!start.equals(from)) {
+                        legs.add(Leg.afoot(Set.of(start)));
+                    }
+                    legs.addAll(by.legs());
+                    if (!end.equals(goal)) {
+                        legs.add(Leg.afoot(Set.of(goal)));
+                    }
+                    best = Faring.yes(new Journey(ticksOf((long) by.walkTicks() + extra), by.rideTicks(),
+                        asker.reckoning() ? List.of() : legs));
+                    least = ticks;
+                }
+            } else if (answer instanceof Faring.Later && best instanceof Faring.No) {
+                best = Faring.LATER;
+            }
         }
-        return List.of(best).subList(0, held);
+        return best;
     }
 
     private static int walk(WorldPos from, Set<WorldPos> to) {
@@ -275,22 +268,7 @@ public final class WayGraph implements Ways {
         return best == Integer.MAX_VALUE ? 0 : best;
     }
 
-    // A journey that lands on a door goes on afoot into the closed ground behind it.
-    private static Faring through(Journey by, WorldPos landed, Map<WorldPos, Set<WorldPos>> beyond) {
-        Set<WorldPos> inside = beyond.get(landed);
-        if (inside == null) {
-            return Faring.yes(by);
-        }
-        List<Leg> legs = new ArrayList<>(by.legs());
-        Leg last = legs.isEmpty() ? null : legs.removeLast();
-        legs.add(last == null || last.from().isEmpty() ? Leg.afoot(Set.of(landed))
-            : Leg.afoot(last.from().get(), Set.of(landed)));
-        legs.add(Leg.afoot(inside));
-        return Faring.yes(new Journey(by.walkTicks() + walk(landed, inside), by.rideTicks(), legs));
-    }
-
-    private Faring direct(Asker asker, Sort sort, WorldPos from, Set<WorldPos> goals,
-                          Map<WorldPos, Set<WorldPos>> beyond) {
+    private Faring direct(Asker asker, Sort sort, WorldPos from, Set<WorldPos> goals) {
         ResourceLocation kind = asker.kind();
         if (goals.isEmpty()) {
 
@@ -298,12 +276,12 @@ public final class WayGraph implements Ways {
         }
         Web web = webs.computeIfAbsent(sort, this::weave);
         if (asker.reckoning()) {
-            return reckoned(web, kind, from, goals, beyond);
+            return reckoned(web, kind, from, goals);
         }
         List<WorldPos> live = new ArrayList<>(goals.size());
         for (WorldPos goal : goals) {
             if (goal.equals(from)) {
-                return through(Journey.afoot(0, Set.of(goal)), goal, beyond);
+                return Faring.yes(Journey.afoot(0, Set.of(goal)));
             }
             if (!web.shutBetween(from, goal)) {
                 live.add(goal);
@@ -323,8 +301,8 @@ public final class WayGraph implements Ways {
         for (WorldPos goal : live) {
             int id = web.at(goal);
             if (id == start) {
-                return through(new Journey(Waypoints.Net.ticks(from.cell(), goal.cell()), 0,
-                    List.of(Leg.afoot(from, Set.of(goal)))), goal, beyond);
+                return Faring.yes(new Journey(Waypoints.Net.ticks(from.cell(), goal.cell()), 0,
+                    List.of(Leg.afoot(from, Set.of(goal)))));
             }
             if (id >= 0 && web.joined(start, id)) {
                 ends.add(id);
@@ -345,18 +323,17 @@ public final class WayGraph implements Ways {
             trodden.note(kind, from.realm(), web.cellsIn(from.realm(), arrived.along()));
         }
         int approach = approachFrom + web.approach(landed, ends.getInt(arrived.which()));
-        return through(new Journey(ticksOf(arrived.walked() + approach),
-            ticksOf(arrived.ridden()), legs(web, arrived, from, live, landed.realm())), landed, beyond);
+        return Faring.yes(new Journey(ticksOf(arrived.walked() + approach),
+            ticksOf(arrived.ridden()), legs(web, arrived, from, live, landed.realm())));
     }
 
     // The journey to the nearest of the goals as the ways to each are known, with no legs: the same answer for
     // every place asked from, so what is found out for one asker serves the rest.
-    private Faring reckoned(Web web, ResourceLocation kind, WorldPos from, Set<WorldPos> goals,
-                            Map<WorldPos, Set<WorldPos>> beyond) {
+    private Faring reckoned(Web web, ResourceLocation kind, WorldPos from, Set<WorldPos> goals) {
         boolean open = false;
         for (WorldPos goal : goals) {
             if (goal.equals(from)) {
-                return through(Journey.afoot(0, Set.of(goal)), goal, beyond);
+                return Faring.yes(Journey.afoot(0, Set.of(goal)));
             }
             open |= !web.shutBetween(from, goal);
         }
@@ -390,10 +367,8 @@ public final class WayGraph implements Ways {
             } else {
                 continue;
             }
-            Set<WorldPos> inside = beyond.get(goal);
-            long counted = whole + (inside == null ? 0 : walk(goal, inside));
-            if (counted < least) {
-                least = counted;
+            if (whole < least) {
+                least = whole;
                 ridden = riding;
                 landed = goal;
             }
@@ -401,9 +376,7 @@ public final class WayGraph implements Ways {
         if (landed == null) {
             return Faring.LATER;
         }
-        Set<WorldPos> inside = beyond.get(landed);
-        long whole = least - (inside == null ? 0 : walk(landed, inside));
-        return through(new Journey(ticksOf(whole - ridden), ridden, List.of()), landed, beyond);
+        return Faring.yes(new Journey(ticksOf(least - ridden), ridden, List.of()));
     }
 
     private static List<Leg> legs(Web web, Arrival arrived, WorldPos from, List<WorldPos> live,
@@ -629,20 +602,31 @@ public final class WayGraph implements Ways {
         private final long at;
         private final int[] ticks;
         private final int[] ridden;
+        private final int[] goals;
         private final java.util.BitSet found;
         private final it.unimi.dsi.fastutil.longs.LongHeapPriorityQueue open =
             new it.unimi.dsi.fastutil.longs.LongHeapPriorityQueue();
 
         Field(Web web, ResourceLocation kind, int goal, long at) {
+            this(web, kind, Map.of(goal, 0), at, false);
+        }
+
+        Field(Web web, ResourceLocation kind, Map<Integer, Integer> ends, long at, boolean trackGoals) {
             this.web = web;
             this.kind = kind;
             this.at = at;
             this.ticks = new int[web.size()];
             this.ridden = new int[web.size()];
+            this.goals = trackGoals ? new int[web.size()] : null;
             this.found = new java.util.BitSet(web.size());
             Arrays.fill(ticks, Integer.MAX_VALUE);
-            ticks[goal] = 0;
-            open.enqueue(goal);
+            ends.forEach((goal, cost) -> {
+                ticks[goal] = cost;
+                if (goals != null) {
+                    goals[goal] = goal;
+                }
+                open.enqueue((long) cost << 32 | goal);
+            });
         }
 
         synchronized boolean reaches(int from) {
@@ -669,12 +653,19 @@ public final class WayGraph implements Ways {
             return ridden[from];
         }
 
+        int goal(int from) {
+            return goals[from];
+        }
+
         // `from` leads on to `to`, already found, in `cost` ticks, `riding` of them aboard.
         void leads(int from, int to, long cost, long riding) {
             long whole = ticks[to] + cost;
             if (whole < ticks[from]) {
                 ticks[from] = (int) whole;
                 ridden[from] = (int) (ridden[to] + riding);
+                if (goals != null) {
+                    goals[from] = goals[to];
+                }
                 open.enqueue(whole << 32 | from);
             }
         }
@@ -963,6 +954,17 @@ public final class WayGraph implements Ways {
         BlockPos pieceCell(int vertex) {
             int tract = tractOf(vertex);
             return nets[tract].pieceCell(vertex - offset[tract]);
+        }
+
+        private IntArrayList in(Realm realm) {
+            IntArrayList vertices = new IntArrayList();
+            Integer tract = tracts.get(realm);
+            if (tract != null) {
+                for (int vertex = offset[tract]; vertex < offset[tract + 1]; vertex++) {
+                    vertices.add(vertex);
+                }
+            }
+            return vertices;
         }
 
         // The point of the ways nearest a place, in its own realm.

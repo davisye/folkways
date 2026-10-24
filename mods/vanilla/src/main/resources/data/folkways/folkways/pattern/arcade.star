@@ -53,7 +53,7 @@ lang = {
         "lamp": "Lamps",
         "error.arcade.steep": "Too steep for one stretch: add a point or lengthen it",
         "error.material": "Choose material for %s",
-        "error.arcade.length": "An arcade runs 6–96 blocks; split longer ones",
+        "error.arcade.length": "An arcade runs at least 6 blocks",
         "error.arcade.bay": "Stretch %s is too short for a bay between its pavilions",
     },
     "zh_cn": {
@@ -80,7 +80,7 @@ lang = {
         "lamp": "灯具",
         "error.arcade.steep": "这一段太陡：请加一个点或拉长这一段",
         "error.material": "请为%s选择材料",
-        "error.arcade.length": "风雨廊长度须为 6–96 格，更长的请分段修建",
+        "error.arcade.length": "风雨廊长度至少 6 格",
         "error.arcade.bay": "第 %s 段太短，放不下一个开间",
     },
     "zh_hk": {
@@ -107,7 +107,7 @@ lang = {
         "lamp": "燈具",
         "error.arcade.steep": "這一段太陡：請加一個點或拉長這一段",
         "error.material": "請為%s選擇材料",
-        "error.arcade.length": "風雨廊長度須為 6–96 格，更長的請分段修建",
+        "error.arcade.length": "風雨廊長度至少 6 格",
         "error.arcade.bay": "第 %s 段太短，放不下一個開間",
     },
     "zh_tw": {
@@ -134,7 +134,7 @@ lang = {
         "lamp": "燈具",
         "error.arcade.steep": "這一段太陡：請加一個點或拉長這一段",
         "error.material": "請為%s選擇材料",
-        "error.arcade.length": "風雨廊長度須為 6–96 格，更長的請分段修建",
+        "error.arcade.length": "風雨廊長度至少 6 格",
         "error.arcade.bay": "第 %s 段太短，放不下一個開間",
     },
 }
@@ -301,7 +301,7 @@ def draw(site):
     length = 0
     for one in runs:
         length += one.depth
-    if length < 6 or length > 96:
+    if length < 6:
         reject("error.arcade.length")
     side = width + 2
     half = side // 2

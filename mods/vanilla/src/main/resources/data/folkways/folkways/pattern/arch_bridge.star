@@ -25,8 +25,7 @@ lang = {
         "accent": "Accent",
         "error.bridge.landing": "No dry landing within 12 blocks of bridgehead",
         "error.bridge.points": "An arch bridge needs exactly two path points",
-        "error.bridge.span": "Bridge span must be 6–96 blocks",
-        "error.bridge.width": "Bridge width must be 3–15 blocks",
+        "error.bridge.span": "Bridge span must be at least 6 blocks",
         "error.bridge.steep": "Bridge ends are too steep",
         "error.material": "Choose material for %s",
     },
@@ -40,8 +39,7 @@ lang = {
         "accent": "点缀",
         "error.bridge.landing": "桥头外 12 格内没有可平缓衔接的岸地",
         "error.bridge.points": "拱桥只支持两个路径点",
-        "error.bridge.span": "拱桥跨度须为 6–96 格",
-        "error.bridge.width": "拱桥宽度须为 3–15 格",
+        "error.bridge.span": "拱桥跨度至少 6 格",
         "error.bridge.steep": "桥头高差不得超过跨度的四分之一",
         "error.material": "请为%s选择材料",
     },
@@ -55,8 +53,7 @@ lang = {
         "accent": "點綴",
         "error.bridge.landing": "橋頭外 12 格內沒有可平緩銜接的岸地",
         "error.bridge.points": "拱橋只支援兩個路徑點",
-        "error.bridge.span": "拱橋跨度須為 6–96 格",
-        "error.bridge.width": "拱橋寬度須為 3–15 格",
+        "error.bridge.span": "拱橋跨度至少 6 格",
         "error.bridge.steep": "橋頭高差不得超過跨度的四分之一",
         "error.material": "請為%s選擇材料",
     },
@@ -70,8 +67,7 @@ lang = {
         "accent": "點綴",
         "error.bridge.landing": "橋頭外 12 格內沒有可平緩銜接的岸地",
         "error.bridge.points": "拱橋只支援兩個路徑點",
-        "error.bridge.span": "拱橋跨度須為 6–96 格",
-        "error.bridge.width": "拱橋寬度須為 3–15 格",
+        "error.bridge.span": "拱橋跨度至少 6 格",
         "error.bridge.steep": "橋頭高差不得超過跨度的四分之一",
         "error.material": "請為%s選擇材料",
     },
@@ -154,11 +150,9 @@ def draw(site):
     if len(site.path.points) != 2:
         reject("error.bridge.points")
     length = site.path.length
-    if length < 6 or length > 96:
+    if length < 6:
         reject("error.bridge.span")
     width = site.count("width")
-    if width < 3 or width > 15:
-        reject("error.bridge.width")
     dy = site.path.points[1].y - site.path.points[0].y
     if max(dy, -dy) > length / 4:
         reject("error.bridge.steep")

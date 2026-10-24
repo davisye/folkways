@@ -9,10 +9,17 @@ import io.github.izakyl.folkways.base.persist.Reader;
 import io.github.izakyl.folkways.core.api.resident.Resident;
 import io.github.izakyl.folkways.core.api.terms.WorldPos;
 import io.github.izakyl.folkways.core.api.terms.ItemSpec;
+import io.github.izakyl.folkways.core.api.terms.Goods;
+import io.github.izakyl.folkways.core.api.work.Ending;
+import io.github.izakyl.folkways.core.api.work.Outcome;
+import io.github.izakyl.folkways.core.api.work.Placement;
+import io.github.izakyl.folkways.core.api.work.Worker;
+import io.github.izakyl.folkways.core.engine.labor.Commit;
 import io.github.izakyl.folkways.front.api.Schema;
 import io.github.izakyl.folkways.front.api.Settings;
 import io.github.izakyl.folkways.front.api.notice.Notice;
 import io.github.izakyl.folkways.plugins.FolkwaysVanillaMod;
+import io.github.izakyl.folkways.plugins.person.PersonBody;
 import io.github.izakyl.folkways.plugins.build.draft.Chosen;
 import io.github.izakyl.folkways.plugins.build.draft.Draft;
 import io.github.izakyl.folkways.plugins.build.draft.Drawn;
@@ -42,6 +49,11 @@ import net.minecraft.resources.ResourceKey;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.SimpleContainer;
+import net.minecraft.world.entity.Mob;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.level.block.Blocks;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
@@ -307,11 +319,56 @@ public final class GrowingGameTests {
         }).save();
     }
 
+    private static void build(GameTestHelper helper, BuildSite site) {
+        ServerLevel level = helper.getLevel();
+        SimpleContainer pack = new SimpleContainer(128);
+        Mob body = PersonBody.RESIDENT.get().create(level);
+        body.setPos(Vec3.atBottomCenterOf(helper.absolutePos(new BlockPos(1, 7, 1))));
+        Worker worker = (Worker) Proxy.newProxyInstance(GrowingGameTests.class.getClassLoader(),
+            new Class<?>[] {Worker.class}, (proxy, method, args) -> switch (method.getName()) {
+                case "body" -> body;
+                case "pack" -> pack;
+                case "resident" -> new Resident(body.getUUID(), ResourceLocation.withDefaultNamespace("pig"));
+                case "effects" -> Effects.NONE;
+                case "placement" -> Placement.NOWHERE;
+                case "held" -> new ItemStack(Items.DIAMOND_PICKAXE);
+                case "within", "route", "supplied" -> List.of();
+                default -> null;
+            });
+        for (int round = 0; round < 64 && !site.complete(); round++) {
+            boolean progressed = false;
+            for (BuildSite.Piece piece : site.pieces()) {
+                if (!site.before(piece).isEmpty()) {
+                    continue;
+                }
+                pack.clearContent();
+                int slot = 0;
+                for (var need : piece.node().spec().needs()) {
+                    var item = Goods.members(need.spec()).stream().findFirst().orElseThrow();
+                    long left = need.count();
+                    while (left > 0) {
+                        int count = (int) Math.min(left, item.getDefaultMaxStackSize());
+                        pack.setItem(slot++, new ItemStack(item, count));
+                        left -= count;
+                    }
+                }
+                Outcome outcome = Commit.run(level, piece.node(), worker);
+                helper.assertTrue(outcome instanceof Outcome.Done, "headframe work succeeds: " + outcome);
+                site.ended(piece.node().id(), Ending.DONE);
+                progressed = true;
+            }
+            site.tick(level);
+            helper.assertTrue(progressed || site.complete(), "headframe construction makes progress; left=" + site.left()
+                + " refusals=" + site.refusals().entrySet().stream().limit(3).toList());
+        }
+    }
+
     @GameTest(template = "empty_large", timeoutTicks = 200)
     public static void aMineRaisesItsHeadframeAsAnOrderThenStartsItsStairOnceThatStands(GameTestHelper helper) {
         Rig rig = rig(helper);
         ServerLevel level = rig.level();
-        BlockPos ground = helper.absolutePos(new BlockPos(10, 0, 10));
+        // Survey real ground above the GameTest enclosure, whose barrier roof otherwise looks like terrain.
+        BlockPos ground = helper.absolutePos(new BlockPos(10, 24, 10));
         for (int x = -8; x <= 8; x++) {
             for (int z = -8; z <= 8; z++) {
                 level.setBlock(ground.offset(x, 0, z), Blocks.STONE.defaultBlockState(), 3);
@@ -344,10 +401,14 @@ public final class GrowingGameTests {
                 }
             }
             helper.assertTrue(placed > 60, "a headframe of posts, deck, rails and roof, got " + placed + " blocks");
-            for (Draft.Cell cell : head.ready().draft().cells()) {
-                level.setBlock(head.ready().corner().offset(cell.offset()), cell.state(), 3);
-            }
-            new BuildPresence(rig.colony(), level.getServer()).settle(level.getServer());
+            presence.settle(level.getServer());
+            UUID order = rig.saved().get().getCompound("book").getList("buildOrders", Tag.TAG_COMPOUND)
+                .getCompound(0).getUUID("id");
+            BuildSite site = presence.site(order).orElseThrow();
+            build(helper, site);
+            helper.assertTrue(site.complete(), "successful headframe operations are latched before growth advances");
+            helper.assertValueEqual(round(rig), 1, "the stair is not drawn before the completed round is settled");
+            presence.settle(level.getServer());
         }).thenWaitUntil(() -> helper.assertValueEqual(round(rig), 2, "the mine waits on its first flight"))
             .thenExecute(() -> helper.assertValueEqual(standing(rig), 1,
                 "the stair is filed once the headframe stands"))

@@ -12,7 +12,7 @@ import net.minecraft.world.level.block.Mirror;
 import net.minecraft.world.level.block.Rotation;
 import net.minecraft.world.level.block.state.BlockState;
 
-public record UnloadedBlock(BlockPos offset, CompoundTag state, List<Turn> turns) {
+public record UnloadedBlock(BlockPos offset, CompoundTag state, List<Turn> turns, BlockData data) {
 
     static final String TAG_TURNS = "turns";
 
@@ -45,6 +45,10 @@ public record UnloadedBlock(BlockPos offset, CompoundTag state, List<Turn> turns
         turns = List.copyOf(turns);
     }
 
+    public UnloadedBlock(BlockPos offset, CompoundTag state, List<Turn> turns) {
+        this(offset, state, turns, BlockData.EMPTY);
+    }
+
     public String block() {
         return state.getString("Name");
     }
@@ -52,7 +56,7 @@ public record UnloadedBlock(BlockPos offset, CompoundTag state, List<Turn> turns
     UnloadedBlock turned(BlockPos to, Mirror mirror, Rotation rotation) {
         List<Turn> more = new ArrayList<>(turns);
         more.add(new Turn(mirror, rotation));
-        return new UnloadedBlock(to, state, more);
+        return new UnloadedBlock(to, state, more, data.turned(mirror, rotation));
     }
 
     BlockState turn(BlockState read) {
@@ -67,6 +71,7 @@ public record UnloadedBlock(BlockPos offset, CompoundTag state, List<Turn> turns
         return Writer.of()
             .blockPos(BlueprintBlock.TAG_OFFSET, offset)
             .blob(BlueprintBlock.TAG_STATE, state)
+            .blob(BlueprintBlock.TAG_DATA, data.save())
             .children(TAG_TURNS, turns, Turn::save)
             .tag();
     }

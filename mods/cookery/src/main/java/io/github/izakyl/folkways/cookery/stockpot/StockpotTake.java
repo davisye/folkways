@@ -189,13 +189,15 @@ final class StockpotTake extends StockpotNode {
             if (pot.getStatus() != IStockpot.PUT_SOUP_BASE) {
                 return rolledBack(level, before);
             }
-            if (batch.get().replaceLid() || keepLid) {
+            if (batch.get().replaceLid()) {
                 KitchenDelivery.Result closed = KitchenDelivery.run(level, pot.getBlockPos(), who, lid,
                     () -> pot.onLitClick(level, who.body(), lid));
                 if (!closed.success()) {
                     return rolledBack(level, before);
                 }
                 made.addAll(closed.outputs());
+            } else if (keepLid) {
+                unused.add(lid);
             } else {
                 made.add(lid);
             }

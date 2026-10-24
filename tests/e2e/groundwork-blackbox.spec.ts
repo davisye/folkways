@@ -5,13 +5,15 @@ import {
   foundColonyFast, foundingBox, probe, stockToolsForResidents, TRADE_TOOLS, waitForGroundedPlayer, type Vec,
 } from "../shared/colony/colony-founding";
 import { runColonyTask } from "../shared/colony/colony-tasks";
-import { configureZone, createMarkedZone, setBookGesture } from "../shared/ui/zone-tools";
+import {
+  applyZoneSetting, createMarkedZone, holdZoneAndOpen, releaseHeldZone, setBookGesture, zoneSettingToken,
+} from "../shared/ui/zone-tools";
 import { aimAndWorldLeftClick, blockHasItem } from "../shared/ui/world-ui";
 import { launchPair, type E2EPair } from "../shared/harness/pair";
 import { ensureOut, tracePath } from "../shared/harness/out-paths";
 import { seededServer } from "../shared/harness/mod-settings";
 import { BUDGET } from "../shared/harness/budgets";
-import { commandPos, tryCommand } from "../shared/harness/bw-helpers";
+import { commandPos, tryCommand, waitForElement } from "../shared/harness/bw-helpers";
 import { newRunId } from "../shared/harness/run-id";
 import { GROUND, twins, type Stage } from "../shared/harness/stage";
 
@@ -46,12 +48,9 @@ for (const on of twins()) test(on.title("groundwork end-to-end: clear, fill, wee
     const grounded = await waitForGroundedPlayer(server);
     const player = grounded.name;
     const origin = { x: Math.round(grounded.pos.x) + 4, y: Math.round(grounded.pos.y), z: Math.round(grounded.pos.z) + 4 };
-    await stage.lay(server, foundingBox(origin));
+    await layStage(server, player, origin);
     const founded = await foundColonyFast(server, client, player, { origin, residentCount: RESIDENT_COUNT, stage });
     const store = founded.foodChest;
-    await stockToolsForResidents(server, stage.at(store), [...TRADE_TOOLS.building, ...TRADE_TOOLS.farming], 2, 4);
-    await tryCommand(server, `item replace block ${at(store)} container.20 with minecraft:dirt 16`);
-    await tryCommand(server, `item replace block ${at(store)} container.21 with minecraft:cobblestone 16`);
 
     const ground = origin.y - 1;
     const cell = (x: number, y: number, z: number): Vec => ({ x: origin.x + x, y, z: origin.z + z });
@@ -71,18 +70,35 @@ for (const on of twins()) test(on.title("groundwork end-to-end: clear, fill, wee
     const patchDirt = cell(11, ground, 6);
     await tick.sprint(server, 5);
 
-    // Two zones are marked with the book, as a player marks one: the first does the work a zone does unless told
-    // otherwise, and the second has clear unticked and fill ticked in its settings, and cobblestone picked to fill
-    // it with in place of the dirt a zone fills with unless told otherwise. The rest are drawn straight onto the
-    // colony, and fill with dirt.
+    for (const weed of weeds) {
+      await tryCommand(server, `setblock ${at(weed)} minecraft:short_grass`);
+    }
+    // A tree, and beside it, in the same box, a beam of two logs with no leaves of its own.
+    await tryCommand(server, `fill ${at(trunk)} ${at({ ...trunk, y: trunk.y + 3 })} minecraft:oak_log`);
+    await tryCommand(server, `fill ${at({ x: trunk.x - 1, y: trunk.y + 2, z: trunk.z - 1 })} ${at({ x: trunk.x + 1, y: trunk.y + 4, z: trunk.z + 1 })} minecraft:oak_leaves[persistent=false] keep`);
+    await tryCommand(server, `fill ${at(beam)} ${at({ ...beam, y: beam.y + 1 })} minecraft:oak_log`);
+    await tryCommand(server, `setblock ${at(woodsWeed)} minecraft:short_grass`);
+    await tryCommand(server, `fill ${at(patch.min)} ${at(patch.max)} minecraft:cobblestone`);
+    await tryCommand(server, `setblock ${at(patchDirt)} minecraft:dirt`);
+    const dropped = await tryCommand(server, `summon minecraft:item ${at(cell(2, origin.y, 11))} {Item:{id:"minecraft:emerald",count:5},PickupDelay:32767s,Age:-32768s}`);
+    expect(dropped.status === "ok" && dropped.success, `the stack to haul lies in the yard: ${JSON.stringify(dropped)}`).toBe(true);
+    await tick.sprint(server, 2);
+    expect(await probe(server, `if entity @e[type=minecraft:item,nbt={Item:{id:"minecraft:emerald"}}]`), "the stack lies there before anyone hauls it").toBe(true);
+
+    // Groundwork discovers its targets once. Prepare each scene before confirming its zone, so UI ticks
+    // cannot capture an unfinished fixture or finish and erase an empty zone between setting edits.
     await setBookGesture(server, client, player, "box");
-    await mark(server, client, player, founded.standBlock, boulder.min, boulder.max);
+    await tryCommand(server, `setblock ${at(boulder.min)} minecraft:stone`);
+    await tryCommand(server, `setblock ${at(boulder.max)} minecraft:stone`);
+    await mark(server, client, player, boulder.min, boulder.max);
     await tryCommand(server, `fill ${at(boulder.min)} ${at(boulder.max)} minecraft:stone`);
-    await mark(server, client, player, founded.standBlock, pit.min, pit.max);
-    const told = await configureZone(server, client, player, founded.standBlock, pit,
-      [{ key: "clear", toggle: true }, { key: "fill", toggle: true },
-        { key: "block", item: "minecraft:cobblestone", query: "cobblestone" }], stage);
-    expect(told.edits.length, `both boxes were ticked and the block picked: ${JSON.stringify(told)}`).toBe(3);
+    await createMarkedZone(server, client, player, founded.standBlock, "ground", stage);
+    // Keep stone awaiting a pickaxe while its live zone is configured. Enable fill before clearing is
+    // disabled, and excavate before that last setting discovers the final fill targets.
+    await tryCommand(server, `fill ${at(pit.min)} ${at(pit.max)} minecraft:stone`);
+    await mark(server, client, player, pit.min, pit.max);
+    await createMarkedZone(server, client, player, founded.standBlock, "ground", stage);
+    await configureFillZone(server, client, player, founded.standBlock, pit);
     const colony = founded.evidence.colonyId;
     await draw(server, colony, ["weed"], { min: cell(-4, ground, 6), max: weeds[2] });
     await draw(server, colony, ["fell", "weed"], woods);
@@ -92,21 +108,10 @@ for (const on of twins()) test(on.title("groundwork end-to-end: clear, fill, wee
     expect(filling.blocks, `the pit fills with what was picked, the patch with the dirt it was drawn with: ${JSON.stringify(filling)}`)
       .toEqual(["minecraft:cobblestone", "minecraft:dirt"]);
 
-    for (const weed of weeds) {
-      await tryCommand(server, `setblock ${at(weed)} minecraft:short_grass`);
-    }
-    // A tree, and beside it, in the same box, a beam of two logs with no leaves of its own.
-    await tryCommand(server, `fill ${at(trunk)} ${at({ ...trunk, y: trunk.y + 3 })} minecraft:oak_log`);
-    await tryCommand(server, `fill ${at({ x: trunk.x - 1, y: trunk.y + 2, z: trunk.z - 1 })} ${at({ x: trunk.x + 1, y: trunk.y + 4, z: trunk.z + 1 })} minecraft:oak_leaves[persistent=false] keep`);
-    await tryCommand(server, `fill ${at(beam)} ${at({ ...beam, y: beam.y + 1 })} minecraft:oak_log`);
-    await tryCommand(server, `fill ${at(pit.min)} ${at(pit.max)} minecraft:air`);
-    await tryCommand(server, `setblock ${at(woodsWeed)} minecraft:short_grass`);
-    await tryCommand(server, `fill ${at(patch.min)} ${at(patch.max)} minecraft:cobblestone`);
-    await tryCommand(server, `setblock ${at(patchDirt)} minecraft:dirt`);
-    const dropped = await tryCommand(server, `summon minecraft:item ${at(cell(2, origin.y, 11))} {Item:{id:"minecraft:emerald",count:5},PickupDelay:32767s,Age:-32768s}`);
-    expect(dropped.status === "ok" && dropped.success, `the stack to haul lies in the yard: ${JSON.stringify(dropped)}`).toBe(true);
-    await tick.sprint(server, 2);
-    expect(await probe(server, `if entity @e[type=minecraft:item,nbt={Item:{id:"minecraft:emerald"}}]`), "the stack lies there before anyone hauls it").toBe(true);
+    // Supply work only after all zones have captured the prepared scene and their settings were checked.
+    await stockToolsForResidents(server, stage.at(store), [...TRADE_TOOLS.building, ...TRADE_TOOLS.farming], 2, 4);
+    await tryCommand(server, `item replace block ${at(store)} container.20 with minecraft:dirt 16`);
+    await tryCommand(server, `item replace block ${at(store)} container.21 with minecraft:cobblestone 16`);
 
     const done = {
       cleared: () => allAre(server, boxCells(boulder), "minecraft:air"),
@@ -144,18 +149,106 @@ for (const on of twins()) test(on.title("groundwork end-to-end: clear, fill, wee
   }
 });
 
-async function mark(server: MinecraftServer, client: MinecraftClient, player: string, standBlock: Vec,
-    min: Vec, max: Vec) {
-  // Each corner is a stone of its own while it is clicked: the box is filled in after.
-  await tryCommand(server, `setblock ${at(min)} minecraft:stone`);
+for (const on of twins()) test(on.title("fill retreats through a narrow hall and waits for the player before sealing"), async ({}, testInfo) => {
+  stage = on;
+  test.setTimeout(BUDGET.slow);
+  ensureOut("e2e");
+  const runId = newRunId();
+  let pair: E2EPair | undefined;
+  try {
+    pair = await launchPair({
+      config: stage.config,
+      server: { trace: tracePath("e2e", stage.name("safe-fill-server")), instance: seededServer(stage.name(`safe-fill-server-${runId}`)) },
+      client: { trace: tracePath("e2e", stage.name("safe-fill-client")), instance: stage.name(`safe-fill-client-${runId}`) },
+    });
+    const { server, client } = pair;
+    const grounded = await waitForGroundedPlayer(server);
+    const player = grounded.name;
+    const origin = { x: Math.round(grounded.pos.x) + 4, y: Math.round(grounded.pos.y), z: Math.round(grounded.pos.z) + 4 };
+    await layStage(server, player, origin);
+    const founded = await foundColonyFast(server, client, player, { origin, residentCount: 3, stage });
+    const cell = (x: number, y: number, z: number): Vec => ({ x: origin.x + x, y: origin.y + y, z: origin.z + z });
+    const hall = { min: cell(7, 0, 10), max: cell(13, 1, 10) };
+    await tryCommand(server, `fill ${at(cell(6, 0, 9))} ${at(cell(14, 2, 11))} minecraft:stone`);
+    await tryCommand(server, `fill ${at(cell(6, 0, 10))} ${at(cell(13, 1, 10))} minecraft:air`);
+    const inside = stage.stand(cell(10, 0, 10));
+    await tryCommand(server, `tp ${player} ${inside.x + 0.5} ${inside.y} ${inside.z + 0.5}`);
+    await draw(server, founded.evidence.colonyId, ["fill"], hall);
+    await stockToolsForResidents(server, stage.at(founded.foodChest), TRADE_TOOLS.building, 3, 4);
+    await tryCommand(server, `item replace block ${at(founded.foodChest)} container.20 with minecraft:dirt 64`);
+
+    const deepEnd = [cell(13, 0, 10), cell(13, 1, 10)];
+    let deepFilled = false;
+    for (let spent = 0; spent < WORK_TICKS; spent += STEP_TICKS) {
+      await tick.sprint(server, STEP_TICKS);
+      expect(await allAre(server, [cell(7, 0, 10), cell(7, 1, 10)], "minecraft:air"),
+        "the player's only exit stays open throughout construction").toBe(true);
+      if (await allAre(server, deepEnd, "minecraft:dirt")) {
+        deepFilled = true;
+        break;
+      }
+    }
+    expect(deepFilled, "builders still make progress at the far end while the player is inside").toBe(true);
+    const outside = stage.stand(cell(4, 0, 10));
+    await tryCommand(server, `tp ${player} ${outside.x + 0.5} ${outside.y} ${outside.z + 0.5}`);
+    let completed = false;
+    for (let spent = 0; spent < WORK_TICKS; spent += STEP_TICKS) {
+      await tick.sprint(server, STEP_TICKS);
+      if (await allAre(server, boxCells(hall), "minecraft:dirt")) {
+        completed = true;
+        break;
+      }
+    }
+    expect(completed, "the hall, including its reserved passage and last opening, fills after the player leaves").toBe(true);
+  } catch (error) {
+    pair?.failing(error);
+    throw error;
+  } finally {
+    await pair?.teardown(testInfo);
+  }
+});
+
+async function layStage(server: MinecraftServer, player: string, origin: Vec) {
+  if (stage.kind === "aboard") {
+    // Assembly removes the floor before the ship has collision. Keep the fixture's player above it until
+    // the deck exists, then restore an ordinary, non-spectating player for the actual construction checks.
+    await tryCommand(server, `gamemode spectator ${player}`);
+    await tryCommand(server, `tp ${player} ${origin.x + 0.5} ${origin.y + 1} ${origin.z + 0.5}`);
+  }
+  await stage.lay(server, foundingBox(origin));
+  if (stage.kind === "aboard") {
+    const stand = stage.stand(origin);
+    await tryCommand(server, `tp ${player} ${stand.x + 0.5} ${stand.y} ${stand.z + 0.5}`);
+    await tryCommand(server, `gamemode creative ${player}`);
+  }
+}
+
+async function mark(server: MinecraftServer, client: MinecraftClient, player: string, min: Vec, max: Vec) {
+  // Click existing blocks without overwriting the scene; no zone exists until its fixture is ready.
   await tick.sprint(server, 2);
   await aimAndWorldLeftClick(server, client, player, min, stage);
   await tick.sprint(server, 3);
-  await tryCommand(server, `setblock ${at(max)} minecraft:stone`);
-  await tick.sprint(server, 2);
   await aimAndWorldLeftClick(server, client, player, max, stage);
   await tick.sprint(server, 5);
-  await createMarkedZone(server, client, player, standBlock, "ground", stage);
+}
+
+async function configureFillZone(server: MinecraftServer, client: MinecraftClient, player: string,
+    standBlock: Vec, pit: { min: Vec; max: Vec }) {
+  await holdZoneAndOpen(server, client, player, pit, stage);
+  try {
+    for (const edit of [{ key: "fill", toggle: true },
+      { key: "block", item: "minecraft:cobblestone", query: "cobblestone" }] as const) {
+      await waitForElement(client, { id: zoneSettingToken(edit.key) }, { timeoutMs: 8_000 });
+      await applyZoneSetting(server, client, edit);
+    }
+    await tryCommand(server, `fill ${at(pit.min)} ${at(pit.max)} minecraft:air`);
+    await applyZoneSetting(server, client, { key: "clear", toggle: true });
+  } finally {
+    await releaseHeldZone(client);
+    const stand = stage.stand(standBlock);
+    await tryCommand(server, `tp ${player} ${stand.x + 0.5} ${stand.y} ${stand.z + 1.5}`);
+    await tick.sprint(server, 5);
+  }
 }
 
 async function draw(server: MinecraftServer, colony: string, works: string[], box: { min: Vec; max: Vec }) {

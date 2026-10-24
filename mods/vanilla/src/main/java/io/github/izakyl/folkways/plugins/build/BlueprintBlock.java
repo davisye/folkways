@@ -13,13 +13,18 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 
-public record BlueprintBlock(BlockPos offset, BlockState state) {
+public record BlueprintBlock(BlockPos offset, BlockState state, BlockData data) {
 
     static final String TAG_OFFSET = "offset";
     static final String TAG_STATE = "state";
+    static final String TAG_DATA = "blockEntity";
 
     public BlueprintBlock {
         offset = offset.immutable();
+    }
+
+    public BlueprintBlock(BlockPos offset, BlockState state) {
+        this(offset, state, BlockData.EMPTY);
     }
 
     public BlockPos worldPos(BlockPos anchor) {
@@ -30,6 +35,7 @@ public record BlueprintBlock(BlockPos offset, BlockState state) {
         return Writer.of()
             .blockPos(TAG_OFFSET, offset)
             .blob(TAG_STATE, NbtUtils.writeBlockState(state))
+            .blob(TAG_DATA, data.save())
             .tag();
     }
 

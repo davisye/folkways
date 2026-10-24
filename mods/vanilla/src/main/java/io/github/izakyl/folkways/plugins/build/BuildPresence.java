@@ -18,6 +18,7 @@ import io.github.izakyl.folkways.front.api.notice.Sentence;
 import io.github.izakyl.folkways.front.api.panel.Board;
 import io.github.izakyl.folkways.plugins.build.draft.DraftRefusal;
 import io.github.izakyl.folkways.plugins.build.draft.Hint;
+import io.github.izakyl.folkways.plugins.build.draft.Joint;
 import io.github.izakyl.folkways.plugins.build.draft.Round;
 import io.github.izakyl.folkways.plugins.build.draft.Templates;
 import java.util.ArrayList;
@@ -87,6 +88,7 @@ final class BuildPresence implements Facing {
     private final Map<UUID, Drafted> drafted = new LinkedHashMap<>();
     private final Map<UUID, Map<ResourceLocation, Long>> owed = new ConcurrentHashMap<>();
     private final Map<UUID, Set<BlockPos>> met = new LinkedHashMap<>();
+    private final Map<UUID, Set<Joint>> joined = new LinkedHashMap<>();
     private final Set<UUID> untallied = new LinkedHashSet<>();
     // How many sites have been numbered for want of a name, so the next unnamed one is #numbered+1.
     private int numbered;
@@ -126,7 +128,15 @@ final class BuildPresence implements Facing {
             Drafted.load(entry).ifPresent(one -> drafted.put(one.order(), one));
         }
         for (Reader entry : saved.children(TAG_MET)) {
-            entry.uuid(TAG_ORDER).ifPresent(order -> met.put(order, cells(entry.intArray(TAG_CELLS).orElse(new int[0]))));
+            entry.uuid(TAG_ORDER).ifPresent(order -> {
+                met.put(order, cells(entry.intArray(TAG_CELLS).orElse(new int[0])));
+                Set<Joint> metJoints = new LinkedHashSet<>();
+                for (Reader joint : entry.children("joints")) {
+                    joint.blockPos("from").ifPresent(from -> joint.blockPos("to")
+                        .filter(to -> !from.equals(to)).ifPresent(to -> metJoints.add(new Joint(from, to))));
+                }
+                joined.put(order, metJoints);
+            });
         }
         numbered = Math.max(0, saved.integer(TAG_NUMBERED).orElse(0));
         nameUnnamed();
@@ -176,6 +186,8 @@ final class BuildPresence implements Facing {
             .children(TAG_MET, metNow().entrySet(), entry -> Writer.of()
                 .uuid(TAG_ORDER, entry.getKey())
                 .intArray(TAG_CELLS, packed(entry.getValue()))
+                .children("joints", joinedNow(entry.getKey()), joint -> Writer.of()
+                    .blockPos("from", joint.from()).blockPos("to", joint.to()).tag())
                 .tag())
             .tag();
         colony.keep(BuildContent.ID, saved);
@@ -188,6 +200,11 @@ final class BuildPresence implements Facing {
         now.keySet().removeIf(order -> !filed(order));
         now.values().removeIf(Set::isEmpty);
         return now;
+    }
+
+    private Set<Joint> joinedNow(UUID order) {
+        BuildSite site = sites.get(order);
+        return site == null ? joined.getOrDefault(order, Set.of()) : site.joined();
     }
 
     private static int[] packed(Set<BlockPos> cells) {
@@ -233,7 +250,7 @@ final class BuildPresence implements Facing {
 
     private Optional<BlueprintBuildOrder> place(ServerLevel level, Blueprint blueprint, BlockPos anchor, String name,
             Optional<UUID> playerId, String playerName) {
-        book.add(blueprint);
+        book.add(level, blueprint);
         return book.place(level, blueprint.id(), name, anchor, playerId, playerName, level.getGameTime());
     }
 
@@ -360,6 +377,7 @@ final class BuildPresence implements Facing {
         cancelled.add(order);
         scaffoldsOf(order);
         met.remove(order);
+        joined.remove(order);
         BuildSite site = sites.remove(order);
         if (site != null) {
             site.close();
@@ -426,7 +444,7 @@ final class BuildPresence implements Facing {
     // loaded would stay refused for good. Until then it is tried again each tick.
     @Nullable
     private BuildSite open(ServerLevel level, BlueprintBuildOrder order) {
-        Optional<Blueprint> drawing = book.blueprint(order.blueprintId());
+        Optional<Blueprint> drawing = book.target(level, order.blueprintId());
         BuildTarget target = cancelled.contains(order.id()) || drawing.isEmpty()
             ? new BuildTarget(order.anchor().realm(), Map.of())
             : BuildTarget.of(order, drawing.get()).in(level);
@@ -435,7 +453,7 @@ final class BuildPresence implements Facing {
         }
         BuildSite site = new BuildSite(order.id(), asks, target, scaffoldsOf(order.id()));
         sites.put(order.id(), site);
-        site.start(level, met.getOrDefault(order.id(), Set.of()));
+        site.start(level, met.getOrDefault(order.id(), Set.of()), joined.getOrDefault(order.id(), Set.of()));
         untallied.add(order.id());
         tallyOne(level, order, site);
         return site;
@@ -468,12 +486,12 @@ final class BuildPresence implements Facing {
     }
 
     private void tallyOne(ServerLevel level, BlueprintBuildOrder order, BuildSite site) {
-        Optional<Blueprint> drawing = book.blueprint(order.blueprintId());
-        site.progress(drawing.flatMap(blueprint -> BuildOrderView.of(level, order, blueprint)));
+        Optional<Blueprint> drawing = book.target(level, order.blueprintId());
+        site.progress(BuildOrderView.of(order.id(), site.target(), site.metCells(), site.metJoints()));
         if (cancelled.contains(order.id()) || drawing.isEmpty()) {
             owed.remove(order.id());
         } else {
-            owed.put(order.id(), BuildOrderView.owed(level, order, drawing.get()));
+            owed.put(order.id(), BuildOrderView.owed(level, site.target(), site.metCells()));
         }
     }
 
@@ -507,6 +525,7 @@ final class BuildPresence implements Facing {
     private void retire(UUID order) {
         owed.remove(order);
         met.remove(order);
+        joined.remove(order);
         untallied.remove(order);
         if (drafted.remove(order) != null) {
             keep();
@@ -530,8 +549,10 @@ final class BuildPresence implements Facing {
             if (cancelled.contains(order.id()) || !order.anchor().in(level)) {
                 continue;
             }
-            book.blueprint(order.blueprintId())
-                .ifPresent(drawing -> owed.addAll(BuildOrderView.pending(level, order, drawing)));
+            BuildSite site = sites.get(order.id());
+            if (site != null) {
+                owed.addAll(BuildOrderView.pending(level, site.target(), site.metCells(), site.metJoints()));
+            }
         }
         return List.copyOf(owed);
     }

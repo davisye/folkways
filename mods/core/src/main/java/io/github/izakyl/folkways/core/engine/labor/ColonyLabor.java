@@ -15,9 +15,6 @@ import io.github.izakyl.folkways.core.api.work.Urge;
 import io.github.izakyl.folkways.core.api.work.WorkProgress;
 import io.github.izakyl.folkways.core.api.work.Worker;
 import io.github.izakyl.folkways.core.api.work.Workshop;
-import io.github.izakyl.folkways.core.api.work.batch.BatchSession;
-import io.github.izakyl.folkways.core.engine.batch.BatchExecution;
-import io.github.izakyl.folkways.core.engine.batch.BatchHolds;
 import io.github.izakyl.folkways.core.engine.colony.ColonyData;
 import io.github.izakyl.folkways.core.engine.colony.ColonySnapshot;
 import io.github.izakyl.folkways.core.engine.colony.ColonyWays;
@@ -79,7 +76,8 @@ public final class ColonyLabor implements ColonyWorks.Listening {
     private final Map<UUID, Personal> personalRequests = new LinkedHashMap<>();
     private final Set<UUID> reportedFailures = new LinkedHashSet<>();
     private final Inbox inbox = new Inbox();
-    private final Pipeline pipeline = new Pipeline(inbox, new Planner(new Claims(), new Cooldowns()), new Scheduler());
+    private final Pipeline pipeline = new Pipeline(inbox, new Planner(new Claims(), new Cooldowns()), new Scheduler(),
+        this::planningProblem);
     private final Runners runners = new Runners(this::arrived);
     private final Urges urges = new Urges();
     private final Salvage salvage = new Salvage();
@@ -106,17 +104,24 @@ public final class ColonyLabor implements ColonyWorks.Listening {
     private final WeaveView graph = new WeaveView();
     // Actual execution survives route changes while its physical output awaits the planner hand-off.
     private final Map<UUID, UUID> inputWorkers = new LinkedHashMap<>();
-    private final Map<UUID, BatchExecution> batches = new LinkedHashMap<>();
     private final Set<UUID> declined = new LinkedHashSet<>();
     private final Map<UUID, Tour> tours = new LinkedHashMap<>();
     private Schedule schedule = Schedule.EMPTY;
     private Diagnosis diagnosis = Diagnosis.NOTHING;
     private long submittedNodes;
+    private long lastScheduleNanos;
+    private long limitedSchedules;
 
     public ColonyLabor(ColonyData colony, ResourceKey<Level> dimension) {
         this.colony = colony;
         this.dimension = dimension;
         colony.works().listen(dimension, this);
+    }
+
+    private void planningProblem(String stage, String error) {
+        LaborIncident.publish(colony.colonyId(), dimension, "planning/" + stage,
+            net.minecraft.network.chat.Component.translatable("folkways.debug.incident.planning",
+                dimension.location().toString() + "/" + stage, error));
     }
 
     @Override
@@ -170,7 +175,6 @@ public final class ColonyLabor implements ColonyWorks.Listening {
         runners.close(this);
         phases.retain(Set.of());
         inputWorkers.clear();
-        batches.clear();
         personal.retain(Set.of());
         personalRequests.clear();
         endings.clear();
@@ -228,7 +232,6 @@ public final class ColonyLabor implements ColonyWorks.Listening {
     }
 
     private void ending(UUID node, Ending how) {
-        batches.remove(node);
         if (!closed) {
             endings.add(new Ended(node, how));
         }
@@ -271,7 +274,7 @@ public final class ColonyLabor implements ColonyWorks.Listening {
         Ways ways = ColonyWays.of(colony, level);
         List<Workshop> workshops = new ArrayList<>(colony.works().workshopsIn(dimension));
         salvage.workshop().ifPresent(workshops::add);
-        Known known = BatchHolds.exclude(survey.known(ways, List.copyOf(workshops)), batchOutputHolds());
+        Known known = survey.known(ways, List.copyOf(workshops));
         readout.froze(known.hands().size(), inbox.size());
         pipeline.weave(lanes.weave(), lanes.schedule(), known, level.getGameTime(),
             (batch, woven) -> woven(level, batch, woven), this::laid);
@@ -340,6 +343,11 @@ public final class ColonyLabor implements ColonyWorks.Listening {
             personal.forget(doing.id());
             return;
         }
+        runner.interruptedWork().ifPresent(interrupted -> LaborIncident.work(colony.colonyId(), level, body,
+            interrupted, "urge-preempts/" + keenest.get().id(),
+            net.minecraft.network.chat.Component.translatable("folkways.debug.incident.preempted",
+                keenest.get().id().toString(), LaborIncident.job(doing), LaborIncident.target(level, doing),
+                LaborIncident.surroundings(body))));
         runner.letGo(this, level, body, "urge-preempts");
         personalRequests.put(doing.id(), new Personal(body.id(), keenest.get().id()));
         runner.offer(this, level, body, keenest.get(), doing);
@@ -359,28 +367,8 @@ public final class ColonyLabor implements ColonyWorks.Listening {
             if (vertex != null && vertex.node().worker().isPresent()) return vertex.node().worker().get();
             UUID pinned = graph.pin(node);
             return pinned != null ? pinned : assigned.get(node);
-        }, node -> {
-            Vertex vertex = graph.vertex(node);
-            if (vertex == null) return List.of();
-            BatchExecution batch = batches.get(node);
-            return batch == null ? vertex.plan().draws() : batch.remainingDraws(vertex.plan().draws());
-        }, node -> {
-            BatchExecution batch = batches.get(node);
-            return batch == null ? List.of() : batch.outputHolds();
         });
     }
-
-    private List<io.github.izakyl.folkways.core.api.work.ReservedInput> batchOutputHolds() {
-        return batches.entrySet().stream().filter(entry -> phases.of(entry.getKey()) == NodeState.WORKING)
-            .flatMap(entry -> entry.getValue().outputHolds().stream()).toList();
-    }
-
-    BatchExecution batch(Node parent) {
-        if (!(parent.spec().workload() instanceof BatchSession)) return null;
-        return batches.computeIfAbsent(parent.id(), ignored -> new BatchExecution(parent));
-    }
-
-    BatchExecution existingBatch(UUID parent) { return batches.get(parent); }
     private void woven(ServerLevel level, List<Message> batch, Planner.Woven woven) {
         WeaveDelta delta = woven.delta();
         Set<UUID> withdrawn = new LinkedHashSet<>();
@@ -484,6 +472,13 @@ public final class ColonyLabor implements ColonyWorks.Listening {
     // What the schedule laid, applied: every route is followed afresh from now on, so work a runner let go of
     // is taken up again whether or not its route changed.
     private void laid(Scheduler.Scheduled laid) {
+        lastScheduleNanos = laid.timing().scheduleNanos();
+        if (laid.timing().limited()) {
+            limitedSchedules++;
+            LaborIncident.publish(colony.colonyId(), dimension, "fallback",
+                net.minecraft.network.chat.Component.translatable("folkways.debug.incident.fallback",
+                    dimension.location().toString(), laid.timing().scheduleNanos() / 1_000_000, limitedSchedules));
+        }
         laid.changed().forEach((resident, tour) -> {
             if (tour.nodes().isEmpty()) {
                 tours.remove(resident);
@@ -842,7 +837,25 @@ public final class ColonyLabor implements ColonyWorks.Listening {
 
     String heartbeat() {
         return readout.line(graph.vertices(), phases, schedule, diagnosis, runners,
-            pipeline.busyFor(Util.getNanos()));
+            pipeline.busyFor(Util.getNanos())) + " limited=" + limitedSchedules;
+    }
+
+    LaborSnapshot snapshot(ServerLevel level) {
+        Map<String, Integer> shortages = new java.util.TreeMap<>();
+        for (Shortfall shortfall : diagnosis.shortfalls()) {
+            shortages.merge(Readout.name(shortfall.why()), 1, Integer::sum);
+        }
+        List<String> examples = new ArrayList<>();
+        for (Unassigned unassigned : diagnosis.unassigned()) {
+            Vertex vertex = graph.vertex(unassigned.node());
+            if (vertex != null) {
+                examples.add(unassigned.why() + "/" + vertex.node().spec().owner() + "/"
+                    + vertex.node().getClass().getSimpleName() + "@" + vertex.node().spec().site().where());
+                if (examples.size() == 3) break;
+            }
+        }
+        return new LaborSnapshot(census(level), pipeline.busyFor(Util.getNanos()) / 1_000_000,
+            lastScheduleNanos / 1_000_000, limitedSchedules, shortages, examples);
     }
 
     long solvingFor(long now) {

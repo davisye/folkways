@@ -20,14 +20,6 @@ import io.github.izakyl.folkways.core.api.work.Unmet;
 import io.github.izakyl.folkways.core.api.work.WorkEffort;
 import io.github.izakyl.folkways.core.api.work.Worker;
 import io.github.izakyl.folkways.core.api.work.Workload;
-import io.github.izakyl.folkways.core.api.work.Staged;
-import io.github.izakyl.folkways.core.api.work.batch.BatchAction;
-import io.github.izakyl.folkways.core.api.work.batch.BatchCommit;
-import io.github.izakyl.folkways.core.api.work.batch.BatchSession;
-import io.github.izakyl.folkways.core.api.work.batch.BatchSpec;
-import io.github.izakyl.folkways.core.api.work.batch.InventoryTransfer;
-import io.github.izakyl.folkways.core.api.work.batch.StepReceipt;
-import io.github.izakyl.folkways.core.api.work.batch.StepResult;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -39,9 +31,9 @@ import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.item.ItemStack;
 
 /** An optional native clothing benefit around one task, using the existing physical borrowing pool. */
-class ClothingWork implements Node, Workload.Within {
+final class ClothingWork implements Node, Workload.Within {
     private final TaskTools service;
-    protected final Node original;
+    private final Node original;
     private final CookeryGear.Request request;
     private final NodeSpec spec;
     private final int loanRoom;
@@ -54,14 +46,9 @@ class ClothingWork implements Node, Workload.Within {
     private boolean resolved;
     private boolean dressed;
     private boolean actionIssued;
-    protected boolean workDone;
-    protected boolean complete;
-    protected RefusalKind failure;
-
-    static ClothingWork of(TaskTools service, Node original, CookeryGear.Request request) {
-        return original.spec().workload() instanceof BatchSession
-            ? new Batched(service, original, request) : new ClothingWork(service, original, request);
-    }
+    private boolean workDone;
+    private boolean complete;
+    private RefusalKind failure;
 
     ClothingWork(TaskTools service, Node original, CookeryGear.Request request) {
         this.service = service;
@@ -173,8 +160,8 @@ class ClothingWork implements Node, Workload.Within {
         }
         if (!workDone) {
             if (original.spec().workload() instanceof Within within) {
-                Turn turn = delegatedTurn(level, who, within);
-                if (turn instanceof Turn.Piece piece) return new Turn.Piece(action(piece.node()));
+                Turn turn = within.next(level, who);
+                if (turn instanceof Turn.Piece piece) return new Turn.Piece(new Action(piece.node()));
                 if (turn instanceof Turn.Wait) return WAIT;
                 workDone = true;
             } else if (original.spec().workload() instanceof Workload.Once
@@ -207,10 +194,6 @@ class ClothingWork implements Node, Workload.Within {
         }
         complete = true;
         return LEAVE;
-    }
-
-    protected Turn delegatedTurn(ServerLevel level, Worker who, Within within) {
-        return within.next(level, who);
     }
 
     private void resolve(io.github.izakyl.folkways.core.api.resident.body.Body body) {
@@ -339,13 +322,7 @@ class ClothingWork implements Node, Workload.Within {
         if (original.spec().workload() instanceof Within || !actionIssued) original.released(level, who, how);
     }
 
-    private Node action(Node node) {
-        if (node instanceof InventoryTransfer) return new TransferAction(node);
-        if (node instanceof Staged) return node instanceof BatchAction ? new StagedAcceptedAction(node) : new StagedAction(node);
-        return node instanceof BatchAction ? new AcceptedAction(node) : new Action(node);
-    }
-
-    private class Action implements Node {
+    private final class Action implements Node {
         private final Node delegate;
         private final NodeSpec spec;
         Action(Node delegate) {
@@ -366,86 +343,15 @@ class ClothingWork implements Node, Workload.Within {
         public void changed(ServerLevel level, NodeState state) { delegate.changed(level, state); }
         public boolean settled(ServerLevel level) { return delegate.settled(level); }
         public Outcome commit(ServerLevel level, Worker who) {
-            return executeDelegate(level, who).outcome();
-        }
-        BatchCommit executeDelegate(ServerLevel level, Worker who) {
-            if (!clothed(who) || refusal(level).isPresent()) return BatchCommit.of(Outcome.failed(CookeryRefusal.NOTHING_TO_WORK_WITH));
+            if (!clothed(who) || refusal(level).isPresent()) return Outcome.failed(CookeryRefusal.NOTHING_TO_WORK_WITH);
             try {
-                return delegate instanceof BatchAction action ? action.execute(level, who)
-                    : BatchCommit.of(delegate.commit(level, who));
+                return delegate.commit(level, who);
             } finally {
                 for (KitchenTools.Lease lease : loans.values()) {
                     ItemStack actual = LoanClothing.held(service, who.body(), lease);
                     if (!actual.isEmpty()) service.record(lease, actual);
                 }
             }
-        }
-    }
-
-    private final class AcceptedAction extends Action implements BatchAction {
-        AcceptedAction(Node delegate) { super(delegate); }
-        public BatchCommit execute(ServerLevel level, Worker who) { return executeDelegate(level, who); }
-    }
-
-    private final class TransferAction extends Action implements InventoryTransfer {
-        TransferAction(Node delegate) { super(delegate); }
-    }
-
-    private class StagedAction extends Action implements Staged {
-        private final Staged staged;
-        StagedAction(Node delegate) { super(delegate); staged = (Staged) delegate; }
-        public Drawn draw(ServerLevel level, Worker who) { return staged.draw(level, who); }
-        public void restore(ServerLevel level, Worker who, List<ItemStack> goods) { staged.restore(level, who, goods); }
-    }
-
-    private final class StagedAcceptedAction extends StagedAction implements BatchAction {
-        StagedAcceptedAction(Node delegate) { super(delegate); }
-        public BatchCommit execute(ServerLevel level, Worker who) { return executeDelegate(level, who); }
-    }
-
-    private static final class Batched extends ClothingWork implements BatchSession {
-        private StepResult delegated;
-        private final BatchSession batch;
-
-        Batched(TaskTools service, Node original, CookeryGear.Request request) {
-            super(service, original, request);
-            batch = (BatchSession) original.spec().workload();
-        }
-        public BatchSpec batch() { return batch.batch(); }
-        public boolean drainsAfterFailure() { return true; }
-
-        @Override
-        protected Turn delegatedTurn(ServerLevel level, Worker who, Within within) {
-            delegated = batch.advance(level, who);
-            return switch (delegated) {
-                case StepResult.Step step -> new Turn.Piece(step.node());
-                case StepResult.Auxiliary auxiliary -> new Turn.Piece(auxiliary.node());
-                case StepResult.Wait ignored -> WAIT;
-                case StepResult.Pause ignored -> WAIT;
-                case StepResult.Complete ignored -> LEAVE;
-                case StepResult.Failed failed -> { failure = failed.why(); yield LEAVE; }
-            };
-        }
-        public StepResult advance(ServerLevel level, Worker who) {
-            delegated = null;
-            Turn turn = super.next(level, who);
-            if (turn instanceof Turn.Piece piece) {
-                return delegated instanceof StepResult.Step step ? new StepResult.Step(step.key(), piece.node())
-                    : new StepResult.Auxiliary(piece.node());
-            }
-            if (turn instanceof Turn.Wait) {
-                return delegated instanceof StepResult.Pause pause ? pause
-                    : delegated instanceof StepResult.Wait wait ? wait : new StepResult.Wait(10);
-            }
-            return new StepResult.Complete();
-        }
-        public void settled(ServerLevel level, StepReceipt receipt) {
-            batch.settled(level, receipt);
-            receipt.stop().ifPresent(why -> { failure = why; workDone = true; });
-        }
-        public Outcome finish(ServerLevel level, Worker who) {
-            if (!complete) return Outcome.failed(CookeryRefusal.STATION_BUSY);
-            return failure == null ? batch.finish(level, who) : Outcome.failed(failure);
         }
     }
 }

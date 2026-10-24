@@ -1,7 +1,7 @@
 // What every Folkways mod project shares. A project sets modId and modName before applying this.
 
 group = project.maven_group
-version = project.mod_version
+version = rootProject.buildVersion
 
 base {
     archivesName = "${project.modName}-neoforge-${project.minecraft_version}"
@@ -51,8 +51,7 @@ ext.lib = { String name ->
     files(paths.collect { rootProject.file(it) })
 }
 
-// The game tests of every mod run together (the root's gameTestServer), so a mod's tests may lean on the mods
-// above it and on the core's fixtures.
+// Optional integration tests reuse their own mod's tests; cross-mod helpers have a separate fixtures output.
 dependencies {
     gametestImplementation sourceSets.main.output
     cookeryTestImplementation sourceSets.main.output
@@ -78,6 +77,8 @@ def expanded = [
     "minecraft_requirement": project.minecraft_requirement,
     "neoforge_requirement": project.neoforge_requirement,
     "ldlib_requirement": project.ldlib_requirement,
+    "diagnostics_mixins": (project.modId == "folkways_core" && rootProject.diagnosticsBuild
+        ? '[[mixins]]\nconfig = "folkways-diagnostics.mixins.json"' : ""),
 ]
 
 processResources {

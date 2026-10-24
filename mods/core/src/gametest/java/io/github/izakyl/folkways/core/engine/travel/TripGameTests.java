@@ -9,6 +9,9 @@ import io.github.izakyl.folkways.core.api.passage.Passage;
 import io.github.izakyl.folkways.core.api.resident.Conveyance;
 import io.github.izakyl.folkways.core.api.resident.Going;
 import io.github.izakyl.folkways.core.api.resident.Resident;
+import io.github.izakyl.folkways.core.api.resident.Locomotion;
+import io.github.izakyl.folkways.core.api.resident.Search;
+import io.github.izakyl.folkways.core.api.terms.Closures;
 import io.github.izakyl.folkways.core.api.terms.RefusalKind;
 import io.github.izakyl.folkways.core.api.terms.WorldPos;
 import io.github.izakyl.folkways.core.api.terms.WorldSpaces;
@@ -27,6 +30,8 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.Mob;
+import net.minecraft.world.level.pathfinder.NodeEvaluator;
+import net.minecraft.world.level.levelgen.structure.BoundingBox;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.event.RegisterGameTestsEvent;
@@ -139,6 +144,45 @@ public final class TripGameTests {
         published.set(answer(Faring.yes(Journey.afoot(0, Set.of(goal)))));
         helper.assertTrue(trip.step(helper.getLevel(), mob, Set.of(goal)) instanceof Going.Arrived,
             "a confirmed walking route must still complete normally");
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty")
+    public static void aFailedNativeWalkOutOfClosedGroundDoesNotTeleportTheBody(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        Mob mob = helper.spawnWithNoFreeWill(EntityType.ZOMBIE, new BlockPos(1, 2, 1));
+        WorldPos from = WorldSpaces.at(mob);
+        WorldPos outside = from.at(from.cell().offset(5, 0, 0));
+        WorldPos goal = from.at(from.cell().offset(8, 0, 0));
+        var originalPosition = mob.position();
+        Runnable reopen = Closures.close(level, BoundingBox.fromCorners(mob.blockPosition().offset(-1, -1, -1),
+            mob.blockPosition().offset(1, 1, 1)));
+        try {
+            Locomotion failingWalk = new Locomotion() {
+                public ResourceLocation id() { return Walking.INSTANCE.id(); }
+                public NodeEvaluator newEvaluator(Search search) { return Walking.INSTANCE.newEvaluator(search); }
+                public void fit(Mob body) { Walking.INSTANCE.fit(body); }
+                public Conveyance along(double speed, RefusalKind lost) {
+                    return new Conveyance() {
+                        public void setOut(ServerLevel at, Mob body, Set<WorldPos> to) { }
+                        public Going step(ServerLevel at, Mob body, Set<WorldPos> to) { return new Going.Failed(lost); }
+                        public void release(ServerLevel at, Mob body) { }
+                    };
+                }
+            };
+            Journey route = new Journey(40, 0, List.of(Leg.afoot(Set.of(outside)), Leg.afoot(Set.of(goal))));
+            Resident who = new Resident(mob.getUUID(), ResourceLocation.parse("folkways:resident"));
+            Trip trip = Trip.to(() -> answer(Faring.yes(route)), who, failingWalk, mob, Set.of(goal), 1, LOST)
+                .orElseThrow();
+            trip.setOut(level, mob, Set.of(goal));
+            helper.assertTrue(trip.step(level, mob, Set.of(goal)) instanceof Going.Failed failed && failed.why() == LOST,
+                "an unreachable native segment preserves its original failure");
+            helper.assertValueEqual(mob.position(), originalPosition,
+                "a failed first native segment never moves the body to an outside waypoint");
+            trip.release(level, mob);
+        } finally {
+            reopen.run();
+        }
         helper.succeed();
     }
 

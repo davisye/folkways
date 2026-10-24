@@ -42,6 +42,27 @@ public final class StructureNbtGameTests {
         event.register(StructureNbtGameTests.class);
     }
 
+    @GameTest(template = "empty", timeoutTicks = 10)
+    public static void flowingBlueprintCellsKeepTheirUnconstrainedMeaning(GameTestHelper helper) {
+        var level = helper.getLevel();
+        BlockPos pos = helper.absolutePos(new BlockPos(1, 1, 1));
+        var flowing = Blocks.WATER.defaultBlockState()
+            .setValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.LEVEL, 1);
+        Blueprint resolved = new Blueprint(UUID.randomUUID(), "flow", java.util.List.of(
+            new BlueprintBlock(BlockPos.ZERO, flowing)), BlueprintVolume.of(1, 1, 1).orElseThrow(), 0L).confirm(level);
+        helper.assertTrue(resolved.blocks().isEmpty(), "resolution excludes flow cells from construction targets");
+        BuildTarget target = new BuildTarget(io.github.izakyl.folkways.core.api.terms.WorldPos.of(level, pos).realm(),
+            java.util.Map.of());
+        SiteRig rig = SiteRig.start(level, target);
+        helper.assertTrue(rig.site.complete(), "an unconstrained flow cell needs no construction");
+        level.setBlock(pos, Blocks.WATER.defaultBlockState(), 2);
+        rig.site.tick(level);
+        helper.assertTrue(rig.site.complete() && rig.site.pieces().isEmpty(),
+            "later fluid simulation cannot introduce work for an unconstrained cell");
+        rig.site.close();
+        helper.succeed();
+    }
+
     @GameTest(template = TEMPLATE, timeoutTicks = 80)
     public static void whatAirMeansIsTheImporterSChoice(GameTestHelper helper) {
         CompoundTag file = fileOf(Blocks.STONE.defaultBlockState(), Blocks.AIR.defaultBlockState());
@@ -150,6 +171,69 @@ public final class StructureNbtGameTests {
                 .equals(stairs.setValue(BlockStateProperties.HORIZONTAL_FACING, Direction.EAST))),
             "facing the way the blueprint was turned");
         helper.succeed();
+    }
+
+    @GameTest(template = TEMPLATE, timeoutTicks = 80)
+    public static void blockEntityConfigurationSurvivesImportSaveAndTurning(GameTestHelper helper) {
+        CompoundTag file = fileOf(Blocks.OAK_SIGN.defaultBlockState(), Blocks.STONE.defaultBlockState());
+        CompoundTag configuration = new CompoundTag();
+        configuration.putString("CustomName", "{\"text\":\"Workshop\"}");
+        file.getList("blocks", 10).getCompound(0).put("nbt", configuration);
+        Blueprint imported = read(helper, file).orElseThrow();
+        Blueprint turned = imported.transformed(Rotation.CLOCKWISE_90, Mirror.FRONT_BACK).orElseThrow();
+        Blueprint reloaded = Blueprint.load(Reader.of(turned.save(helper.getLevel().registryAccess())),
+            helper.getLevel().registryAccess()).orElseThrow();
+        BlueprintBlock sign = reloaded.blocks().stream().filter(cell -> cell.state().is(Blocks.OAK_SIGN))
+            .findFirst().orElseThrow();
+        helper.assertValueEqual(sign.data().tag(), configuration, "block entity data survives the complete pipeline");
+        helper.assertValueEqual(sign.data().turns().size(), 1, "the configuration remembers its transformation");
+        configuration.putString("CustomName", "changed source");
+        helper.assertTrue(!sign.data().tag().equals(configuration), "blueprints own their configuration data");
+        helper.succeed();
+    }
+
+    @GameTest(template = TEMPLATE, timeoutTicks = 80)
+    public static void trustedConfigurationIsPlaced(GameTestHelper helper) {
+        net.minecraft.server.level.ServerLevel level = helper.getLevel();
+        BlockPos source = helper.absolutePos(new BlockPos(1, 2, 1));
+        BlockPos destination = helper.absolutePos(new BlockPos(3, 2, 1));
+        level.setBlockAndUpdate(source.below(), Blocks.STONE.defaultBlockState());
+        level.setBlockAndUpdate(destination.below(), Blocks.STONE.defaultBlockState());
+        BlockState state = Blocks.OAK_SIGN.defaultBlockState();
+        level.setBlockAndUpdate(source, state);
+        net.minecraft.world.level.block.entity.SignBlockEntity sign =
+            (net.minecraft.world.level.block.entity.SignBlockEntity) level.getBlockEntity(source);
+        sign.setText(sign.getFrontText().setMessage(0, net.minecraft.network.chat.Component.literal("Workshop")), true);
+        BlockData data = BlockData.of(sign.saveWithFullMetadata(level.registryAccess()));
+        fire(level, destination, state, data);
+        net.minecraft.world.level.block.entity.SignBlockEntity placed =
+            (net.minecraft.world.level.block.entity.SignBlockEntity) level.getBlockEntity(destination);
+        helper.assertValueEqual(placed.getFrontText().getMessage(0, false).getString(), "Workshop",
+            "schematic placement restores sign text");
+        helper.succeed();
+    }
+
+    @GameTest(template = TEMPLATE, timeoutTicks = 80)
+    public static void containerContentsAreNotCreatedFromBlueprintNbt(GameTestHelper helper) {
+        net.minecraft.server.level.ServerLevel level = helper.getLevel();
+        BlockPos source = helper.absolutePos(new BlockPos(1, 2, 1));
+        BlockPos destination = helper.absolutePos(new BlockPos(3, 2, 1));
+        BlockState state = Blocks.CHEST.defaultBlockState();
+        level.setBlockAndUpdate(source, state);
+        net.minecraft.world.level.block.entity.ChestBlockEntity chest =
+            (net.minecraft.world.level.block.entity.ChestBlockEntity) level.getBlockEntity(source);
+        chest.setItem(0, new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.DIAMOND, 32));
+        BlockData data = BlockData.of(chest.saveWithFullMetadata(level.registryAccess()));
+        fire(level, destination, state, data);
+        net.minecraft.world.Container placed = (net.minecraft.world.Container) level.getBlockEntity(destination);
+        helper.assertTrue(placed.isEmpty(), "schematic configuration must not copy inventory contents");
+        helper.succeed();
+    }
+
+    private static void fire(net.minecraft.server.level.ServerLevel level, BlockPos pos, BlockState state,
+            BlockData data) {
+        SchematicPlacement.adapter().fire(level, SchematicPlacement.Launch.of(pos, java.util.Set.of(pos)),
+            cell -> state, cell -> data, net.minecraft.world.item.ItemStack.EMPTY);
     }
 
     private static Optional<Blueprint> read(GameTestHelper helper, CompoundTag file) {

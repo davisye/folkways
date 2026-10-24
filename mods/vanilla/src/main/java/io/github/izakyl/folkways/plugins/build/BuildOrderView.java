@@ -6,21 +6,24 @@ import io.github.izakyl.folkways.front.api.Ghost;
 import io.github.izakyl.folkways.plugins.build.draft.Joint;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.material.Fluids;
 
 public record BuildOrderView(UUID id, BlockPos min, BlockPos max, int placed, int total) {
 
-    static Optional<BuildOrderView> of(ServerLevel level, BlueprintBuildOrder order, Blueprint blueprint) {
-        BuildTarget target = BuildTarget.of(order, blueprint).in(level);
-        if (target.cells().isEmpty() && target.unloaded().isEmpty() || !order.anchor().in(level)) {
+    static Optional<BuildOrderView> of(UUID order, BuildTarget target, Set<BlockPos> met, Set<Joint> joined) {
+        if (target.cells().isEmpty() && target.unloaded().isEmpty()) {
             return Optional.empty();
         }
         int minX = Integer.MAX_VALUE;
@@ -40,45 +43,42 @@ public record BuildOrderView(UUID id, BlockPos min, BlockPos max, int placed, in
             maxY = Math.max(maxY, pos.getY());
             maxZ = Math.max(maxZ, pos.getZ());
             BlockState wanted = target.cells().get(pos);
-            if (wanted != null && level.hasChunkAt(pos) && BuildPlanner.satisfied(level.getBlockState(pos), wanted)) {
+            if (wanted != null && met.contains(pos)) {
                 placed++;
             }
         }
         int total = cells.size() + target.joints().size();
         for (Joint joint : target.joints()) {
-            if (level.hasChunkAt(joint.from()) && Joints.joiner().joined(level, joint.from(), joint.to())) {
+            if (joined.contains(joint)) {
                 placed++;
             }
         }
-        return Optional.of(new BuildOrderView(order.id(),
+        return Optional.of(new BuildOrderView(order,
             new BlockPos(minX, minY, minZ), new BlockPos(maxX, maxY, maxZ), placed, total));
     }
 
-    static List<Ghost> pending(ServerLevel level, BlueprintBuildOrder order, Blueprint blueprint) {
-        BuildTarget target = BuildTarget.of(order, blueprint).in(level);
-        if (!order.anchor().in(level)) {
-            return List.of();
-        }
+    static List<Ghost> pending(ServerLevel level, BuildTarget target, Set<BlockPos> met, Set<Joint> joined) {
         List<Ghost> owed = new ArrayList<>();
+        Map<BlockPos, SchematicPlacement.Launch> shots = target.shots();
         for (Map.Entry<BlockPos, BlockState> cell : target.cells().entrySet()) {
             BlockPos pos = cell.getKey();
             BlockState wanted = cell.getValue();
-            if (wanted.isAir() || BuildPlanner.unlayable(target.footprint(pos)) || !level.hasChunkAt(pos)) {
+            SchematicPlacement.Launch shot = shots.get(pos);
+            if (met.contains(pos) || wanted.isAir() || shot == null || !level.hasChunkAt(pos)
+                || target.costs(level, shot, met).isEmpty()) {
                 continue;
             }
-            if (!BuildPlanner.satisfied(level.getBlockState(pos), wanted)) {
-                owed.add(new Ghost(pos, wanted));
-            }
+            owed.add(new Ghost(pos, wanted));
         }
         for (Joint joint : target.joints()) {
             BlockState start = target.cells().get(joint.from());
             BlockState end = target.cells().get(joint.to());
-            if (start == null || end == null || !level.hasChunkAt(joint.from()) || !level.hasChunkAt(joint.to())
-                || Joints.joiner().joined(level, joint.from(), joint.to())) {
+            if (joined.contains(joint) || start == null || end == null
+                || !level.hasChunkAt(joint.from()) || !level.hasChunkAt(joint.to())) {
                 continue;
             }
             Joints.sketch(joint.from(), start, joint.to(), end).forEach((pos, state) -> {
-                if (level.getBlockState(pos).canBeReplaced()) {
+                if (!met.contains(pos) && level.getBlockState(pos).canBeReplaced()) {
                     owed.add(new Ghost(pos, state));
                 }
             });
@@ -86,25 +86,25 @@ public record BuildOrderView(UUID id, BlockPos min, BlockPos max, int placed, in
         return List.copyOf(owed);
     }
 
-    static Map<ResourceLocation, Long> owed(ServerLevel level, BlueprintBuildOrder order, Blueprint blueprint) {
+    static Map<ResourceLocation, Long> owed(ServerLevel level, BuildTarget target, Set<BlockPos> met) {
         Map<ResourceLocation, Long> owed = new LinkedHashMap<>();
-        if (!order.anchor().in(level)) {
-            return owed;
-        }
-        BuildTarget target = BuildTarget.of(order, blueprint).in(level);
-        for (Map.Entry<BlockPos, BlockState> cell : target.cells().entrySet()) {
-            BlockPos pos = cell.getKey();
-            if (cell.getValue().isAir() || !level.hasChunkAt(pos)
-                || BuildPlanner.satisfied(level.getBlockState(pos), cell.getValue())) {
+        Set<BlockPos> quoted = new LinkedHashSet<>();
+        for (SchematicPlacement.Launch shot : target.shots().values()) {
+            BlockPos anchor = shot.anchor();
+            if (!quoted.add(anchor) || met.contains(anchor) || !level.hasChunkAt(anchor)
+                || target.satisfied(level, anchor)) {
                 continue;
             }
-            Footprint print = target.footprint(pos);
-            if (!print.anchor().equals(pos) || BuildPlanner.unlayable(print)) {
-                continue;
-            }
-            for (Need need : Costs.of(print).orElse(List.of())) {
+            for (Need need : target.costs(level, shot, met).orElse(List.of())) {
                 Goods.members(need.spec()).stream().findFirst().ifPresent(item ->
                     owed.merge(BuiltInRegistries.ITEM.getKey(item), need.count(), Long::sum));
+            }
+            // A waterlogged block laid where no water stands has a bucket let into it after.
+            for (BlockPos cell : shot.produces()) {
+                if (!met.contains(cell) && Step.soaked(target.wanted(cell))
+                        && level.getFluidState(cell).getType() != Fluids.WATER) {
+                    owed.merge(BuiltInRegistries.ITEM.getKey(Items.WATER_BUCKET), 1L, Long::sum);
+                }
             }
         }
         return owed;

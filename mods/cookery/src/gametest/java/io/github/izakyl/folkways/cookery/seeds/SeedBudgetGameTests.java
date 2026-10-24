@@ -2,6 +2,7 @@ package io.github.izakyl.folkways.cookery.seeds;
 
 import com.github.ysbbbbbb.kaleidoscopecookery.init.ModItems;
 import io.github.izakyl.folkways.FolkwaysMod;
+import io.github.izakyl.folkways.plugins.compost.SeedBudget;
 import io.github.izakyl.folkways.core.api.terms.Goods;
 import io.github.izakyl.folkways.plugins.farming.CropSeeds;
 import java.util.List;
@@ -39,48 +40,6 @@ public final class SeedBudgetGameTests {
     }
 
     @GameTest(template = "empty")
-    public static void duplicateInventoryViewsAndDuplicateNodeClaimsNeverIncreaseTheAllowance(GameTestHelper helper) {
-        var place = SeedBudget.Location.pack(UUID.randomUUID());
-        var stock = stock("one real pack", place, 100);
-        UUID node = UUID.randomUUID();
-        var claim = new SeedBudget.Claim(node, place, Goods.specOf(Items.WHEAT_SEEDS.getDefaultInstance()), 20);
-        SeedBudget budget = budget(new SeedBudget.Snapshot(List.of(stock, stock), List.of(claim, claim), List.of(), Map.of()));
-        var tally = budget.tally(Items.WHEAT_SEEDS);
-        helper.assertValueEqual(tally.physical(), 100L, "two views describe a single physical stack total");
-        helper.assertValueEqual(tally.committed(), 20L, "one node's repeated observation is one claim");
-        helper.assertValueEqual(tally.compostable(), 16L, "only unclaimed surplus above one actual seed stack is available");
-        helper.succeed();
-    }
-
-    @GameTest(template = "empty")
-    public static void storeAndTransitClaimsClampToTheirActualPhysicalLocations(GameTestHelper helper) {
-        var warehouse = SeedBudget.Location.pack(UUID.randomUUID());
-        var transit = SeedBudget.Location.pack(UUID.randomUUID());
-        var goods = Goods.specOf(Items.WHEAT_SEEDS.getDefaultInstance());
-        SeedBudget budget = budget(new SeedBudget.Snapshot(List.of(stock("warehouse", warehouse, 50), stock("transit", transit, 50)),
-            List.of(new SeedBudget.Claim(UUID.randomUUID(), warehouse, goods, 80),
-                new SeedBudget.Claim(UUID.randomUUID(), transit, goods, 30)), List.of(), Map.of()));
-        var tally = budget.tally(Items.WHEAT_SEEDS);
-        helper.assertValueEqual(tally.physical(), 100L, "claims and transit do not create any additional goods");
-        helper.assertValueEqual(tally.committed(), 80L, "the old warehouse draw clamps at fifty, plus thirty real carried seeds");
-        helper.assertValueEqual(tally.compostable(), 0L, "in-flight seeds and the one-stack reserve are protected");
-        helper.succeed();
-    }
-
-    @GameTest(template = "empty")
-    public static void unknownClaimsSowingAndExplicitOrdersAreProtectedBeforeComposting(GameTestHelper helper) {
-        var goods = Goods.specOf(Items.WHEAT_SEEDS.getDefaultInstance());
-        SeedBudget budget = budget(new SeedBudget.Snapshot(List.of(stock("pack", SeedBudget.Location.pack(UUID.randomUUID()), 150)),
-            List.of(new SeedBudget.Claim(UUID.randomUUID(), SeedBudget.Location.UNKNOWN, goods, 20)),
-            List.of(new SeedBudget.FutureNeed("new sowing cells", goods, 10), new SeedBudget.FutureNeed("new sowing cells", goods, 10),
-                new SeedBudget.FutureNeed("explicit order", goods, 5)), Map.of()));
-        var tally = budget.tally(Items.WHEAT_SEEDS);
-        helper.assertValueEqual(tally.committed(), 35L, "unknown claims and distinct outstanding requests reserve real units once");
-        helper.assertValueEqual(tally.compostable(), 51L, "compost only sees the remaining surplus after sowing, orders and reserve");
-        helper.succeed();
-    }
-
-    @GameTest(template = "empty")
     public static void rareFirstSeedsAndRiceFoodRemainProtectedAndMaintainTargetsKeepTheirMeaning(GameTestHelper helper) {
         Item rice = ModItems.RICE_SEED.get();
         var place = SeedBudget.Location.pack(UUID.randomUUID());
@@ -114,25 +73,6 @@ public final class SeedBudgetGameTests {
     }
 
     @GameTest(template = "empty")
-    public static void commitRechecksEscrowAndProtectsSeedsClaimedSincePlanning(GameTestHelper helper) {
-        UUID current = UUID.randomUUID();
-        var location = SeedBudget.Location.pack(UUID.randomUUID());
-        var goods = Goods.specOf(Items.WHEAT_SEEDS.getDefaultInstance());
-        var snapshots = new AtomicReference<>(new SeedBudget.Snapshot(List.of(stock("actual pack", location, 64)),
-            List.of(new SeedBudget.Claim(current, location, goods, 1)), List.of(), Map.of()));
-        var budget = new SeedBudget(snapshots::get, () -> Set.of(Items.WHEAT_SEEDS));
-        helper.assertTrue(budget.permits(current, new ItemStack(Items.WHEAT_SEEDS)),
-            "one physically drawn escrow plus sixty-four stored seeds gives exactly one spendable seed");
-        snapshots.set(new SeedBudget.Snapshot(List.of(stock("actual pack", location, 64)),
-            List.of(new SeedBudget.Claim(UUID.randomUUID(), location, goods, 1)), List.of(), Map.of()));
-        helper.assertTrue(!budget.permits(current, new ItemStack(Items.WHEAT_SEEDS)),
-            "a new sowing claim consumes that final allowance before compost commits");
-        snapshots.set(new SeedBudget.Snapshot(List.of(stock("actual pack", location, 63)), List.of(), List.of(), Map.of()));
-        helper.assertTrue(!budget.permits(current, new ItemStack(Items.WHEAT_SEEDS)), "the final reserve seed is never spent");
-        helper.succeed();
-    }
-
-    @GameTest(template = "empty")
     public static void alternativeTargetsProtectTheirTotalOnceAndReuseThePurposeReserve(GameTestHelper helper) {
         Item wild = ModItems.WILD_RICE_SEED.get();
         Item rice = ModItems.RICE_SEED.get();
@@ -144,30 +84,6 @@ public final class SeedBudgetGameTests {
         var budget = new SeedBudget(() -> snapshot, () -> Set.of(wild, rice));
         long surplus = budget.tally(wild).compostable() + budget.tally(rice).compostable();
         helper.assertValueEqual(surplus, 32L, "96 alternatives share one target, reusing rather than adding the purpose reserve");
-        helper.succeed();
-    }
-
-    @GameTest(template = "empty")
-    public static void distinctTargetsAddButRepeatedMetadataDoesNot(GameTestHelper helper) {
-        var goods = Goods.specOf(Items.WHEAT_SEEDS.getDefaultInstance());
-        var first = new SeedBudget.StockTarget("first pantry", goods, 80);
-        var second = new SeedBudget.StockTarget("second pantry", goods, 80);
-        var snapshot = new SeedBudget.Snapshot(List.of(stock("store", SeedBudget.Location.pack(UUID.randomUUID()), 200)),
-            List.of(), List.of(), Map.of(), List.of(first, first, second), true);
-        helper.assertValueEqual(budget(snapshot).tally(Items.WHEAT_SEEDS).compostable(), 40L,
-            "two real target boxes retain 160 seeds while one repeated view does not allocate them twice");
-        helper.succeed();
-    }
-
-    @GameTest(template = "empty")
-    public static void unloadedPhysicalInventoryStopsDestructiveWorkAndSpeculativeRestocking(GameTestHelper helper) {
-        var snapshot = new SeedBudget.Snapshot(List.of(stock("loaded pack", SeedBudget.Location.pack(UUID.randomUUID()), 100)),
-            List.of(), List.of(), Map.of(), List.of(), false);
-        var budget = budget(snapshot);
-        helper.assertValueEqual(budget.tally(Items.WHEAT_SEEDS).physical(), 100L, "loaded physical seeds remain visible");
-        helper.assertValueEqual(budget.tally(Items.WHEAT_SEEDS).compostable(), 0L, "unloaded inventory is never assumed disposable");
-        helper.assertTrue(budget.reserves().isEmpty(), "no speculative seed request is made from an incomplete snapshot");
-        helper.assertTrue(!budget.permits(UUID.randomUUID(), new ItemStack(Items.WHEAT_SEEDS)), "escrow cannot bypass unknown stock protection");
         helper.succeed();
     }
 

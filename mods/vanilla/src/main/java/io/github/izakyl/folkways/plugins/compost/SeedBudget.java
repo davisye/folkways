@@ -5,6 +5,7 @@ import io.github.izakyl.folkways.core.api.terms.ItemSpec;
 import io.github.izakyl.folkways.core.api.terms.WorldPos;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -12,11 +13,12 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Supplier;
+import java.util.function.ToIntFunction;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 
 /** A destructive consumer's allowance over one fresh, physical inventory snapshot. */
-public class SeedBudget {
+public final class SeedBudget {
     public record Location(Optional<WorldPos> store, Optional<UUID> resident) {
         public static final Location UNKNOWN = new Location(Optional.empty(), Optional.empty());
         public Location {
@@ -87,41 +89,66 @@ public class SeedBudget {
     public record Tally(long physical, long committed, long retained, long compostable, long missing) {
     }
 
-    private final Supplier<Snapshot> snapshots;
-    private final Supplier<Set<Item>> seeds;
-    private List<List<Item>> observedPurposes;
+    private static final Tally NOTHING = new Tally(0, 0, 0, 0, 0);
 
-    public SeedBudget(Supplier<Snapshot> snapshots, Supplier<Set<Item>> seeds) {
-        this.snapshots = Objects.requireNonNull(snapshots);
-        this.seeds = Objects.requireNonNull(seeds);
+    /** Read-only results for one synchronous planning call; never retained by an executing node. */
+    public static final class Planning {
+        private final boolean complete;
+        private final Map<Item, Tally> tallies;
+        private final List<Reserve> reserves;
+
+        private Planning(boolean complete, Map<Item, Tally> tallies, List<List<Item>> purposes,
+                Map<List<Item>, Long> minimums) {
+            this.complete = complete;
+            this.tallies = Map.copyOf(tallies);
+            reserves = !complete ? List.of() : purposes.stream().map(alternatives -> {
+                Item first = alternatives.getFirst();
+                return new Reserve(alternatives, ItemSpec.anyOf(alternatives.stream()
+                    .map(item -> Goods.specOf(item.getDefaultInstance())).toList()), minimums.get(alternatives),
+                    tally(first).missing());
+            }).toList();
+        }
+
+        public boolean complete() { return complete; }
+        public Tally tally(Item seed) { return tallies.getOrDefault(seed, NOTHING); }
+        public List<Reserve> reserves() { return reserves; }
     }
 
-    // Discovery computes every candidate against one physical observation.
-    public SeedBudget frozen() {
-        if (observedPurposes != null) return this;
-        Snapshot snapshot = snapshots.get();
-        Set<Item> catalogue = Set.copyOf(seeds.get());
-        SeedBudget observed = new SeedBudget(() -> snapshot, () -> catalogue);
-        observed.observedPurposes = purposes(catalogue);
-        return observed;
+    private final Supplier<Snapshot> snapshots;
+    private final Supplier<Set<Item>> seeds;
+    private final ToIntFunction<Item> retained;
+
+    public SeedBudget(Supplier<Snapshot> snapshots, Supplier<Set<Item>> seeds) {
+        this(snapshots, seeds, item -> item.getDefaultInstance().getMaxStackSize());
+    }
+
+    public SeedBudget(Supplier<Snapshot> snapshots, Supplier<Set<Item>> seeds, ToIntFunction<Item> retained) {
+        this.snapshots = Objects.requireNonNull(snapshots);
+        this.seeds = Objects.requireNonNull(seeds);
+        this.retained = Objects.requireNonNull(retained);
+    }
+
+    private long reserve(List<Item> alternatives) {
+        return alternatives.stream().mapToLong(item -> Math.max(0, retained.applyAsInt(item))).max().orElse(0);
     }
 
     public Tally tally(Item seed) { return tally(seed, ItemStack.EMPTY, Set.of()); }
 
     public boolean complete() { return snapshots.get().complete(); }
 
-    public List<Reserve> reserves() {
-        return frozen().observedReserves();
+    public Planning planning() { return planning(snapshots.get()); }
+
+    private Planning planning(Snapshot snapshot) {
+        Set<Item> known = new LinkedHashSet<>(seeds.get());
+        List<List<Item>> purposes = purposes(known);
+        Map<List<Item>, Long> minimums = minimums(purposes);
+        return new Planning(snapshot.complete(), measure(snapshot, known, purposes, minimums, ItemStack.EMPTY, Set.of()),
+            purposes, minimums);
     }
 
-    private List<Reserve> observedReserves() {
-        if (!complete()) return List.of();
-        return purposes().stream().map(alternatives -> {
-            Item first = alternatives.getFirst();
-            return new Reserve(alternatives, ItemSpec.anyOf(alternatives.stream()
-                .map(item -> Goods.specOf(item.getDefaultInstance())).toList()), first.getDefaultInstance().getMaxStackSize(),
-                tally(first).missing());
-        }).toList();
+    public List<Reserve> reserves() {
+        Snapshot snapshot = snapshots.get();
+        return snapshot.complete() ? planning(snapshot).reserves() : List.of();
     }
 
     // Core has drawn the current input before commit. Add that real escrow back to its former physical
@@ -132,14 +159,24 @@ public class SeedBudget {
 
     public Tally tally(Item seed, ItemStack escrow, Set<UUID> consumingNodes) {
         Snapshot snapshot = snapshots.get();
-        if (!seeds.get().contains(seed)) return new Tally(0, 0, 0, 0, 0);
+        Set<Item> known = new LinkedHashSet<>(seeds.get());
+        if (!known.contains(seed)) return NOTHING;
+        List<List<Item>> purposes = purposes(known);
+        return measure(snapshot, known, purposes, minimums(purposes), escrow, consumingNodes).get(seed);
+    }
+
+    // Allocation depends on the snapshot and escrow, not on which seed asks for its final total.
+    // Settle physical claims, future demand and ordered retention once, then report every seed.
+    private Map<Item, Tally> measure(Snapshot snapshot, Set<Item> known, List<List<Item>> purposes,
+            Map<List<Item>, Long> minimums, ItemStack escrow, Set<UUID> consumingNodes) {
         Map<String, Stock> distinct = new LinkedHashMap<>();
         snapshot.stock().forEach(stock -> distinct.putIfAbsent(stock.identity(), stock));
         List<Unit> units = new ArrayList<>();
         distinct.values().forEach(stock -> stock.stacks().stream().filter(stack -> !stack.isEmpty())
             .forEach(stack -> units.add(new Unit(stock.at(), stack))));
         if (!escrow.isEmpty()) units.add(new Unit(Location.UNKNOWN, escrow));
-        long physical = units.stream().filter(unit -> unit.stack.is(seed)).mapToLong(unit -> unit.free).sum();
+        Map<Item, Long> physical = new LinkedHashMap<>();
+        units.forEach(unit -> physical.merge(unit.stack.getItem(), unit.free, Long::sum));
         record ClaimKey(UUID node, Location at, ItemSpec goods) { }
         Map<ClaimKey, Long> claims = new LinkedHashMap<>();
         for (Claim claim : snapshot.claims()) {
@@ -161,19 +198,18 @@ public class SeedBudget {
             if (old == null || need.count() > old.count()) future.put(need.identity(), need);
         }
         future.values().forEach(need -> allocate(units, Location.UNKNOWN, need.goods(), need.count()));
-        long free = units.stream().filter(unit -> unit.stack.is(seed)).mapToLong(unit -> unit.free).sum();
         Map<Item, Long> available = new LinkedHashMap<>();
         units.forEach(unit -> available.merge(unit.stack.getItem(), unit.free, Long::sum));
         Map<Item, Long> baseline = new LinkedHashMap<>();
-        long missing = 0;
-        for (List<Item> purpose : purposes()) {
-            long left = purpose.getFirst().getDefaultInstance().getMaxStackSize();
+        Map<Item, Long> missing = new LinkedHashMap<>();
+        for (List<Item> purpose : purposes) {
+            long left = minimums.get(purpose);
             for (Item alternative : purpose) {
                 long kept = Math.min(left, available.getOrDefault(alternative, 0L));
                 baseline.put(alternative, kept);
                 left -= kept;
             }
-            if (purpose.getFirst() == seed) missing = left;
+            missing.put(purpose.getFirst(), left);
         }
         Map<String, StockTarget> targets = new LinkedHashMap<>();
         snapshot.targets().forEach(target -> targets.merge(target.identity(), target,
@@ -197,17 +233,25 @@ public class SeedBudget {
                 }
             }
         }
-        long retained = Math.max(baseline.getOrDefault(seed, 0L), ordered.getOrDefault(seed, 0L));
-        return new Tally(physical, physical - free, retained, snapshot.complete() ? Math.max(0, free - retained) : 0,
-            missing);
+        Map<Item, Tally> tallies = new LinkedHashMap<>();
+        for (Item seed : known) {
+            long total = physical.getOrDefault(seed, 0L);
+            long free = available.getOrDefault(seed, 0L);
+            long retained = Math.max(baseline.getOrDefault(seed, 0L), ordered.getOrDefault(seed, 0L));
+            tallies.put(seed, new Tally(total, total - free, retained,
+                snapshot.complete() ? Math.max(0, free - retained) : 0, missing.getOrDefault(seed, 0L)));
+        }
+        return tallies;
     }
 
-    private List<List<Item>> purposes() {
-        return observedPurposes != null ? observedPurposes : purposes(seeds.get());
+    private Map<List<Item>, Long> minimums(List<List<Item>> purposes) {
+        Map<List<Item>, Long> minimums = new LinkedHashMap<>();
+        purposes.forEach(purpose -> minimums.put(purpose, reserve(purpose)));
+        return minimums;
     }
 
     private static List<List<Item>> purposes(Set<Item> seeds) {
-        return io.github.izakyl.folkways.plugins.farming.CropSeeds.purposes(seeds);
+        return SeedReserves.purposes(seeds);
     }
 
     private static void allocate(List<Unit> units, Location where, ItemSpec goods, long count) {

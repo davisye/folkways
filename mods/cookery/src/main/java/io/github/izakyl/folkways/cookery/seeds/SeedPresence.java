@@ -1,6 +1,7 @@
 package io.github.izakyl.folkways.cookery.seeds;
 
 import com.github.ysbbbbbb.kaleidoscopecookery.init.ModItems;
+import io.github.izakyl.folkways.plugins.compost.SeedBudget;
 import com.github.ysbbbbbb.kaleidoscopecookery.init.tag.TagMod;
 import io.github.izakyl.folkways.core.api.colony.Closing;
 import io.github.izakyl.folkways.core.api.colony.Colony;
@@ -12,6 +13,7 @@ import io.github.izakyl.folkways.core.api.terms.Reach;
 import io.github.izakyl.folkways.core.api.terms.RefusalKind;
 import io.github.izakyl.folkways.core.api.terms.WorldPos;
 import io.github.izakyl.folkways.core.api.terms.WorldSpaces;
+import io.github.izakyl.folkways.core.api.work.Amount;
 import io.github.izakyl.folkways.core.api.work.Ending;
 import io.github.izakyl.folkways.core.api.work.Grown;
 import io.github.izakyl.folkways.core.api.work.Hold;
@@ -21,8 +23,6 @@ import io.github.izakyl.folkways.core.api.work.Node;
 import io.github.izakyl.folkways.core.api.work.NodeSpec;
 import io.github.izakyl.folkways.core.api.work.Outcome;
 import io.github.izakyl.folkways.core.api.work.Stances;
-import io.github.izakyl.folkways.core.api.work.Staged;
-import io.github.izakyl.folkways.core.api.work.StockCheck;
 import io.github.izakyl.folkways.core.api.work.WorkGesture;
 import io.github.izakyl.folkways.core.api.work.WorkSite;
 import io.github.izakyl.folkways.core.api.work.Worker;
@@ -52,7 +52,6 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.item.Item;
-import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Blocks;
 
@@ -114,22 +113,18 @@ public final class SeedPresence implements Facing {
                             body.mob().getItemBySlot(EquipmentSlot.HEAD)))).toList();
     }
 
-    private UUID keepId(WorldPos at, Item seed) {
-        return named("keep/" + colony.id() + "/" + at.realm() + "/" + BuiltInRegistries.ITEM.getKey(seed));
-    }
-
     public List<Grown> goals(ColonyView view) {
         if (!enabled.getAsBoolean()) return List.of();
         List<Body> farmers = farmers(view);
         if (farmers.isEmpty()) return List.of();
         ServerLevel level = view.level();
-        List<io.github.izakyl.folkways.plugins.compost.SeedBudget.Reserve> reserves = budgets.apply(level).reserves();
+        List<SeedBudget.Reserve> reserves = budgets.apply(level).reserves();
         List<Grown> goals = new ArrayList<>();
         List<WorldPos> stores = colony.storesIn(level.dimension());
         if (!stores.isEmpty()) {
             WorldPos at = stores.getFirst();
             if (at.in(level)) Stances.of(level, Reach.workableCells(level, at.block(level))).ifPresent(stances -> {
-                for (io.github.izakyl.folkways.plugins.compost.SeedBudget.Reserve reserve : reserves) {
+                for (SeedBudget.Reserve reserve : reserves) {
                     if (reserve.missing() > 0) goals.add(Grown.of(new Keep(at, stances, reserve)));
                 }
             });
@@ -191,30 +186,18 @@ public final class SeedPresence implements Facing {
         return List.of(Line.text(Component.translatable("folkways.page.cookery.seeds." + status)));
     }
 
-    // A planner demand for bootstrap production, not a request to pick up the reserve stack.
-    private final class Keep implements Node, StockCheck {
+    private final class Keep implements Node {
         private final NodeSpec spec;
-        private final Item seed;
-        Keep(WorldPos at, Stances stances, io.github.izakyl.folkways.plugins.compost.SeedBudget.Reserve reserve) {
-            seed = reserve.alternatives().getFirst();
-            spec = NodeSpec.of(keepId(at, seed), ID, new WorkSite.AtBlock(at), stances, Workload.Once.of(1))
-                .vocation(FarmingContent.trade()).needs(new Need(reserve.goods(), reserve.count(), false))
-                .doing(KEEPING).done();
+        Keep(WorldPos at, Stances stances, SeedBudget.Reserve reserve) {
+            spec = NodeSpec.of(named("keep/" + colony.id() + "/" + at.realm() + "/"
+                + BuiltInRegistries.ITEM.getKey(reserve.alternatives().getFirst())), ID,
+                new WorkSite.AtBlock(at), stances, Workload.Once.of(1))
+                .vocation(FarmingContent.trade()).needs(new Need(reserve.goods(), reserve.count(), true))
+                .leaves(List.of(new Amount(reserve.goods(), reserve.count()))).doing(KEEPING).done();
         }
         public NodeSpec spec() { return spec; }
-        private boolean present(ServerLevel level) {
-            var observed = budgets.apply(level).frozen();
-            return enabled.getAsBoolean() && observed.complete()
-                && observed.tally(seed).missing() == 0;
-        }
-        public Staged.Drawn draw(ServerLevel level, Worker who) {
-            return present(level) ? new Staged.Taken(List.of()) : new Staged.Short(SeedRefusal.RESERVE_UNAVAILABLE);
-        }
-        public void restore(ServerLevel level, Worker who, List<ItemStack> goods) {
-            if (!goods.isEmpty()) throw new IllegalStateException("a seed stock check never draws material");
-        }
         public Outcome commit(ServerLevel level, Worker who) {
-            return present(level) ? Outcome.done() : Outcome.failed(SeedRefusal.RESERVE_UNAVAILABLE);
+            return new Outcome.Done(List.of(), List.of(), Optional.empty(), who.supplied());
         }
     }
 

@@ -33,6 +33,7 @@ final class Pipeline {
     private final Inbox inbox;
     private final Planner planner;
     private final Scheduler scheduler;
+    private final BiConsumer<String, String> problem;
 
     private final Queue<Runnable> made = new ConcurrentLinkedQueue<>();
     private final Queue<Scheduler.Input> laying = new ConcurrentLinkedQueue<>();
@@ -45,11 +46,24 @@ final class Pipeline {
     private long weaveBegan;
     private volatile long scheduleBegan;
     private volatile boolean closed;
+    // The schedule lane raises the gate before publishing its failure. Only a simulation tick lowers it;
+    // new weave inputs wait behind it too. Failure counts belong to that lane; retry/now to the server thread.
+    private volatile boolean retrying;
+    private int scheduleFailures;
+    private long now;
+    private Retry retry;
+
+    private record Retry(Executor thread, Consumer<Scheduler.Scheduled> laid, long at) { }
 
     Pipeline(Inbox inbox, Planner planner, Scheduler scheduler) {
+        this(inbox, planner, scheduler, (stage, error) -> { });
+    }
+
+    Pipeline(Inbox inbox, Planner planner, Scheduler scheduler, BiConsumer<String, String> problem) {
         this.inbox = inbox;
         this.planner = planner;
         this.scheduler = scheduler;
+        this.problem = problem;
     }
 
     boolean weaving() {
@@ -84,6 +98,7 @@ final class Pipeline {
                 made.add(() -> {
                     inbox.giveBack();
                     weaving = false;
+                    problem.accept("weave", broken.getClass().getSimpleName());
                 });
                 return;
             }
@@ -116,8 +131,11 @@ final class Pipeline {
     }
 
     private void lay(Executor scheduleThread, Scheduler.Input input, Consumer<Scheduler.Scheduled> laid) {
+        if (closed) {
+            return;
+        }
         laying.add(input);
-        if (scheduling.compareAndSet(false, true)) {
+        if (!retrying && scheduling.compareAndSet(false, true)) {
             scheduleThread.execute(() -> drain(scheduleThread, laid));
         }
     }
@@ -141,25 +159,36 @@ final class Pipeline {
                     result = scheduler.handle(inputs);
                 } catch (RuntimeException | Error broken) {
                     Labor.LOGGER.error("scheduling failed over {} changes", inputs.size(), broken);
-                    continue;
+                    scheduleFailures = Math.min(scheduleFailures + 1, 6);
+                    long delay = Math.min(20, 1L << (scheduleFailures - 1));
+                    retrying = true;
+                    made.add(() -> {
+                        retry = new Retry(scheduleThread, laid, now + delay);
+                        problem.accept("schedule", broken.getClass().getSimpleName());
+                    });
+                    break;
                 } finally {
                     scheduleBegan = 0;
                 }
+                scheduleFailures = 0;
                 long finished = Util.getNanos();
                 if (FolkwaysConfig.logPlanHeartbeat() && finished - began >= SLOW_NANOS) {
                     Labor.LOGGER.info("schedule timing tick={} changes={} apply_us={} schedule_us={} total_us={}"
-                            + " nodes={} tours={} unassigned={}",
+                            + " nodes={} tours={} unassigned={} improvement_work={} limited={}",
                         result.tick(), inputs.size(), result.timing().applyNanos() / 1000,
                         result.timing().scheduleNanos() / 1000, (finished - began) / 1000, scheduler.size(),
-                        result.all().size(), result.unassigned().size());
+                        result.all().size(), result.unassigned().size(), result.timing().improvementWork(),
+                        result.timing().limited());
                 }
                 tours = result.all();
+                // The lane has no asynchronous child layouts. Successful publications remain ordered across
+                // a synchronous Tours rebuild; close permanently rejects both ready and late publications.
                 made.add(() -> laid.accept(result));
             }
         } finally {
             scheduling.set(false);
         }
-        if (!closed && !laying.isEmpty() && scheduling.compareAndSet(false, true)) {
+        if (!closed && !retrying && !laying.isEmpty() && scheduling.compareAndSet(false, true)) {
             scheduleThread.execute(() -> drain(scheduleThread, laid));
         }
     }
@@ -173,13 +202,23 @@ final class Pipeline {
         if (!level.getServer().tickRateManager().runsNormally()) {
             return;
         }
+        now = level.getGameTime();
         for (Runnable next = made.poll(); next != null && !closed; next = made.poll()) {
             next.run();
+        }
+        if (!closed && retry != null && now >= retry.at()) {
+            Retry due = retry;
+            retry = null;
+            retrying = false;
+            // A failed layout has already accepted its inputs. A wake retries its complete current weave,
+            // rather than resubmitting the input batch or the colony's original material demands.
+            lay(due.thread(), Scheduler.Input.wake(now), due.laid());
         }
     }
 
     void close(Executor weaveThread, Executor scheduleThread) {
         closed = true;
+        retry = null;
         made.clear();
         laying.clear();
         weaveThread.execute(planner::closed);

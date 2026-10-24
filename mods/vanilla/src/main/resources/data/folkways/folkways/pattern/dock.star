@@ -41,8 +41,7 @@ lang = {
         "lantern": "Lanterns",
         "roof": "Roof",
         "error.dock.points": "A dock needs exactly two path points, shore then water",
-        "error.dock.length": "Dock length must be 6–64 blocks",
-        "error.dock.width": "Dock width must be 3–9 blocks",
+        "error.dock.length": "Dock length must be at least 6 blocks",
         "error.material": "Choose material for %s",
         "error.dock.start": "Start the dock on dry land",
         "error.dock.end": "The dock must end over water",
@@ -70,8 +69,7 @@ lang = {
         "lantern": "灯具",
         "roof": "棚顶",
         "error.dock.points": "码头只支持两个路径点：先岸上，后水面",
-        "error.dock.length": "码头长度须为 6–64 格",
-        "error.dock.width": "码头宽度须为 3–9 格",
+        "error.dock.length": "码头长度至少 6 格",
         "error.material": "请为%s选择材料",
         "error.dock.start": "码头须从岸上起步",
         "error.dock.end": "码头终点须在水面上",
@@ -99,8 +97,7 @@ lang = {
         "lantern": "燈具",
         "roof": "棚頂",
         "error.dock.points": "碼頭只支援兩個路徑點：先岸上，後水面",
-        "error.dock.length": "碼頭長度須為 6–64 格",
-        "error.dock.width": "碼頭寬度須為 3–9 格",
+        "error.dock.length": "碼頭長度至少 6 格",
         "error.material": "請為%s選擇材料",
         "error.dock.start": "碼頭須從岸上起步",
         "error.dock.end": "碼頭終點須在水面上",
@@ -128,8 +125,7 @@ lang = {
         "lantern": "燈具",
         "roof": "棚頂",
         "error.dock.points": "碼頭只支援兩個路徑點：先岸上，後水面",
-        "error.dock.length": "碼頭長度須為 6–64 格",
-        "error.dock.width": "碼頭寬度須為 3–9 格",
+        "error.dock.length": "碼頭長度至少 6 格",
         "error.material": "請為%s選擇材料",
         "error.dock.start": "碼頭須從岸上起步",
         "error.dock.end": "碼頭終點須在水面上",
@@ -222,11 +218,9 @@ def draw(site):
     if len(site.path.points) != 2:
         reject("error.dock.points")
     length = site.path.length
-    if length < 6 or length > 64:
+    if length < 6:
         reject("error.dock.length")
     width = site.count("width")
-    if width < 3 or width > 9:
-        reject("error.dock.width")
     for key in ["deck", "beam", "pile", "rail", "landing", "lantern", "roof"]:
         if not site.items(key):
             reject("error.material", translated(key))

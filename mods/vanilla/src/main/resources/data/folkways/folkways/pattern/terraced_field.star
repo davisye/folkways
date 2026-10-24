@@ -40,9 +40,7 @@ lang = {
         "gate": "Gate",
         "lamp": "Lamps",
         "error.field.ground": "No ground under the field",
-        "error.field.size": "A terraced field must be 6–56 blocks on each side",
-        "error.field.height": "Terrace height must be 1–4 blocks",
-        "error.field.spacing": "Water spacing must be 2–8 blocks",
+        "error.field.size": "A terraced field must be at least 6 blocks on each side",
         "error.material": "Choose material for %s",
         "error.field.water": "The field is under water",
         "error.field.steep": "Too steep to terrace",
@@ -62,9 +60,7 @@ lang = {
         "gate": "栅栏门",
         "lamp": "灯具",
         "error.field.ground": "田地下方没有地面",
-        "error.field.size": "梯田每边须为 6–56 格",
-        "error.field.height": "梯田台阶高须为 1–4 格",
-        "error.field.spacing": "水眼间距须为 2–8 格",
+        "error.field.size": "梯田每边至少 6 格",
         "error.material": "请为%s选择材料",
         "error.field.water": "田地大部分在水下",
         "error.field.steep": "坡度太陡，无法修成梯田",
@@ -84,9 +80,7 @@ lang = {
         "gate": "柵欄門",
         "lamp": "燈具",
         "error.field.ground": "田地下方沒有地面",
-        "error.field.size": "梯田每邊須為 6–56 格",
-        "error.field.height": "梯田每級高度須為 1–4 格",
-        "error.field.spacing": "水眼間距須為 2–8 格",
+        "error.field.size": "梯田每邊至少 6 格",
         "error.material": "請為%s選擇材料",
         "error.field.water": "田地大部分在水下",
         "error.field.steep": "坡度太陡，無法修成梯田",
@@ -106,9 +100,7 @@ lang = {
         "gate": "柵欄門",
         "lamp": "燈具",
         "error.field.ground": "田地下方沒有地面",
-        "error.field.size": "梯田每邊須為 6–56 格",
-        "error.field.height": "梯田每級高度須為 1–4 格",
-        "error.field.spacing": "水眼間距須為 2–8 格",
+        "error.field.size": "梯田每邊至少 6 格",
         "error.material": "請為%s選擇材料",
         "error.field.water": "田地大部分在水下",
         "error.field.steep": "坡度太陡，無法修成梯田",
@@ -411,14 +403,10 @@ def palette(items):
 
 def draw(site):
     zone = site.zone.sized(height = 1)
-    if zone.width < 6 or zone.depth < 6 or zone.width > 56 or zone.depth > 56:
+    if zone.width < 6 or zone.depth < 6:
         reject("error.field.size")
     rise = site.count("rise")
     spacing = site.count("spacing")
-    if rise < 1 or rise > 4:
-        reject("error.field.height")
-    if spacing < 2 or spacing > 8:
-        reject("error.field.spacing")
     for key in ["soil", "bund", "wall", "cap", "path", "steps", "fence", "gate", "lamp"]:
         if not site.items(key):
             reject("error.material", translated(key))

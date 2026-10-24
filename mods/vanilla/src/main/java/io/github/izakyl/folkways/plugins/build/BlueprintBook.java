@@ -40,8 +40,8 @@ public final class BlueprintBook {
         this.dirty = listener;
     }
 
-    void add(Blueprint blueprint) {
-        file(blueprint);
+    void add(ServerLevel level, Blueprint blueprint) {
+        file(blueprint.confirm(level));
     }
 
     private void file(Blueprint blueprint) {
@@ -88,6 +88,18 @@ public final class BlueprintBook {
 
     Optional<Blueprint> blueprint(UUID id) {
         return Optional.ofNullable(blueprints.get(id));
+    }
+
+    /** The blueprint as its target: one filed before targets were resolved this way is resolved now, once. */
+    Optional<Blueprint> target(ServerLevel level, UUID id) {
+        Blueprint found = blueprints.get(id);
+        if (found == null || found.confirmed()) {
+            return Optional.ofNullable(found);
+        }
+        Blueprint resolved = found.confirm(level);
+        blueprints.put(id, resolved);
+        dirty.run();
+        return Optional.of(resolved);
     }
 
     List<BlueprintBuildOrder> allBuildOrders() {

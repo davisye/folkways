@@ -12,10 +12,7 @@ import io.github.izakyl.folkways.core.api.work.Stances;
 import io.github.izakyl.folkways.core.api.work.WorkEffort;
 import io.github.izakyl.folkways.core.api.work.Worker;
 import io.github.izakyl.folkways.core.api.work.WorkGesture;
-import io.github.izakyl.folkways.core.api.work.batch.BatchSession;
-import io.github.izakyl.folkways.core.api.work.batch.BatchSpec;
-import io.github.izakyl.folkways.core.api.work.batch.StepReceipt;
-import io.github.izakyl.folkways.core.api.work.batch.StepResult;
+import io.github.izakyl.folkways.core.api.work.Workload;
 import io.github.izakyl.folkways.core.api.work.WorkSite;
 import io.github.izakyl.folkways.cookery.CookeryContent;
 import io.github.izakyl.folkways.cookery.CookeryRefusal;
@@ -28,7 +25,7 @@ import net.minecraft.server.level.ServerLevel;
 
 // One production offer has one completion and one input budget. Its pieces use the real pot batch by batch;
 // serving a first batch must not promise all later batches to the downstream consumer yet.
-final class StockpotWork implements Node, BatchSession {
+final class StockpotWork implements Node, Workload.Within {
 
     private final NodeSpec spec;
     private final UUID colony;
@@ -70,10 +67,7 @@ final class StockpotWork implements Node, BatchSession {
 
     private void nextBatch() {
         UUID batch = UUID.randomUUID();
-        // Between batches the real lid stays on the empty pot. Only the first load draws a supplied lid;
-        // the final serving restores an original appliance lid or returns the one this work brought.
-        loading = new StockpotLoad(colony, batch, at, stances, plan, hasLid || served > 0, bookings, changed,
-            id(), generation, hasLid);
+        loading = new StockpotLoad(colony, batch, at, stances, plan, hasLid, bookings, changed, id(), generation);
         taking = new StockpotTake(colony, batch, at, stances, plan, bookings, changed, false, id(), served + 1 < runs, generation);
         loaded = false;
     }
@@ -99,41 +93,34 @@ final class StockpotWork implements Node, BatchSession {
     }
 
     @Override
-    public BatchSpec batch() {
-        return BatchSpec.of(id());
-    }
-
-    @Override
-    public StepResult advance(ServerLevel level, Worker who) {
+    public Turn next(ServerLevel level, Worker who) {
         refusal(level).ifPresent(why -> failed = why);
         if (bookings.cancelled(at, id(), generation)) {
             failed = CookeryRefusal.STATION_CHANGED;
         }
-        if (failed != null) return new StepResult.Failed(failed);
-        if (served == runs) return new StepResult.Complete();
+        if (failed != null || served == runs) {
+            return LEAVE;
+        }
         if (!bookings.first(at, id())) {
-            return new StepResult.Wait(10);
+            return WAIT;
         }
         Node next = loaded ? taking : loading;
-        return next.ready(level) ? new StepResult.Step(served + (loaded ? "/take" : "/load"), new Piece(next))
-            : new StepResult.Wait(10);
-    }
-
-    @Override
-    public void settled(ServerLevel level, StepReceipt receipt) {
-        receipt.stop().ifPresent(why -> failed = why);
-        if (receipt.step().equals(served + "/load")) {
-            loaded = true;
-        } else if (loaded && receipt.step().equals(served + "/take")) {
-            served++;
-            if (served < runs) nextBatch();
-        }
+        return next.ready(level) ? new Turn.Piece(new Piece(next)) : WAIT;
     }
 
     @Override
     public void ended(ServerLevel level, Node piece, Ending how) {
         if (how instanceof Ending.Failed failure) {
             failed = failure.why();
+        } else if (how instanceof Ending.Done && piece instanceof Piece action) {
+            if (action.delegate == loading) {
+                loaded = true;
+            } else if (action.delegate == taking) {
+                served++;
+                if (served < runs) {
+                    nextBatch();
+                }
+            }
         }
     }
 
@@ -162,11 +149,6 @@ final class StockpotWork implements Node, BatchSession {
     public Outcome commit(ServerLevel level, Worker who) {
         return served == runs && !bookings.cancelled(at, id(), generation) ? Outcome.done()
             : Outcome.failed(failed == null ? CookeryRefusal.STATION_CHANGED : failed);
-    }
-
-    @Override
-    public Outcome finish(ServerLevel level, Worker who) {
-        return commit(level, who);
     }
 
     @Override

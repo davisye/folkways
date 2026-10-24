@@ -20,18 +20,13 @@ import net.minecraft.world.phys.shapes.VoxelShape;
 // the work did: a wall laid into the edge of a body that stood half over its cell, or at the head of one standing
 // just under it (its own worker's, as often as not, since a worker counts as at its stance up to most of a block off
 // it), left that body in the wall, and one that stayed there - a tower's top course laid round the worker's head,
-// say - suffocated. A mob only grazing the cell is
-// stepped out of it, as far as it overlaps and no further than a body is wide, onto room that is free; one under a
-// low block is lifted onto it, as a block pushes up what stands on it; the worker, if it stands in the very cell it
-// lays, steps into the middle of its nearest free stance; anyone else holds the work up till they move.
+// say - suffocated. Mobs are pushed the shortest clear distance out of the new block, or onto a nearby work stance.
+// A block may also lift a mob up onto its top when the space above is clear.
 final class Bystanders {
 
-    // Further than a body is wide is not stepping aside but being carried off.
-    private static final double MOST_STEP = 0.6D;
-    // A block whose top is no higher than this over a body's feet is one the body could have stepped onto.
-    private static final double STEP_UP = 0.5D;
+    private static final double STEP_UP = 1.0D;
     private static final double CLEAR = 1.0E-3D;
-    // How far off a stance the worker may be and still count as at it, and so how far it steps back into one.
+    // A nearby work stance is also somewhere for a bystander to step aside to.
     private static final double MOST_STANCE_STEP = 1.5D;
 
     private Bystanders() {
@@ -39,8 +34,7 @@ final class Bystanders {
 
     // Steps every mob out of the way of what is laid, and answers true; or moves nobody and answers false when
     // someone cannot be stepped clear.
-    static boolean clear(ServerLevel level, Map<BlockPos, BlockState> laid, LivingEntity worker,
-            Collection<BlockPos> stances) {
+    static boolean clear(ServerLevel level, Map<BlockPos, BlockState> laid, Collection<BlockPos> stances) {
         List<AABB> solid = new ArrayList<>();
         Map<BlockPos, VoxelShape> shapes = new LinkedHashMap<>();
         for (Map.Entry<BlockPos, BlockState> cell : laid.entrySet()) {
@@ -70,7 +64,7 @@ final class Bystanders {
                     return false;
                 }
                 Vec3 to = stepAside(level, body, box, bounds, solid);
-                if (to == null && body == worker) {
+                if (to == null) {
                     to = intoStance(level, body, box, stances, laid.keySet(), solid);
                 }
                 if (to == null) {
@@ -83,12 +77,8 @@ final class Bystanders {
         return true;
     }
 
-    // The least step that takes the box off the laid block: up onto a low one, else sideways along one axis.
+    // Clear the block by the least horizontal displacement, including a body standing fully inside its cell.
     private static Vec3 stepAside(ServerLevel level, LivingEntity body, AABB box, AABB block, List<AABB> solid) {
-        if (block.maxY - box.minY <= STEP_UP) {
-            Vec3 up = new Vec3(0.0D, block.maxY - box.minY + CLEAR, 0.0D);
-            return free(level, body, box.move(up), solid) ? up : null;
-        }
         Vec3[] steps = {
             new Vec3(block.minX - box.maxX - CLEAR, 0.0D, 0.0D),
             new Vec3(block.maxX - box.minX + CLEAR, 0.0D, 0.0D),
@@ -98,11 +88,17 @@ final class Bystanders {
         Vec3 best = null;
         for (Vec3 step : steps) {
             double length = step.length();
-            if (length > MOST_STEP || (best != null && length >= best.length())) {
+            if (best != null && length >= best.length()) {
                 continue;
             }
-            if (free(level, body, box.move(step), solid)) {
+            if (free(level, body, box, step, solid)) {
                 best = step;
+            }
+        }
+        if (best == null && block.maxY - box.minY <= STEP_UP) {
+            Vec3 up = new Vec3(0.0D, block.maxY - box.minY + CLEAR, 0.0D);
+            if (free(level, body, box, up, solid)) {
+                return up;
             }
         }
         return best;
@@ -122,14 +118,15 @@ final class Bystanders {
                     || (best != null && step.lengthSqr() >= best.lengthSqr())) {
                 continue;
             }
-            if (free(level, body, box.move(step), solid)) {
+            if (free(level, body, box, step, solid)) {
                 best = step;
             }
         }
         return best;
     }
 
-    private static boolean free(ServerLevel level, LivingEntity body, AABB box, List<AABB> solid) {
-        return level.noCollision(body, box) && solid.stream().noneMatch(box::intersects);
+    private static boolean free(ServerLevel level, LivingEntity body, AABB box, Vec3 step, List<AABB> solid) {
+        AABB moved = box.move(step);
+        return level.noCollision(body, box.expandTowards(step)) && solid.stream().noneMatch(moved::intersects);
     }
 }

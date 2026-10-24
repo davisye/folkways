@@ -29,8 +29,6 @@ import io.github.izakyl.folkways.core.api.work.Worker;
 import io.github.izakyl.folkways.core.api.work.Workload;
 import io.github.izakyl.folkways.core.api.work.WorkEffort;
 import io.github.izakyl.folkways.core.api.work.WorkExertion;
-import io.github.izakyl.folkways.core.api.work.batch.StepResult;
-import io.github.izakyl.folkways.core.engine.batch.BatchExecution;
 import io.github.izakyl.folkways.core.api.work.Xp;
 import io.github.izakyl.folkways.core.engine.travel.Trip;
 import java.util.ArrayDeque;
@@ -82,7 +80,6 @@ final class BodyRunner {
     private Node within;
     private Placement withinPlan = Placement.NOWHERE;
     private Body withinBody;
-    private BatchExecution withinBatch;
     private int waited;
     private Own own;
     private Trip carrying;
@@ -132,6 +129,10 @@ final class BodyRunner {
 
     boolean executing() {
         return current != null || within != null;
+    }
+
+    Optional<Node> interruptedWork() {
+        return Optional.ofNullable(current == null ? within : current);
     }
 
     List<UUID> queued() {
@@ -201,6 +202,13 @@ final class BodyRunner {
     }
 
     void tick(ColonyLabor labor, ServerLevel level, Body body) {
+        if (within != null && (own == null || own.urge() == null)) {
+            try {
+                ((Workload.Within) within.spec().workload()).tick(level, labor.hands(body, withinPlan));
+            } catch (RuntimeException | LinkageError broken) {
+                Labor.LOGGER.error("node {} threw during its presentation", within.id(), broken);
+            }
+        }
         if (current == null && within != null) {
             inside(labor, level, body);
             return;
@@ -247,10 +255,6 @@ final class BodyRunner {
     // Anything else that lets go takes it out of that work as well.
     void letGo(ColonyLabor labor, ServerLevel level, Body body, String why) {
         boolean urged = why.startsWith("urge");
-        BatchExecution ownerBatch = withinBatch != null ? withinBatch
-            : current != null && own == null ? labor.existingBatch(current.id()) : null;
-        boolean committedBatch = !urged && (current == null || own == null)
-            && ownerBatch != null && ownerBatch.hasCommittedSteps();
         if (current == null) {
             if (within == null || urged) {
                 return;
@@ -258,6 +262,10 @@ final class BodyRunner {
             comeOut();
         }
         Node node = current;
+        if (why.equals("urge-gone")) {
+            LaborIncident.work(labor.colony().id(), level, body, node, why,
+                net.minecraft.network.chat.Component.translatable("folkways.debug.incident.urge_ended"));
+        }
         if (LET_GO_DEBUG) {
             Labor.LOGGER.info("let go node={} doing={} body={} at={} why={}", node.id(), node.spec().doing(),
                 body.mob().getUUID(), body.mob().blockPosition().toShortString(), why);
@@ -267,14 +275,8 @@ final class BodyRunner {
         putDown(body);
         ended(labor, level, body, node, Ending.DROPPED);
         if (onGraph) {
-            if (committedBatch) {
-                // Releasing the original aggregate need would provision already-spent inputs again.
-                // End this offer; a recovery offer must read the physical pack/appliance state.
-                if (!labor.phases().of(node.id()).terminal()) labor.failed(node.id(), LaborRefusal.WORK_BROKE);
-            } else {
-                labor.phases().letGo(node.id());
-                labor.released(node.id());
-            }
+            labor.phases().letGo(node.id());
+            labor.released(node.id());
         } else {
             labor.personal().cancelled(node.id());
             labor.forgetPersonal(node.id());
@@ -293,18 +295,16 @@ final class BodyRunner {
         own = null;
         within = null;
         withinBody = null;
-        withinBatch = null;
         waited = 0;
     }
 
-    private void enter(ColonyLabor labor, Body body) {
+    private void enter(Body body) {
         Node entered = current;
         Placement plan = placement;
         body.mob().getNavigation().stop();
         clear(body);
         within = entered;
         withinBody = body;
-        withinBatch = labor.batch(entered);
         // Where the plan stood the body for the whole of the work is not where each piece of it is done from.
         withinPlan = new Placement(Set.of(), plan.carrying(), plan.from(), plan.into(), plan.draws());
         waited = 0;
@@ -323,31 +323,16 @@ final class BodyRunner {
             }, () -> letGo(labor, level, body, "check:" + labor.phases().of(stopped.id())));
             return;
         }
-        if (withinBatch == null && waited > 0 && waited % WAIT_POLL_TICKS != 0) {
+        if (waited > 0 && waited % WAIT_POLL_TICKS != 0) {
             waited++;
             return;
         }
         Workload.Within shift = (Workload.Within) within.spec().workload();
         Workload.Within.Turn turn;
         try {
-            if (withinBatch == null) {
-                turn = shift.next(level, labor.hands(body, withinPlan));
-            } else {
-                turn = switch (withinBatch.next(level, labor.hands(body, withinPlan))) {
-                    case StepResult.Step step -> new Workload.Within.Turn.Piece(step.node());
-                    case StepResult.Auxiliary auxiliary -> new Workload.Within.Turn.Piece(auxiliary.node());
-                    case StepResult.Wait ignored -> Workload.Within.WAIT;
-                    case StepResult.Pause ignored -> Workload.Within.WAIT;
-                    case StepResult.Complete ignored -> Workload.Within.LEAVE;
-                    case StepResult.Failed failed -> {
-                        withinBatch.stop(failed.why());
-                        yield Workload.Within.LEAVE;
-                    }
-                };
-            }
+            turn = shift.next(level, labor.hands(body, withinPlan));
         } catch (RuntimeException | LinkageError broken) {
             Labor.LOGGER.error("node {} threw asked for its next piece", within.id(), broken);
-            if (withinBatch != null) withinBatch.stop(LaborRefusal.WORK_BROKE);
             turn = Workload.Within.LEAVE;
         }
         switch (turn) {
@@ -367,14 +352,12 @@ final class BodyRunner {
 
     // What the work needed went into its pieces as they were done, so nothing is drawn for it now.
     private void leave(ColonyLabor labor, ServerLevel level, Body body) {
-        BatchExecution batch = withinBatch;
         comeOut();
         activeBody = body;
         Node node = current;
         Outcome outcome;
         try {
-            outcome = batch == null ? node.commit(level, labor.hands(body, placement))
-                : batch.finish(level, labor.hands(body, placement));
+            outcome = node.commit(level, labor.hands(body, placement));
         } catch (RuntimeException | LinkageError broken) {
             Labor.LOGGER.error("node {} threw on commit", node.id(), broken);
             refuse(labor, level, body, LaborRefusal.WORK_BROKE);
@@ -389,10 +372,8 @@ final class BodyRunner {
 
     private void told(ServerLevel level, Node piece, Ending how) {
         try {
-            if (withinBatch == null) ((Workload.Within) within.spec().workload()).ended(level, piece, how);
-            else withinBatch.ended(level, piece, how);
+            ((Workload.Within) within.spec().workload()).ended(level, piece, how);
         } catch (RuntimeException | LinkageError broken) {
-            if (withinBatch != null) withinBatch.stop(LaborRefusal.WORK_BROKE);
             Labor.LOGGER.error("node {} threw told its piece {} ended as {}", within.id(), piece.id(), how, broken);
         }
     }
@@ -519,7 +500,7 @@ final class BodyRunner {
             if (joining) {
                 windupTicks = 0;
             }
-            startWork(labor, level, body);
+            startWork(level, body);
             return;
         }
         Optional<Trip> trip = setOut(labor, level, body);
@@ -562,13 +543,13 @@ final class BodyRunner {
     private void carry(ColonyLabor labor, ServerLevel level, Body body) {
         if (standing(body)) {
             putDown(body);
-            startWork(labor, level, body);
+            startWork(level, body);
             return;
         }
         switch (carrying.step(level, body.mob(), footings())) {
             case Going.Arrived ignored -> {
                 putDown(body);
-                startWork(labor, level, body);
+                startWork(level, body);
             }
             case Going.Failed(RefusalKind why) -> {
                 if (LET_GO_DEBUG) {
@@ -591,9 +572,9 @@ final class BodyRunner {
         carrying = null;
     }
 
-    private void startWork(ColonyLabor labor, ServerLevel level, Body body) {
+    private void startWork(ServerLevel level, Body body) {
         if (own == null && current.spec().workload() instanceof Workload.Within) {
-            enter(labor, body);
+            enter(body);
             return;
         }
         carrying = null;
@@ -719,10 +700,8 @@ final class BodyRunner {
         Node node = current;
         Worker who = labor.hands(body, placement);
         Outcome outcome;
-        BatchExecution batch = withinBatch != null && withinBatch.active(node) ? withinBatch : null;
         try {
-            outcome = withinBatch != null && withinBatch.auxiliary(node) ? Commit.transfer(level, node, who)
-                : Commit.run(level, node, who, batch);
+            outcome = Commit.run(level, node, who);
         } catch (RuntimeException | LinkageError broken) {
             Labor.LOGGER.error("node {} threw on commit", node.id(), broken);
             refuse(labor, level, body, LaborRefusal.WORK_BROKE);
@@ -735,17 +714,8 @@ final class BodyRunner {
                               List<ItemStack> returned) -> {
                 Wear.from(level, body, node.spec(), who, item -> labor.broke(resident, item));
                 WorkYield.gave(body.mob(), node, made);
-                List<BatchExecution.Output> placed = Stowing.put(who, placement, made);
-                if (batch != null) batch.produced(placed);
+                Stowing.put(who, placement, made);
                 xp.ifPresent(gained -> reward(level, body, gained));
-                if (batch != null) {
-                    try {
-                        batch.notifySettled(level);
-                    } catch (RuntimeException | LinkageError broken) {
-                        batch.stop(LaborRefusal.WORK_BROKE);
-                        Labor.LOGGER.error("batch {} threw observing committed step {}", batch.parent(), node.id(), broken);
-                    }
-                }
                 handIn(labor, level, body, node);
             }
             case Outcome.Failed(List<WorkNoise> ignored, RefusalKind why) ->
@@ -767,14 +737,16 @@ final class BodyRunner {
 
     private void failed(ColonyLabor labor, ServerLevel level, Body body, Node node,
             RefusalKind why) {
+        LaborIncident.work(labor.colony().id(), level, body, node, why.translationKey(),
+            net.minecraft.network.chat.Component.translatable("folkways.debug.incident.refused",
+                net.minecraft.network.chat.Component.translatable(why.translationKey())));
         NodeSpec spec = node.spec();
         body.balked(new Balk(Doing.open(spec.doing()).about(spec.about()).with(node.wares()), why,
             level.getGameTime()));
         if (own == null) {
             labor.balked(node, why, level.getGameTime());
         }
-        BatchExecution batch = own == null ? labor.existingBatch(node.id()) : null;
-        if (own == null && (batch == null || !batch.hasCommittedSteps()) && labor.phases().waits(node.id(), why)) {
+        if (own == null && labor.phases().waits(node.id(), why)) {
             letGo(labor, level, body, "waits:" + why);
             return;
         }

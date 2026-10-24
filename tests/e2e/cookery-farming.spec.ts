@@ -7,7 +7,7 @@ import { clickElement, scrollElementIntoView } from "../ldlib2";
 import { chooseInSelector, foundColonyFast, foundingBox, openColonyPanelViaBook, optInViaBook,
   waitForGroundedPlayer } from "../shared/colony/colony-founding";
 import { setMaintainDemandViaUI } from "../shared/colony/membership-optin";
-import { boardActs, settlePanel } from "../shared/ui/site-panel";
+import { boardActs, settlePanel, toggleCell } from "../shared/ui/site-panel";
 import { colonyRegistry, configureZone, createMarkedZone, openBookPage, setBookGesture,
   zoneCellsAt, zoneCount, zoneFlagSettingAt, zoneKindAt } from "../shared/ui/zone-tools";
 import { aimAndWorldLeftClick } from "../shared/ui/world-ui";
@@ -37,7 +37,7 @@ type Layout = ReturnType<typeof farming>;
 type Stack = { id?: string; count?: number; Slot?: number };
 type Inventory = { totals: Record<string, number>; chests: unknown[]; residents: unknown[]; drops: unknown[] };
 type FarmState = { compostPoint: boolean; compostHasBlockEntity: boolean; soil: string; root: string; middle: string; top: string; grass: number; compost: number;
-  wearHat: boolean; wearArmor: boolean; hatShared: number; hatResidents: Array<{ uuid: string; x: number; y: number; z: number }>;
+  automaticCompost: boolean; wearHat: boolean; wearArmor: boolean; hatShared: number; hatResidents: Array<{ uuid: string; x: number; y: number; z: number }>;
   complete: boolean; wheatPhysical: number; wheatCompostable: number; rareCompostable: number };
 
 for (const stage of twins()) test(stage.title("cookery farming: native rice, owned hats, protected seeds and a compost-to-grass loop"), async ({}, testInfo) => {
@@ -97,6 +97,8 @@ for (const stage of twins()) test(stage.title("cookery farming: native rice, own
     expect(compostRegistration.compostPoint, "the book registers a real ledger-owned composter point").toBe(true);
     expect(compostRegistration.compostHasBlockEntity, "registration preserves the native composter without a fabricated block entity").toBe(false);
 
+    evidence.compostOff = await toggleCompost(server, client, player, founded.standBlock, stage);
+    expect((await state(server, stage, layout)).automaticCompost).toBe(false);
     evidence.hatOff = await editClothing(server, client, player, founded.standBlock, stage, 0);
     expect((await state(server, stage, layout)).wearHat, "the real book action disables task hat borrowing").toBe(false);
     expect((await state(server, stage, layout)).wearArmor, "a full farmer outfit is opt-in").toBe(false);
@@ -172,9 +174,11 @@ for (const stage of twins()) test(stage.title("cookery farming: native rice, own
     for (const seed of GRASS_SEEDS) expect(initial.totals[seed] ?? 0, "there are no unstated rare seeds").toBe(0);
     await tick.sprint(server, 200);
     expect((await state(server, stage, layout)).hatResidents).toHaveLength(0);
-    expect((await inventory(server, stage, containers)).totals[WHEAT_SEED], "with seed task support disabled the composter consumes no surplus").toBe(256);
+    expect((await inventory(server, stage, containers)).totals[WHEAT_SEED], "with automatic composting disabled the composter consumes no surplus").toBe(256);
     expect((await state(server, stage, layout)).compost).toBe(0);
 
+    evidence.compostOn = await toggleCompost(server, client, player, founded.standBlock, stage);
+    expect((await state(server, stage, layout)).automaticCompost).toBe(true);
     evidence.hatOn = await editClothing(server, client, player, founded.standBlock, stage, 0);
     expect((await state(server, stage, layout)).wearHat).toBe(true);
     const looks = await readResidentLooks(server);
@@ -270,6 +274,16 @@ function farming(origin: Vec) {
     grass: { min: at(3, 3, -1), max: at(17, 17, -1) } };
 }
 
+async function toggleCompost(server: MinecraftServer, client: MinecraftClient, player: string, stand: Vec, stage: Stage) {
+  await openColonyPanelViaBook(server, client, player, stand, stage);
+  await scrollElementIntoView(client, { id: "folkways.page.compost_settings" });
+  await clickElement(client, { id: "folkways.page.compost_settings" });
+  await settlePanel(server, client);
+  const changed = await toggleCell(server, client, "folkways.settings.compost.enabled");
+  await screen.dismiss(client);
+  return changed;
+}
+
 async function editClothing(server: MinecraftServer, client: MinecraftClient, player: string, stand: Vec, stage: Stage,
   setting: 0 | 2, item?: string) {
   await openColonyPanelViaBook(server, client, player, stand, stage);
@@ -339,7 +353,7 @@ const READ_FARM = defineTask<{ rice: Vec; composter: Vec; min: Vec; max: Vec }, 
       "net.minecraft.world.entity.EquipmentSlot", "net.minecraft.world.item.Items", "io.github.izakyl.folkways.core.api.colony.Colonies",
       "io.github.izakyl.folkways.core.api.resident.body.Bodies", "io.github.izakyl.folkways.front.api.Fronts",
       "io.github.izakyl.folkways.core.api.colony.Held", "io.github.izakyl.folkways.core.api.terms.WorldPos",
-      "io.github.izakyl.folkways.cookery.CookeryContent", "io.github.izakyl.folkways.cookery.seeds.SeedPresence",
+      "io.github.izakyl.folkways.plugins.compost.CompostSettings", "io.github.izakyl.folkways.cookery.CookeryContent", "io.github.izakyl.folkways.plugins.compost.CompostContent", "io.github.izakyl.folkways.cookery.seeds.SeedPresence",
       "com.github.ysbbbbbb.kaleidoscopecookery.init.ModItems", "com.github.ysbbbbbb.kaleidoscopecookery.init.tag.TagMod"],
     members: `private static BlockPos pos(Object raw) {
       var at = (Map<?, ?>) raw;
@@ -362,12 +376,13 @@ var wheat=budget.tally(Items.WHEAT_SEEDS); var out=new LinkedHashMap<String,Obje
 out.put("soil",level.getBlockState(root.below()).toString());out.put("root",level.getBlockState(root).toString());out.put("middle",level.getBlockState(root.above()).toString());out.put("top",level.getBlockState(root.above(2)).toString());
 out.put("grass",grass);out.put("compost",compost.is(Blocks.COMPOSTER)?compost.getValue(ComposterBlock.LEVEL):-1);
 out.put("compostPoint",colony.holdingAt(WorldPos.of(level,pos(args.value("composter"))))
-  .filter(holding->holding.owner().equals(CookeryContent.COMPOST)&&holding.what() instanceof Held.Point).isPresent());
+  .filter(holding->holding.owner().equals(CompostContent.POINT)&&holding.what() instanceof Held.Point).isPresent());
 out.put("compostHasBlockEntity",level.getBlockEntity(pos(args.value("composter")))!=null);
 long sharedHats=0;for(var at:colony.storesIn(level.dimension())){
   var store=colony.store(level,at);if(store.isPresent())sharedHats+=io.github.izakyl.folkways.core.api.terms.Goods.countIn(store.get(),
     io.github.izakyl.folkways.core.api.terms.ItemSpec.of(TagMod.STRAW_HAT));
 }
+out.put("automaticCompost",CompostSettings.enabled(colony));
 out.put("wearHat",settings.flag("wear_hat"));out.put("wearArmor",settings.flag("wear_farmer_armor"));out.put("hatResidents",hats);out.put("hatShared",sharedHats);
 out.put("complete",budget.complete());out.put("wheatPhysical",wheat.physical());out.put("wheatCompostable",wheat.compostable());out.put("rareCompostable",rare);
 return out;`,

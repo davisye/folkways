@@ -166,9 +166,6 @@ public final class DockPatternGameTests {
             settings, lake(7));
         helper.assertTrue(DraftKit.explanationKey(refused(helper, cliff)).equals(DraftKit.key(pattern, "error.dock.bank")),
             "a cliff is refused");
-        Drawn wide = draw(pattern, new Hint.Path(List.of(new BlockPos(0, 2, -3), new BlockPos(0, 2, 20))),
-            defaults().count("width", 12), lake(1));
-        refused(helper, wide);
         helper.succeed();
     }
 }

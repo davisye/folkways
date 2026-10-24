@@ -6,8 +6,7 @@ lang = {
     "en_us": {
         "title": "Quarry",
         "depth": "Depth",
-        "error.quarry.size": "A quarry must be 8–64 blocks on each side",
-        "error.quarry.depth": "Quarry depth must be 0–16 blocks",
+        "error.quarry.size": "A quarry must be at least 8 blocks on each side",
         "error.quarry.water": "The quarry is under water",
         "error.quarry.ground": "No ground under the quarry",
         "error.quarry.empty": "Nothing here stands above the quarry's floor",
@@ -15,8 +14,7 @@ lang = {
     "zh_cn": {
         "title": "采石场",
         "depth": "深度",
-        "error.quarry.size": "采石场每边须为 8–64 格",
-        "error.quarry.depth": "采石场深度须为 0–16 格",
+        "error.quarry.size": "采石场每边至少 8 格",
         "error.quarry.water": "采石场大部分在水下",
         "error.quarry.ground": "采石场下方没有地面",
         "error.quarry.empty": "这里没有高于采石场底面的地面",
@@ -24,8 +22,7 @@ lang = {
     "zh_hk": {
         "title": "採石場",
         "depth": "深度",
-        "error.quarry.size": "採石場每邊須為 8–64 格",
-        "error.quarry.depth": "採石場深度須為 0–16 格",
+        "error.quarry.size": "採石場每邊至少 8 格",
         "error.quarry.water": "採石場大部分在水下",
         "error.quarry.ground": "採石場下方沒有地面",
         "error.quarry.empty": "這裏沒有高於採石場底面的地面",
@@ -33,8 +30,7 @@ lang = {
     "zh_tw": {
         "title": "採石場",
         "depth": "深度",
-        "error.quarry.size": "採石場每邊須為 8–64 格",
-        "error.quarry.depth": "採石場深度須為 0–16 格",
+        "error.quarry.size": "採石場每邊至少 8 格",
         "error.quarry.water": "採石場大部分在水下",
         "error.quarry.ground": "採石場下方沒有地面",
         "error.quarry.empty": "這裡沒有高於採石場底面的地面",
@@ -53,11 +49,9 @@ def cell(work, x, z, y, width = 1, height = 1):
 
 def draw(site):
     zone = site.zone.sized(height = 1)
-    if zone.width < 8 or zone.depth < 8 or zone.width > 64 or zone.depth > 64:
+    if zone.width < 8 or zone.depth < 8:
         reject("error.quarry.size")
     depth = site.count("depth")
-    if depth < 0 or depth > 16:
-        reject("error.quarry.depth")
     if site.survey(zone).water > 0.2:
         reject("error.quarry.water")
     width = zone.width

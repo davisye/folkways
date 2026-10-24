@@ -51,23 +51,22 @@ public final class SeedScene {
         scene.idle(60);
 
         scene.world().modifyBlockEntity(chest, ChestBlockEntity.class, store -> store.setItem(0, new ItemStack(ModItems.TOMATO_SEED.get(), 64)));
-        farmer.hold(scene, new ItemStack(ModItems.TOMATO_SEED.get(), 4));
-        scene.overlay().showText(110).text("Keep one normal stack per planting purpose. Seeds for sowing, goods already in transit, task claims and explicit orders are protected first. Wild rice and edible rice share one reserve, with wild seeds preferred. Only the remaining surplus may be composted.")
+        farmer.hold(scene, new ItemStack(ModItems.TOMATO_SEED.get(), 21));
+        scene.overlay().showText(110).text("Configure automatic composting, the default seed reserve and individual seed reserves on the Composting page. Sowing, transit, task claims and explicit orders are protected first. Wild rice and edible rice share a reserve, with wild seeds preferred.")
             .pointAt(util.vector().topOf(chest)).placeNearTarget().attachKeyFrame();
         scene.idle(120);
         farmer.walkTo(scene, util.vector().topOf(11, 0, 12));
         farmer.lookAt(scene, util.vector().centerOf(compost));
-        scene.world().setBlock(compost, Blocks.COMPOSTER.defaultBlockState().setValue(ComposterBlock.LEVEL, 1), false);
-        farmer.hold(scene, new ItemStack(ModItems.TOMATO_SEED.get(), 3));
-        scene.overlay().showText(100).text("Register a vanilla composter with the colony book; neither Cookery nor a straw hat is needed. Surplus seeds can feed it. A full composter yields its bone meal separately.")
+        scene.world().setBlock(compost, Blocks.COMPOSTER.defaultBlockState().setValue(ComposterBlock.LEVEL, 7), false);
+        farmer.hold(scene, ItemStack.EMPTY);
+        scene.overlay().showText(100).text("Mark a composter with the Colony Book. No straw hat is needed. A resident spends one batch at the native average cost and fills it directly to level seven. The reserve is checked again before feeding; an incomplete batch waits.")
             .pointAt(util.vector().topOf(compost)).placeNearTarget().attachKeyFrame();
         scene.idle(50);
-        farmer.hold(scene, new ItemStack(ModItems.TOMATO_SEED.get(), 2));
         scene.idle(60);
 
         scene.world().setBlock(compost, Blocks.COMPOSTER.defaultBlockState().setValue(ComposterBlock.LEVEL, 7), false);
         farmer.hold(scene, ItemStack.EMPTY);
-        scene.overlay().showText(100).text("Level seven must mature for the original twenty ticks. At level eight a resident collects the one real bone meal, and the composter empties. New sowing claims can reserve the next seed before it is fed.")
+        scene.overlay().showText(100).text("Level seven must mature for the original twenty ticks. At level eight a resident collects the one real bone meal, and the composter empties. New sowing claims protect the next batch before it is fed.")
             .pointAt(util.vector().topOf(compost)).placeNearTarget().attachKeyFrame();
         scene.idle(20);
         scene.world().setBlock(compost, Blocks.COMPOSTER.defaultBlockState().setValue(ComposterBlock.LEVEL, 8), false);

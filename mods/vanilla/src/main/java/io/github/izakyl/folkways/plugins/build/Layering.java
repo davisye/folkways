@@ -1,5 +1,6 @@
 package io.github.izakyl.folkways.plugins.build;
 
+import io.github.izakyl.folkways.core.api.terms.BlockSketch;
 import io.github.izakyl.folkways.core.api.terms.Reach;
 import io.github.izakyl.folkways.plugins.build.draft.Joint;
 import it.unimi.dsi.fastutil.longs.LongArrayFIFOQueue;
@@ -23,7 +24,6 @@ import net.minecraft.tags.FluidTags;
 import net.minecraft.world.level.LevelReader;
 import net.minecraft.world.level.block.LiquidBlock;
 import net.minecraft.world.level.block.state.BlockState;
-import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.material.Fluid;
 import net.minecraft.world.level.material.Fluids;
 
@@ -31,9 +31,9 @@ import net.minecraft.world.level.material.Fluids;
  * The order a build goes up in, worked out once from the whole target: every piece of work outward from one plane,
  * up from it layer by layer above and down from it layer by layer below, after only what it stands on.
  *
- * <p>A piece waits for the work a few pieces back along its own layer, or for the piece its layer goes out from,
- * and for whatever holds it up: a block it hangs from, the block under sand, the walls water would run out through,
- * the things on a block cleared before it. So the last few pieces of a layer may go in any order, by several hands.
+ * <p>Layer order is a preference, not a prerequisite. A piece waits only for what physically holds it up: a block
+ * it hangs from, the block under sand, the walls water would run out through, or the things on a block cleared
+ * before it. Independent work remains available when a preferred earlier piece cannot be done.
  * Nothing waits for room to stand in or a way to walk, so no piece is ever refused for want of them: those are for
  * the work to find when it is done.
  */
@@ -43,9 +43,9 @@ final class Layering {
         LAY,
         STRIP,
         DRAIN,
-        POUR,
         JOIN,
-        SCAFFOLD
+        SCAFFOLD,
+        SOAK
     }
 
     record Work(int id, Kind kind, BlockPos focus, Optional<Step> step, Optional<Joint> joint, boolean up, int band,
@@ -81,13 +81,8 @@ final class Layering {
     private static final int STANCE_DROP = 4;
     private static final int FAR_DROP = 24;
     private static final int MOST_STANCES = 12;
-    private static final int SCAFFOLD_SPREAD = 2;
-    private static final int SCAFFOLD_BELOW = 2;
-    private static final int TALLEST_SCAFFOLD = 32;
-    private static final int MOST_FROM_ONE_SCAFFOLD = 8;
-    // How many pieces along a layer may be under way at once, in any order: a piece waits for the one this many
-    // back, not for the one before it.
-    static final int SLACK = 4;
+    // Prefer stances that remain usable across a few nearby changes in the suggested construction order.
+    private static final int STANCE_SLACK = 4;
 
     private final LevelReader level;
     private final BuildTarget target;
@@ -98,8 +93,6 @@ final class Layering {
     private final Set<BlockPos> latched;
     private final Map<BlockPos, Long> changedAt = new HashMap<>();
     private final Map<BlockPos, BlockState> changedTo = new HashMap<>();
-    // Each scaffolded cell, and the keys between which its scaffold stands: over the first, up to the second.
-    private final Map<BlockPos, long[]> scaffolded = new HashMap<>();
 
     private Layering(LevelReader level, BuildTarget target, Set<BlockPos> latched) {
         this.level = level;
@@ -142,44 +135,37 @@ final class Layering {
     private Plan plan() {
         lay(pending());
         joints();
-        Sketch done = new Sketch(level);
+        BlockSketch done = new BlockSketch(level);
         drafts.stream().filter(draft -> !draft.dropped).forEach(draft -> done.drawAll(draft.after()));
         for (Draft draft : drafts) {
             switch (draft.kind) {
-                case LAY, POUR -> held(draft, done);
+                case LAY -> held(draft, done);
                 case STRIP -> cleared(draft);
                 case DRAIN -> drained(draft);
-                case JOIN, SCAFFOLD -> { }
+                case JOIN, SCAFFOLD, SOAK -> { }
             }
         }
         for (Draft draft : drafts) {
-            if (!draft.dropped && wet(target.wanted(draft.focus))) {
+            if (!draft.dropped && (draft.kind == Kind.SOAK || wet(target.wanted(draft.focus)))) {
                 walledIn(draft);
             }
         }
         Opening opening = opening();
         int plane = opening.plane();
         Map<Integer, Long> keys = new HashMap<>();
-        Map<Integer, Integer> parent = new HashMap<>();
-        int broken = spread(opening, keys, parent);
+        int broken = spread(opening, keys);
         Map<Integer, Set<Integer>> after = new HashMap<>();
         int held = 0;
         for (Map.Entry<Integer, Set<Integer>> edges : hard.entrySet()) {
             if (keys.containsKey(edges.getKey())) {
                 for (int before : edges.getValue()) {
-                    if (keys.containsKey(before)) {
+                    // spread resolves mutually dependent structures by choosing an order. Keep that order in
+                    // the executable graph too: copying a backward edge would recreate the cycle it broke.
+                    if (keys.containsKey(before) && keys.get(before) < keys.get(edges.getKey())) {
                         after.computeIfAbsent(edges.getKey(), id -> new LinkedHashSet<>()).add(before);
                         held++;
                     }
                 }
-            }
-        }
-        int led = 0;
-        for (int id : parent.keySet()) {
-            Integer back = waited(id, parent, plane);
-            if (back != null && keys.get(back) < keys.get(id)
-                && after.computeIfAbsent(id, key -> new LinkedHashSet<>()).add(back)) {
-                led++;
             }
         }
         for (Draft draft : live()) {
@@ -189,16 +175,6 @@ final class Layering {
                 changedTo.put(cell, state);
             });
         }
-        for (Scaffold scaffold : scaffold(keys)) {
-            Draft raise = add(Kind.SCAFFOLD, scaffold.column.getFirst(), Step.raise(scaffold.column), null);
-            Draft lower = add(Kind.SCAFFOLD, scaffold.column.getFirst(), Step.lower(scaffold.column), null);
-            keys.put(raise.id, scaffold.raised);
-            keys.put(lower.id, scaffold.lowered);
-            for (Draft served : scaffold.served) {
-                after.computeIfAbsent(served.id, id -> new LinkedHashSet<>()).add(raise.id);
-                after.computeIfAbsent(lower.id, id -> new LinkedHashSet<>()).add(served.id);
-            }
-        }
         List<Work> works = new ArrayList<>();
         for (Draft draft : live()) {
             long key = keys.get(draft.id);
@@ -207,19 +183,7 @@ final class Layering {
                 stances(draft, key)));
         }
         works.sort(Comparator.comparingLong(Work::key).thenComparingInt(Work::id));
-        return new Plan(plane, List.copyOf(works), after, Map.copyOf(refused), held, led, broken);
-    }
-
-    // The piece this one waits for of those that led the spread to it: the one SLACK back along its own layer, or
-    // the piece its layer was stepped out to from, when that comes first. None when the layer begins of itself
-    // within that many pieces.
-    private Integer waited(int id, Map<Integer, Integer> parent, int plane) {
-        int band = band(drafts.get(id), plane);
-        Integer back = parent.get(id);
-        for (int step = 1; back != null && step < SLACK && band(drafts.get(back), plane) == band; step++) {
-            back = parent.get(back);
-        }
-        return back;
+        return new Plan(plane, List.copyOf(works), after, Map.copyOf(refused), held, 0, broken);
     }
 
     private List<Draft> live() {
@@ -233,7 +197,7 @@ final class Layering {
             BlockPos pos = cell.getKey();
             if (!level.hasChunkAt(pos)) {
                 refused.put(pos, BuildRefusal.CELL_NOT_LOADED);
-            } else if (!latched.contains(pos) && !BuildPlanner.satisfied(level.getBlockState(pos), cell.getValue())) {
+            } else if (!latched.contains(pos) && !target.satisfied(level, pos)) {
                 pending.add(pos);
             }
         }
@@ -256,19 +220,52 @@ final class Layering {
                 if (unbreakable(Set.of(cell))) {
                     refused.put(cell, BuildRefusal.NO_WAY_TO_BUILD);
                 } else {
-                    add(Kind.STRIP, cell, Step.strip(level, cell), null);
+                    add(Kind.STRIP, cell, Step.strip(level, cell, latched::contains), null);
                 }
-            } else if (pours(cell, goal, standing)) {
-                add(Kind.POUR, cell, Step.pour(cell, standing), null);
             } else {
-                Footprint print = target.footprint(cell);
-                if (BuildPlanner.unlayable(print) || !Footprints.formed(print) || unbreakable(print.cells().keySet())) {
+                // A part another shot makes is laid with that shot, met here or later from its own cell.
+                Optional<SchematicPlacement.Launch> launch = target.launch(cell);
+                if (launch.isEmpty()) {
+                    continue;
+                }
+                Footprint print = target.footprint(launch.get());
+                Footprint remaining = Step.remaining(print, latched).orElseThrow();
+                if (unlayable(launch.get()) || unbreakable(remaining.cells().keySet())) {
                     refused.put(cell, BuildRefusal.NO_WAY_TO_BUILD);
                 } else {
-                    add(Kind.LAY, cell, Step.lay(level, print), null);
+                    laid(cell, Step.lay(level, print, latched::contains));
                 }
             }
         }
+        // A part whose shot is done or refused is never aimed at by itself: the cannon would not either.
+        for (BlockPos cell : pending) {
+            if (!owner.containsKey(cell) && !refused.containsKey(cell)) {
+                refused.put(cell, BuildRefusal.NO_WAY_TO_BUILD);
+            }
+        }
+    }
+
+    /**
+     * A block the target wants waterlogged takes in the water it is laid into, as one placed by hand would. Where no
+     * water stands it is laid dry, the cannon's way, and a bucket let into it after.
+     */
+    private void laid(BlockPos cell, Step step) {
+        Set<BlockPos> dry = new LinkedHashSet<>();
+        step.after().forEach((part, state) -> {
+            if (Step.soaked(state) && level.getFluidState(part).getType() != Fluids.WATER) {
+                dry.add(part);
+            }
+        });
+        Draft lay = add(Kind.LAY, cell, dry.isEmpty() ? step : step.dried(dry), null);
+        for (BlockPos part : dry) {
+            wait(add(Kind.SOAK, part, Step.soak(part, step.after().get(part)), null).id, lay.id);
+        }
+    }
+
+    private boolean unlayable(SchematicPlacement.Launch launch) {
+        return level instanceof net.minecraft.server.level.ServerLevel server
+            ? target.costs(server, launch, latched).isEmpty()
+            : BuildJob.quoted(launch, target::wanted).isEmpty();
     }
 
     /**
@@ -330,21 +327,16 @@ final class Layering {
         hard.computeIfAbsent(id, key -> new LinkedHashSet<>()).add(before);
     }
 
-    // What the piece leans on once all is built: every neighbour it would not stay without, taken away alone.
-    private void held(Draft draft, Sketch done) {
+    // What the piece leans on once all is built: every neighbour it would not stay without, taken away alone. It
+    // goes after those, so it is never placed in the air when it need not be.
+    private void held(Draft draft, BlockSketch done) {
         for (Map.Entry<BlockPos, BlockState> part : draft.after().entrySet()) {
             BlockState state = part.getValue();
             if (state.isAir() || state.liquid()) {
                 continue;
             }
             BlockPos at = part.getKey();
-            // Seagrass and the like are laid into water already standing there; nothing pours it for them.
-            if (!BuildPlanner.stays(done, at, state)
-                || BuildPlanner.drowned(state) && !level.getBlockState(at).getFluidState().isSourceOfType(Fluids.WATER)) {
-                draft.dropped = true;
-                refused.put(at, BuildRefusal.NO_WAY_TO_BUILD);
-                return;
-            }
+            // The cannon places what would not stay as readily as what would: holding up only orders the work.
             for (Direction direction : Direction.values()) {
                 BlockPos next = at.relative(direction);
                 Integer by = owner.get(next);
@@ -363,7 +355,7 @@ final class Layering {
 
     // What hangs on a cell cleared goes first, as it would drop when the cell does.
     private void cleared(Draft draft) {
-        Sketch without = new Sketch(level);
+        BlockSketch without = new BlockSketch(level);
         without.drawAll(draft.after());
         for (BlockPos part : draft.after().keySet()) {
             for (Direction direction : Direction.values()) {
@@ -525,7 +517,7 @@ final class Layering {
      * leads the way to its own support. Work the spread never meets (it touches nothing) starts on its own; a ring of
      * holding, which no world has, is broken where it stops the spread, and counted.
      */
-    private int spread(Opening opening, Map<Integer, Long> keys, Map<Integer, Integer> parent) {
+    private int spread(Opening opening, Map<Integer, Long> keys) {
         int plane = opening.plane();
         List<Draft> live = live();
         Set<Integer> alive = new HashSet<>();
@@ -612,7 +604,6 @@ final class Layering {
                         Long known = reached.get(by);
                         if (known == null || key < known) {
                             reached.put(by, key);
-                            parent.put(by, id);
                             if (!parked.contains(by)) {
                                 open.add(new long[] {due(by, reached, floor), by});
                             }
@@ -648,9 +639,9 @@ final class Layering {
 
     /**
      * Where a body may stand to do a piece, as the ground will be when the piece comes up: every piece before it
-     * done, none after, and any scaffold raised for it standing. Any cell in arm's reach counts, walls between or not.
-     * With none in reach and no scaffold to be had, the nearest ground under it counts: the piece is done from below,
-     * out of reach, rather than never.
+     * done, none after. Any cell in arm's reach counts, walls between or not. With none in reach, the nearest ground
+     * under it counts: the piece is done from below, out of reach, rather than never. Scaffolds are only considered
+     * while work is running, and do not affect the planned construction order or its stance estimates.
      */
     private List<BlockPos> stances(Draft draft, long key) {
         Set<BlockPos> own = draft.after().keySet();
@@ -660,7 +651,7 @@ final class Layering {
         // is stood on first.
         List<BlockPos> sure = new ArrayList<>();
         for (BlockPos feet : found) {
-            if (standsAt(feet, key - SLACK * HOP) && standsAt(feet, key + SLACK * HOP)) {
+            if (standsAt(feet, key - STANCE_SLACK * HOP) && standsAt(feet, key + STANCE_SLACK * HOP)) {
                 sure.add(feet);
             }
         }
@@ -698,120 +689,11 @@ final class Layering {
         return found;
     }
 
-    private static final class Scaffold {
-        final List<BlockPos> column;
-        final BlockPos top;
-        final List<Draft> served = new ArrayList<>();
-        final long raised;
-        long lowered;
-
-        Scaffold(List<BlockPos> column, long raised) {
-            this.column = column;
-            this.top = column.getLast().above();
-            this.raised = raised;
-        }
-    }
-
-    /**
-     * A scaffold for every piece with nowhere in reach to stand: a column beside and under it, raised before it from
-     * the ground and lowered once all it serves is done. A scaffold already up serves what else its top reaches, so
-     * one column takes a run of a high course; a piece no column can be raised for is done from below.
-     */
-    private List<Scaffold> scaffold(Map<Integer, Long> keys) {
-        List<Scaffold> raised = new ArrayList<>();
-        List<Draft> laid = new ArrayList<>(live().stream().filter(draft -> draft.kind == Kind.LAY).toList());
-        laid.sort(Comparator.comparingLong(draft -> keys.get(draft.id)));
-        for (Draft draft : laid) {
-            long key = keys.get(draft.id);
-            if (!inReach(draft, key).isEmpty()) {
-                continue;
-            }
-            Scaffold up = null;
-            for (Scaffold one : raised) {
-                if (one.served.size() < MOST_FROM_ONE_SCAFFOLD && one.raised < key && reaches(one.top, draft)) {
-                    up = one;
-                    break;
-                }
-            }
-            if (up == null) {
-                up = column(draft, key);
-                if (up == null) {
-                    continue;
-                }
-                raised.add(up);
-            }
-            up.served.add(draft);
-            up.lowered = Math.max(up.lowered, key + HOP);
-            long[] span = {up.raised, up.lowered};
-            up.column.forEach(cell -> scaffolded.put(cell, span));
-        }
-        return raised;
-    }
-
-    // The nearest column that stands on ground nothing changes, through air nothing fills, high enough for its top
-    // to reach the whole piece, and that a body on the ground beside its foot can raise.
-    private Scaffold column(Draft draft, long key) {
-        List<int[]> around = new ArrayList<>();
-        for (int dx = -SCAFFOLD_SPREAD; dx <= SCAFFOLD_SPREAD; dx++) {
-            for (int dz = -SCAFFOLD_SPREAD; dz <= SCAFFOLD_SPREAD; dz++) {
-                around.add(new int[] {dx, dz});
-            }
-        }
-        around.sort(Comparator.comparingInt(at -> Math.abs(at[0]) + Math.abs(at[1])));
-        for (int[] at : around) {
-            List<BlockPos> column = column(draft.focus.offset(at[0], -SCAFFOLD_BELOW, at[1]));
-            if (column.isEmpty()) {
-                continue;
-            }
-            Scaffold scaffold = new Scaffold(column, key - HOP);
-            if (!reaches(scaffold.top, draft) || !clear(scaffold.top, key) || !clear(scaffold.top.above(), key)
-                || owner.containsKey(scaffold.top) || owner.containsKey(scaffold.top.above())) {
-                continue;
-            }
-            Draft raising = new Draft(-1, Kind.SCAFFOLD, column.getFirst(), Step.raise(column), null);
-            if (!inReach(raising, scaffold.raised).isEmpty()) {
-                return scaffold;
-            }
-        }
-        return null;
-    }
-
-    // Downward from the top cell, to the first floor: never onto or through anything a piece changes, nor onto
-    // another scaffold, which drops what stands on it when it comes down. Bottom first, as it goes up.
-    private List<BlockPos> column(BlockPos top) {
-        List<BlockPos> downward = new ArrayList<>();
-        for (BlockPos cell = top; downward.size() < TALLEST_SCAFFOLD; cell = cell.below()) {
-            if (!level.getBlockState(cell).isAir() || owner.containsKey(cell) || scaffolded.containsKey(cell)) {
-                return List.of();
-            }
-            downward.add(cell);
-            BlockPos floor = cell.below();
-            if (!owner.containsKey(floor) && !scaffolded.containsKey(floor)
-                && level.getBlockState(floor).isFaceSturdy(level, floor, Direction.UP)) {
-                return downward.size() < 2 ? List.of() : List.copyOf(downward.reversed());
-            }
-        }
-        return List.of();
-    }
-
-    private static boolean reaches(BlockPos feet, Draft draft) {
-        for (BlockPos cell : draft.after().keySet()) {
-            if (!Reach.withinReach(feet, cell)) {
-                return false;
-            }
-        }
-        return true;
-    }
-
     private boolean standsAt(BlockPos feet, long key) {
         return clear(feet, key) && clear(feet.above(), key) && floor(feet.below(), key);
     }
 
     private BlockState stateAt(BlockPos cell, long key) {
-        long[] span = scaffolded.get(cell);
-        if (span != null && span[0] < key && key <= span[1]) {
-            return ScaffoldNode.state();
-        }
         Long at = changedAt.get(cell);
         return at != null && at < key ? changedTo.get(cell) : level.getBlockState(cell);
     }
@@ -827,7 +709,13 @@ final class Layering {
 
     private boolean unbreakable(Set<BlockPos> cells) {
         for (BlockPos cell : cells) {
+            if (latched.contains(cell)) {
+                continue;
+            }
             for (Map.Entry<BlockPos, BlockState> part : Footprints.standing(level, cell).entrySet()) {
+                if (latched.contains(part.getKey())) {
+                    continue;
+                }
                 BlockState state = part.getValue();
                 if (!state.isAir() && !state.liquid() && state.getDestroySpeed(level, part.getKey()) < 0.0F) {
                     return true;
@@ -837,13 +725,7 @@ final class Layering {
         return false;
     }
 
-    private static boolean pours(BlockPos cell, BlockState goal, BlockState standing) {
-        return goal.hasProperty(BlockStateProperties.WATERLOGGED) && goal.getValue(BlockStateProperties.WATERLOGGED)
-            && Fidelity.same(standing, goal.setValue(BlockStateProperties.WATERLOGGED, false));
-    }
-
     private static boolean wet(BlockState state) {
-        return state.getBlock() instanceof LiquidBlock
-            || state.hasProperty(BlockStateProperties.WATERLOGGED) && state.getValue(BlockStateProperties.WATERLOGGED);
+        return state.getBlock() instanceof LiquidBlock;
     }
 }

@@ -1,0 +1,9 @@
+Spark 1.10.124 (NeoForge 1.21.1), by Luck and contributors.
+Distributed unmodified, as a separate Jar-in-Jar mod, under GPLv3.
+Its license is in META-INF/LICENSE_spark.txt. Folkways is licensed separately.
+Nightly applies a client-only runtime compatibility mixin to honour Spark's background-profiler
+opt-in. The distributed Spark jar itself is unchanged.
+
+Official distribution: https://modrinth.com/mod/spark/version/1.10.124-neoforge-1.21.1
+Upstream source: https://github.com/lucko/spark
+Documentation: https://spark.lucko.me/docs

@@ -9,7 +9,7 @@ import net.minecraft.core.Vec3i;
 
 public final class BlueprintVolume {
 
-    public static final int MAX_EDGE = 512;
+    public static final int MAX_EDGE = 1024;
     private static long maxVolume() {
         return FolkwaysVanillaConfig.maxBlueprintVolume();
     }

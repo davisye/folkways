@@ -100,17 +100,17 @@ public final class FolkwaysVanillaConfig {
                 "as well as the blocks it lays, but not the empty air around them. A long wall or road",
                 "with its cut and fill comes to some tens of thousands. Raising it lets bigger work",
                 "through, at the cost of a longer standing order and more ghost blocks drawn in the world.")
-            .defineInRange("maxBuildCells", 65_536, 1, 1_048_576);
+            .defineInRange("maxBuildCells", 262_144, 1, 4_194_304);
         MAX_BLUEPRINT_VOLUME = BUILDER
             .comment("Widest span a blueprint may claim once read, in cells. This is the outer guard on a",
                 "malformed or hostile structure file, not a building size: it stops one from claiming a",
                 "volume too large to walk before its blocks are counted.")
-            .defineInRange("maxBlueprintVolume", 1_048_576L, 1L, 16_777_216L);
+            .defineInRange("maxBlueprintVolume", 33_554_432L, 1L, 1_073_741_824L);
         DRAW_SECONDS = BUILDER
             .comment("Longest one pattern may take to draw, in seconds, before it is stopped and refused.",
                 "Drawings run beside the game rather than in its tick, and patterns are trusted to read",
                 "and draw what they like within what they capture: this is the one limit held over them.")
-            .defineInRange("drawSeconds", 10, 1, 3_600);
+            .defineInRange("drawSeconds", 30, 1, 3_600);
         BUILDER.pop();
 
         BUILDER.push("crafting");

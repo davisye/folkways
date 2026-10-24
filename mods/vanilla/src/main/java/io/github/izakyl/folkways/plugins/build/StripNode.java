@@ -23,13 +23,16 @@ final class StripNode extends BuildNode {
 
     @Override
     Outcome work(ServerLevel level, Worker who) {
-        BlockPos at = cell(level);
-        BlockState standing = level.getBlockState(at);
+        Map<BlockPos, BlockState> before = remaining(level, job().before(), true);
+        if (before.isEmpty()) {
+            return Outcome.done();
+        }
+        BlockPos at = before.keySet().iterator().next();
+        BlockState standing = before.get(at);
         if (standing.liquid()) {
             level.setBlock(at, Blocks.AIR.defaultBlockState(), 3);
             return Outcome.done();
         }
-        Map<BlockPos, BlockState> before = standing(level, job().before());
         List<WorkNoise> heard = new ArrayList<>(before.size());
         for (Map.Entry<BlockPos, BlockState> cell : before.entrySet()) {
             if (cell.getValue().getDestroySpeed(level, cell.getKey()) < 0.0F) {
@@ -40,7 +43,7 @@ final class StripNode extends BuildNode {
             }
         }
         ItemStack tool = who.held(new ToolNeed.SuitableFor(standing));
-        List<ItemStack> spoil = Rubble.swap(level, who.body(), before, blocks(level, job().after()), tool, false);
+        List<ItemStack> spoil = Rubble.clear(level, who.body(), before, remaining(level, job().after(), false), tool);
         return new Outcome.Done(List.copyOf(heard), spoil, Optional.of(new Xp(BuildContent.trade(), 1)));
     }
 }

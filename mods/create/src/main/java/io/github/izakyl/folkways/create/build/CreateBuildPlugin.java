@@ -14,6 +14,7 @@ public final class CreateBuildPlugin {
 
     public static void install(IEventBus modBus) {
         CreateTrack.install();
+        io.github.izakyl.folkways.plugins.build.SchematicPlacement.install(new CreateSchematicPlacement());
         if (FMLEnvironment.dist.isClient()) {
             modBus.addListener(FMLClientSetupEvent.class, event -> event.enqueueWork(() ->
                 Scenes.add(BuildContent.ID, Scenes.scene("create_handoff", CreateHandoffScene::program))));

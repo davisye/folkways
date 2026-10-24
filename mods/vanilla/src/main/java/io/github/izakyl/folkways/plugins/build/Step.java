@@ -6,10 +6,15 @@ import io.github.izakyl.folkways.core.api.work.Stances;
 import io.github.izakyl.folkways.plugins.build.draft.Joint;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.function.Predicate;
+import javax.annotation.Nullable;
 import net.minecraft.core.BlockPos;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
@@ -36,28 +41,80 @@ record Step(BuildJob.Kind kind, BlockPos focus, Map<BlockPos, BlockState> before
     }
 
     static Step lay(BlockGetter world, Footprint goal) {
+        return lay(world, goal, cell -> false);
+    }
+
+    static Step lay(BlockGetter world, Footprint goal, Predicate<BlockPos> met) {
         Map<BlockPos, BlockState> before = new LinkedHashMap<>();
         Map<BlockPos, BlockState> after = new LinkedHashMap<>();
         for (BlockPos cell : goal.cells().keySet()) {
-            Footprints.standing(world, cell).forEach((part, state) -> {
+            if (met.test(cell)) {
+                continue;
+            }
+            standing(world, cell, met).forEach((part, state) -> {
                 before.putIfAbsent(part, state);
                 after.putIfAbsent(part, BuildPlanner.leftBehind(state));
             });
         }
-        after.putAll(goal.cells());
-        return new Step(BuildJob.Kind.LAY, goal.anchor(), before, after);
-    }
-
-    static Step pour(BlockPos cell, BlockState dry) {
-        return new Step(BuildJob.Kind.POUR, cell, Map.of(cell, dry),
-            Map.of(cell, dry.setValue(BlockStateProperties.WATERLOGGED, true)));
+        goal.cells().forEach((cell, state) -> {
+            if (!met.test(cell)) {
+                after.put(cell, state);
+            }
+        });
+        return new Step(BuildJob.Kind.LAY, after.containsKey(goal.anchor()) ? goal.anchor()
+            : after.keySet().stream().findFirst().orElse(goal.anchor()), before, after);
     }
 
     static Step strip(BlockGetter world, BlockPos cell) {
-        Map<BlockPos, BlockState> standing = Footprints.standing(world, cell);
+        return strip(world, cell, pos -> false);
+    }
+
+    static Step strip(BlockGetter world, BlockPos cell, Predicate<BlockPos> met) {
+        Map<BlockPos, BlockState> standing = standing(world, cell, met);
         Map<BlockPos, BlockState> cleared = new LinkedHashMap<>();
         standing.forEach((part, state) -> cleared.put(part, BuildPlanner.leftBehind(state)));
         return new Step(BuildJob.Kind.STRIP, standing.keySet().iterator().next(), standing, cleared);
+    }
+
+    private static Map<BlockPos, BlockState> standing(BlockGetter world, BlockPos cell, Predicate<BlockPos> met) {
+        Map<BlockPos, BlockState> standing = new LinkedHashMap<>();
+        if (met.test(cell)) {
+            return standing;
+        }
+        BlockState state = world.getBlockState(cell);
+        Footprint footprint = Footprints.of(pos -> met.test(pos) ? Blocks.AIR.defaultBlockState()
+            : world.getBlockState(pos), cell, state);
+        footprint.cells().forEach((part, expected) -> {
+            if (!met.test(part)) {
+                BlockState actual = part.equals(cell) ? state : world.getBlockState(part);
+                if (part.equals(cell) || actual == expected) {
+                    standing.put(part, actual);
+                }
+            }
+        });
+        return standing;
+    }
+
+    /** Water let into a block laid dry where the target wants it waterlogged: one bucket poured into it. */
+    static Step soak(BlockPos cell, BlockState wet) {
+        return new Step(BuildJob.Kind.SOAK, cell, Map.of(cell, dry(wet)), Map.of(cell, wet), Optional.empty(),
+            Costs.poured(Blocks.WATER.defaultBlockState()).orElse(List.of()));
+    }
+
+    /** This step with {@code cells} laid dry, the water to be let into them after. */
+    Step dried(Set<BlockPos> cells) {
+        Map<BlockPos, BlockState> laid = new LinkedHashMap<>(after);
+        cells.forEach(cell -> laid.computeIfPresent(cell, (pos, state) -> dry(state)));
+        return new Step(kind, focus, before, laid, joint, cost);
+    }
+
+    static boolean soaked(BlockState state) {
+        return state.hasProperty(BlockStateProperties.WATERLOGGED) && state.getValue(BlockStateProperties.WATERLOGGED);
+    }
+
+    static BlockState dry(BlockState state) {
+        return state.hasProperty(BlockStateProperties.WATERLOGGED)
+            ? state.setValue(BlockStateProperties.WATERLOGGED, false) : state;
     }
 
     static Step drain(BlockPos focus, Map<BlockPos, BlockState> layer) {
@@ -87,10 +144,54 @@ record Step(BuildJob.Kind kind, BlockPos focus, Map<BlockPos, BlockState> before
     }
 
     BuildJob job(BuildTarget target, Stances footings) {
+        return job(null, target, footings);
+    }
+
+    BuildJob job(@Nullable ServerLevel level, BuildTarget target, Stances footings) {
+        return job(level, target, footings, Set.of());
+    }
+
+    /** The job for this step. A laying step is one shot: it pays for and fires what the target aims at its focus. */
+    BuildJob job(@Nullable ServerLevel level, BuildTarget target, Stances footings, Set<BlockPos> met) {
         List<WorldPos> ends = joint.map(found -> List.of(target.cell(found.from()), target.cell(found.to())))
             .orElse(List.of());
+        if (kind != BuildJob.Kind.LAY) {
+            return new BuildJob(kind, target.cell(focus), footings, addressed(target, before), addressed(target, after),
+                ends, cost, Map.of(), Set.of());
+        }
+        Optional<SchematicPlacement.Launch> launch = target.launch(focus);
+        Set<WorldPos> shot = new LinkedHashSet<>();
+        Map<WorldPos, BlockData> data = new LinkedHashMap<>();
+        launch.ifPresent(found -> found.produces().forEach(cell -> {
+            if (after.containsKey(cell)) {
+                shot.add(target.cell(cell));
+            }
+            BlockData payload = target.data().get(cell);
+            if (payload != null) {
+                data.put(target.cell(cell), payload);
+            }
+        }));
+        List<Need> paid = launch.flatMap(found -> level == null
+                ? BuildJob.quoted(found, target::wanted)
+                : target.costs(level, found, met))
+            .orElse(List.of());
         return new BuildJob(kind, target.cell(focus), footings, addressed(target, before), addressed(target, after),
-            ends, cost);
+            ends, paid, data, shot);
+    }
+
+    /** The cells of a shot still to be placed. */
+    static Optional<Footprint> remaining(Footprint print, Set<BlockPos> met) {
+        Map<BlockPos, BlockState> cells = new LinkedHashMap<>();
+        print.cells().forEach((cell, state) -> {
+            if (!met.contains(cell)) {
+                cells.put(cell, state);
+            }
+        });
+        if (cells.isEmpty()) {
+            return Optional.empty();
+        }
+        BlockPos anchor = cells.containsKey(print.anchor()) ? print.anchor() : cells.keySet().iterator().next();
+        return Optional.of(new Footprint(anchor, cells));
     }
 
     private static Map<WorldPos, BlockState> addressed(BuildTarget target, Map<BlockPos, BlockState> cells) {

@@ -8,9 +8,151 @@ ext.modId = "folkways_core"
 ext.modName = "folkways-core"
 apply from: rootProject.file("gradle/mod.gradle")
 
+if (rootProject.diagnosticsBuild || rootProject.nightlyBuild) {
+    repositories {
+        exclusiveContent {
+            forRepository { maven { url = "https://api.modrinth.com/maven" } }
+            filter { includeModule("maven.modrinth", "spark") }
+        }
+    }
+}
+
+if (rootProject.diagnosticsBuild) {
+    dependencies {
+        compileOnly "maven.modrinth:spark:${project.spark_version}"
+    }
+    sourceSets.main.java.srcDir("src/diagnostics/java")
+    sourceSets.main.resources.srcDir("src/diagnostics/resources")
+}
+
+if (rootProject.nightlyBuild) {
+    dependencies {
+        jarJar("maven.modrinth:spark") {
+            version {
+                strictly "[${project.spark_version}]"
+                prefer project.spark_version
+            }
+            transitive = false
+        }
+    }
+    sourceSets.main.resources.srcDir("src/nightly/resources")
+}
+
+tasks.named("processResources") {
+    inputs.property("buildChannel", rootProject.buildChannel)
+    inputs.property("buildVersion", project.version.toString())
+    filesMatching("META-INF/folkways/build.properties") {
+        expand(build_channel: rootProject.buildChannel, build_version: project.version.toString())
+    }
+}
+
+// The optional development hook and Nightly's bundled Spark have separate packaging conditions.
+tasks.register("verifyDiagnostics") {
+    group = "verification"
+    dependsOn tasks.named("jar")
+    inputs.file(tasks.named("jar", Jar).flatMap { it.archiveFile })
+    inputs.property("buildChannel", rootProject.buildChannel)
+    inputs.property("buildVersion", project.version.toString())
+    inputs.property("diagnosticsBuild", rootProject.diagnosticsBuild)
+    inputs.property("sparkSha512", project.spark_sha512)
+    doLast {
+        def archive = tasks.named("jar", Jar).get().archiveFile.get().asFile
+        def contents = zipTree(archive)
+        def info = new Properties()
+        contents.matching { include "META-INF/folkways/build.properties" }.singleFile.withInputStream { info.load(it) }
+        if (info.getProperty("channel") != rootProject.buildChannel) {
+            throw new GradleException("Wrong diagnostic channel in ${archive.name}")
+        }
+        if (info.getProperty("version") != project.version.toString()) {
+            throw new GradleException("Wrong diagnostic version in ${archive.name}")
+        }
+        def metadata = new groovy.json.JsonSlurper().parse(
+            contents.matching { include "META-INF/jarjar/metadata.json" }.singleFile)
+        def profiler = metadata.jars.findAll { it.identifier.artifact == "spark" }
+        if (profiler.size() != (rootProject.nightlyBuild ? 1 : 0)) {
+            throw new GradleException("Unexpected Spark dependency in ${archive.name}")
+        }
+        if (rootProject.nightlyBuild) {
+            def nested = contents.matching { include profiler.first().path }.singleFile
+            def hash = java.security.MessageDigest.getInstance("SHA-512").digest(nested.bytes).encodeHex().toString()
+            if (hash != project.spark_sha512) {
+                throw new GradleException("Spark checksum mismatch in ${archive.name}")
+            }
+            contents.matching { include "META-INF/LICENSE_spark.txt" }.singleFile
+            contents.matching { include "META-INF/NOTICE_spark.txt" }.singleFile
+        } else if (!contents.matching {
+            include "META-INF/jarjar/*spark*.jar", "me/lucko/spark/**"
+            include "META-INF/LICENSE_spark.txt", "META-INF/NOTICE_spark.txt"
+        }.isEmpty()) {
+            throw new GradleException("Nightly profiler files leaked into ${archive.name}")
+        }
+        def modInfo = contents.matching { include "META-INF/neoforge.mods.toml" }.singleFile.text
+        if (rootProject.diagnosticsBuild) {
+            contents.matching { include "folkways-diagnostics.mixins.json" }.singleFile
+            contents.matching { include "io/github/izakyl/folkways/diagnostics/mixin/SparkClientBackgroundMixin.class" }.singleFile
+            contents.matching { include "io/github/izakyl/folkways/diagnostics/SparkDiagnosticsPlugin.class" }.singleFile
+            if (!modInfo.contains('config = "folkways-diagnostics.mixins.json"')) {
+                throw new GradleException("Development Spark client compatibility hook is not registered")
+            }
+        } else if (modInfo.contains("folkways-diagnostics.mixins.json") || !contents.matching {
+            include "folkways-diagnostics.mixins.json", "io/github/izakyl/folkways/diagnostics/**"
+        }.isEmpty()) {
+            throw new GradleException("Development client hook leaked into ${archive.name}")
+        }
+        logger.lifecycle("Verified ${rootProject.buildChannel} diagnostics in ${archive.name}")
+    }
+}
+
+// Shared helpers stay in the core module to retain access to package-private planning internals.
+// They contain no test registration, so consumers never load the core test suite to reuse them.
+sourceSets {
+    gameTestFixtures
+    diagnosticsTest {
+        compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
+        runtimeClasspath += sourceSets.main.output + sourceSets.main.runtimeClasspath
+    }
+}
+
+if (rootProject.diagnosticsBuild) {
+    dependencies {
+        diagnosticsTestRuntimeOnly "maven.modrinth:spark:${project.spark_version}"
+    }
+}
+
+tasks.register("checkDiagnostics", JavaExec) {
+    group = "verification"
+    classpath = sourceSets.diagnosticsTest.runtimeClasspath
+    mainClass = "io.github.izakyl.folkways.DiagnosticsCheck"
+    javaLauncher = javaToolchains.launcherFor {
+        languageVersion = JavaLanguageVersion.of(project.java_release.toInteger())
+    }
+    args rootProject.buildChannel, project.version.toString(), rootProject.diagnosticsBuild.toString()
+    environment.remove("SPARK_BACKGROUNDPROFILER")
+}
+
+tasks.named("check") {
+    dependsOn "verifyDiagnostics", "checkDiagnostics"
+}
+
+neoForge {
+    addModdingDependenciesTo sourceSets.gameTestFixtures
+}
+
+configurations {
+    gameTestFixturesCompileOnly.extendsFrom compileOnly
+    gameTestFixturesImplementation.extendsFrom implementation
+    gameTestFixturesRuntimeOnly.extendsFrom runtimeOnly
+}
+
 dependencies {
+    gameTestFixturesImplementation sourceSets.main.output
+    gameTestFixturesImplementation project(":vanilla")
+    gametestImplementation sourceSets.gameTestFixtures.output
     compileOnly lib("emi")
     compileOnly lib("jei")
+    compileOnly lib("jecharacters")
+    // JEC supplies this at runtime; only its configuration ticket is used, and nothing is bundled here.
+    compileOnly lib("pinin")
     compileOnly lib("shouldersurfing")
     compileOnly lib("create")
     compileOnly lib("sable"), lib("sable-companion")
@@ -35,40 +177,18 @@ dependencies {
     }
     api("com.lowdragmc.ldlib2:ldlib2-neoforge-${project.minecraft_version}:${project.ldlib_version}:all")
 
-    // The core's game tests stand residents up as the plugins' people, and one checks Create's extensions.
+    // Engine integration tests use Vanilla's residents without loading Vanilla's test suite.
     gametestImplementation project(":vanilla")
-    gametestCompileOnly project(":create")
 }
 
 def apiJar = tasks.register("apiJar", Jar) {
     archiveClassifier = "api"
     from sourceSets.main.output
     include "io/github/izakyl/folkways/core/api/**", "io/github/izakyl/folkways/front/api/**"
-    include "io/github/izakyl/folkways/base/task/**"
     includeEmptyDirs = false
 }
 
 publishing.publications.mod.artifact apiJar
-
-// The job service has no game dependency; exercise its concurrency contracts on every check, including CI.
-def jobTestClasses = layout.buildDirectory.dir("jobs-test")
-def compileJobsTest = tasks.register("compileJobsTest", JavaCompile) {
-    source file("src/main/java/io/github/izakyl/folkways/base/task/Jobs.java")
-    source rootProject.file("tests/java/io/github/izakyl/folkways/base/task/JobsTest.java")
-    classpath = files()
-    destinationDirectory = jobTestClasses
-    options.release = project.java_release.toInteger()
-    options.encoding = "UTF-8"
-}
-def jobsTest = tasks.register("jobsTest", JavaExec) {
-    dependsOn compileJobsTest
-    classpath = files(jobTestClasses)
-    mainClass = "io.github.izakyl.folkways.base.task.JobsTest"
-    javaLauncher = javaToolchains.launcherFor {
-        languageVersion = JavaLanguageVersion.of(project.java_release.toInteger())
-    }
-}
-tasks.named("check") { dependsOn jobsTest }
 
 // Native optional-integration tests share this mod's package and module, without linking its main source to Cookery.
 dependencies {

@@ -25,11 +25,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import net.minecraft.commands.arguments.blocks.BlockStateParser;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.gametest.framework.GameTest;
 import net.minecraft.gametest.framework.GameTestHelper;
+import net.minecraft.nbt.CompoundTag;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.Container;
@@ -40,6 +42,9 @@ import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.Mirror;
+import net.minecraft.world.level.block.Rotation;
+import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplate;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
@@ -162,6 +167,57 @@ public final class CreateJointGameTests {
     }
 
     @GameTest(template = "empty", timeoutTicks = 100)
+    public static void importedCurvesKeepTheirEntityStateAndSurviveTurningAndRelocation(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        BlockPos source = base(helper);
+        floor(level, source, 10);
+        BlockPos end = source.offset(8, 0, 8);
+        level.setBlock(source, track("xo"), 3);
+        level.setBlock(end, track("zo"), 3);
+        int curveCost = count(Joints.joiner().cost(level, source, end).orElseThrow(), track());
+        helper.assertTrue(Joints.joiner().join(level, source, end, of(track(), curveCost)).joined(),
+            "the fixture is a real Create curve");
+        StructureTemplate template = new StructureTemplate();
+        template.fillFromWorld(level, source, new net.minecraft.core.Vec3i(9, 1, 9), false, Blocks.AIR);
+        CompoundTag file = template.save(new CompoundTag());
+        Blueprint imported = StructureNbt.toBlueprint(file, level.registryAccess(), UUID.randomUUID(), "curve", 0,
+            StructureNbt.AirMeaning.UNCONSTRAINED, 1000).orElseThrow();
+        Blueprint turned = imported.transformed(Rotation.CLOCKWISE_90, Mirror.FRONT_BACK).orElseThrow();
+        helper.assertTrue(turned.blocks().size() > 2, "the captured world includes Create's temporary curve blocks");
+        BlockPos destination = source.offset(24, 0, 0);
+        floor(level, destination, 10);
+        BuildTarget target = BuildTarget.of(BlueprintBuildOrder.create(turned.id(), "curve",
+            WorldPos.of(level, destination), Optional.empty(), "", 0), turned.confirm(level));
+        helper.assertValueEqual(target.cells().size(), 2, "only the curve endpoints need independent construction");
+        int quoted = 0;
+        for (BlockPos pos : target.cells().keySet()) {
+            BlockState wanted = target.wanted(pos);
+            helper.assertTrue(wanted.getValue(com.simibubi.create.content.trains.track.TrackBlock.HAS_BE),
+                "placement keeps turn=true so the curve entity can exist");
+            helper.assertTrue(!BuildPlanner.satisfied(wanted.setValue(
+                com.simibubi.create.content.trains.track.TrackBlock.HAS_BE, false), wanted),
+                "completion requires the same curve entity state as placement");
+            quoted += target.launch(pos).flatMap(shot -> target.costs(level, shot, Set.of())).orElseThrow().stream()
+                .mapToInt(need -> Math.toIntExact(need.count())).sum();
+        }
+        helper.assertValueEqual(quoted, curveCost + 2, "curve material is charged once, plus both endpoints");
+        Worker worker = worker(helper, destination.offset(4, 0, 4), quoted);
+        SiteRig site = SiteRig.start(level, target);
+        for (int pass = 0; pass < 8 && !site.site.complete(); pass++) {
+            work(helper, site, worker);
+        }
+        List<BlockPos> ends = new ArrayList<>(target.cells().keySet());
+        helper.assertTrue(Joints.joiner().joined(level, ends.get(0), ends.get(1)),
+            "transformed curve connections point at the relocated endpoints");
+        helper.assertValueEqual(tracks(worker), 0L, "the imported curve consumes exactly its quote");
+        helper.assertTrue(BuildPlanner.complete(level, target), "restored curve satisfies the blueprint");
+        helper.runAfterDelay(10, () -> {
+            helper.assertTrue(curveEdges(destination, 10) > 0, "the restored curve enters Create's railway graph");
+            helper.succeed();
+        });
+    }
+
+    @GameTest(template = "empty", timeoutTicks = 100)
     public static void aTurnCreateWouldRefuseHasNoCost(GameTestHelper helper) {
         ServerLevel level = helper.getLevel();
         BlockPos base = base(helper);
@@ -254,7 +310,7 @@ public final class CreateJointGameTests {
             == BuildJob.Kind.LAY), "the ends are laid before anything joins them");
         work(helper, site, worker);
         helper.assertValueEqual(tracks(worker), 62L, "one track for each end");
-        helper.assertTrue(!BuildPlanner.complete(level, target), "two loose ends are not the railway yet");
+        helper.assertTrue(!site.site.complete(), "two loose ends are not the railway yet");
 
         List<BuildSite.Piece> joins = site.site.pieces();
         helper.assertValueEqual(joins.size(), 1, "one join is asked for once both ends stand");
@@ -265,7 +321,7 @@ public final class CreateJointGameTests {
         work(helper, site, worker);
         helper.assertValueEqual(tracks(worker), 62L - owed, "and spends exactly that");
         helper.assertTrue(Joints.joiner().joined(level, from, to), "the turn is laid");
-        helper.assertTrue(BuildPlanner.complete(level, target), "the railway is complete");
+        helper.assertTrue(site.site.metJoints().contains(new Joint(from, to)), "the built turn is latched complete");
         helper.assertTrue(site.site.complete(), "and its order is done");
 
         Map<BlockPos, BlockState> cleared = new LinkedHashMap<>();
@@ -281,6 +337,16 @@ public final class CreateJointGameTests {
         helper.assertValueEqual(count(made, track()), owed + 1, "taking an end up gives back it and the whole turn");
         helper.assertTrue(!Joints.joiner().joined(level, from, to), "the turn is gone with its end");
         helper.assertValueEqual(tracks(worker), before, "nothing is taken from the worker to take it up");
+        Set<BlockPos> met = site.site.met();
+        Set<Joint> joined = site.site.joined();
+        site.site.close();
+        SiteRig restored = SiteRig.start(level, target, new TemporaryScaffolds(() -> { }), met, joined);
+        helper.assertTrue(restored.site.complete(), "restoring does not recheck a completed railway after its removal");
+        helper.assertValueEqual(BuildOrderView.of(UUID.randomUUID(), target, restored.site.metCells(),
+            restored.site.metJoints()).orElseThrow().placed(), 3, "both endpoints and the turn retain their progress");
+        helper.assertTrue(BuildOrderView.pending(level, target, restored.site.metCells(), restored.site.metJoints()).isEmpty(),
+            "completed endpoints and curves do not return as ghosts");
+        restored.site.close();
         helper.runAfterDelay(5, () -> {
             helper.assertValueEqual(level.getEntitiesOfClass(ItemEntity.class, new AABB(base).inflate(12)).size(), 0,
                 "nothing spills on the ground");

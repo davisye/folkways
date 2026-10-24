@@ -308,10 +308,6 @@ public final class DraftRoadGameTests {
         helper.assertTrue(Set.of(DraftKit.key(pattern, "error.road.water_depth"), DraftKit.key(pattern, "error.road.water_crossing"))
             .contains(DraftKit.explanationKey(wide)),
             "a wide water points at the bridge: " + wide.detail());
-        Drawn.Refused narrow = DraftKit.refused(helper, draw(pattern, flat, settings(pattern).count("width", 2),
-            new BlockPos(0, 64, 0), new BlockPos(20, 64, 0)));
-        helper.assertTrue(DraftKit.explanationKey(narrow).equals(DraftKit.key(pattern, "error.road.width")),
-            "a width out of range is explained");
         helper.succeed();
     }
 

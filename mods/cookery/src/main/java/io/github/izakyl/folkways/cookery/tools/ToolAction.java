@@ -14,7 +14,6 @@ import io.github.izakyl.folkways.core.api.work.Stances;
 import io.github.izakyl.folkways.core.api.work.WorkSite;
 import io.github.izakyl.folkways.core.api.work.Worker;
 import io.github.izakyl.folkways.core.api.work.Workload;
-import io.github.izakyl.folkways.core.api.work.batch.InventoryTransfer;
 import io.github.izakyl.folkways.cookery.CookeryContent;
 import io.github.izakyl.folkways.cookery.CookeryRefusal;
 import java.util.ArrayList;
@@ -25,7 +24,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.Container;
 import net.minecraft.world.item.ItemStack;
 
-abstract class ToolAction implements InventoryTransfer {
+abstract class ToolAction implements Node {
 
     final TaskTools service;
     final KitchenTools.Lease lease;

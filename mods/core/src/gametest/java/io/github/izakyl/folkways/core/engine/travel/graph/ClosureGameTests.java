@@ -1,7 +1,17 @@
 package io.github.izakyl.folkways.core.engine.travel.graph;
 
 import io.github.izakyl.folkways.FolkwaysMod;
+import io.github.izakyl.folkways.core.api.Declaring;
+import io.github.izakyl.folkways.core.api.colony.Colony;
+import io.github.izakyl.folkways.core.api.passage.Passage;
+import io.github.izakyl.folkways.core.api.participation.Participation;
+import io.github.izakyl.folkways.core.api.participation.Participations;
+import io.github.izakyl.folkways.core.api.participation.Stake;
+import io.github.izakyl.folkways.core.api.resident.Conveyance;
 import io.github.izakyl.folkways.core.api.resident.Resident;
+import io.github.izakyl.folkways.core.api.passage.Fare;
+import io.github.izakyl.folkways.core.api.passage.Hop;
+import io.github.izakyl.folkways.core.api.work.Stances;
 import io.github.izakyl.folkways.core.api.terms.Closures;
 import io.github.izakyl.folkways.core.api.terms.Realm;
 import io.github.izakyl.folkways.core.api.terms.WorldPos;
@@ -32,6 +42,18 @@ public final class ClosureGameTests {
 
     private static final Sort SORT = new Sort(ResourceLocation.fromNamespaceAndPath("folkways", "walking"),
         new Bulk(1, 2));
+
+    private static final ResourceLocation SERVICE = ResourceLocation.fromNamespaceAndPath("folkways", "test_closure_passage");
+
+    @SubscribeEvent
+    public static void declare(Declaring event) {
+        event.passage(new Passage() {
+            public ResourceLocation id() { return SERVICE; }
+            public List<Hop> hopsIn(Colony colony) { return List.of(); }
+            public Conveyance aboard(Hop hop) { throw new UnsupportedOperationException("graph-only test passage"); }
+        });
+        Participations.register(KIND, Stake.passage(SERVICE), Participation.ALWAYS);
+    }
 
     // The closed ground: x 8 to 12 across the line the ways run along.
     private static final BoundingBox BOX = new BoundingBox(8, 0, -2, 12, 4, 2);
@@ -71,49 +93,147 @@ public final class ClosureGameTests {
     }
 
     @GameTest(template = "empty")
-    public static void aGoalInClosedGroundIsComeToByItsDoorAndWalkedTo(GameTestHelper helper) {
-        WorldPos start = pos(helper, 0, 0);
-        WorldPos door = pos(helper, 7, 0);
-        WorldPos goal = pos(helper, 10, 0);
-        WayGraph ways = ways(helper, List.of(door), start, door);
-        Faring fare = ways.journey(who(), start, Set.of(goal));
-        helper.assertTrue(fare instanceof Faring.Yes, "the goal is come to, not " + fare);
+    public static void closedWorkIsReachedNativelyWithoutPublicWaypoints(GameTestHelper helper) {
+        WorldPos outside = pos(helper, 0, 0);
+        WorldPos inside = pos(helper, 10, 0);
+        WorldPos other = pos(helper, 11, 1);
+        Asked asked = new Asked();
+        WayGraph ways = ways(helper, Map.of(), List.of(), asked);
+        WorldPos distant = pos(helper, 200, 0);
+        for (List<WorldPos> trip : List.of(List.of(outside, inside), List.of(inside, outside), List.of(inside, other),
+                List.of(distant, inside), List.of(inside, distant))) {
+            WorldPos from = trip.getFirst();
+            WorldPos goal = trip.getLast();
+            Faring fare = ways.journey(who(), from, Set.of(goal));
+            helper.assertTrue(fare instanceof Faring.Yes, "work-area navigation needs no public graph, got " + fare);
+            Journey by = ((Faring.Yes) fare).by();
+            helper.assertTrue(by.legs().equals(List.of(Leg.afoot(Set.of(goal)))),
+                "the body walks directly to the real destination without an intermediate entrance");
+            helper.assertValueEqual(by.walkTicks(), Waypoints.Net.ticks(from.cell(), goal.cell()),
+                "the native walk has an estimated cost");
+            reckonedAlike(helper, ways, from, goal, by);
+        }
+        helper.assertTrue(asked.drain().isEmpty(), "entering, leaving and working inside never asks for internal public ways");
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty")
+    public static void ordinaryTrafficStillRoutesAroundTheClosedWorkArea(GameTestHelper helper) {
+        WorldPos west = pos(helper, 0, 0);
+        WorldPos east = pos(helper, 20, 0);
+        Waypoints net = bend(true);
+        WayGraph ways = ways(helper, Map.of(new Tract(SORT, west.realm()), net.freeze(1)), List.of(), new Asked());
+        Faring fare = ways.journey(who(), west, Set.of(east));
+        helper.assertTrue(fare instanceof Faring.Yes, "the ordinary route around the work area remains available");
         Journey by = ((Faring.Yes) fare).by();
-        Leg last = by.legs().getLast();
-        Leg before = by.legs().get(by.legs().size() - 2);
-        helper.assertTrue(last.to().equals(Set.of(goal)) && last.from().isEmpty(),
-            "the last of it is walked in from the door, off the ways");
-        helper.assertTrue(before.to().equals(Set.of(door)), "the ways end at the door");
-        helper.assertTrue(by.walkTicks() >= Waypoints.Net.ticks(start.cell(), door.cell())
-            + Waypoints.Net.ticks(door.cell(), goal.cell()), "the walk in is counted");
-        reckonedAlike(helper, ways, start, goal, by);
+        helper.assertTrue(by.walkTicks() > Waypoints.Net.ticks(west.cell(), east.cell()),
+            "two outside endpoints keep the detour instead of taking the native shortcut through the site");
+        helper.assertTrue(by.legs().stream().flatMap(leg -> leg.to().stream())
+            .noneMatch(cell -> BOX.isInside(cell.cell())), "ordinary traffic has no waypoint inside the site");
+        reckonedAlike(helper, ways, west, east, by);
         helper.succeed();
     }
 
     @GameTest(template = "empty")
-    public static void aBodyInClosedGroundWalksOutByADoor(GameTestHelper helper) {
-        WorldPos inside = pos(helper, 11, 1);
-        WorldPos unlaid = pos(helper, 13, 0);
-        WorldPos door = pos(helper, 7, 0);
-        WorldPos goal = pos(helper, 0, 0);
-        WayGraph ways = ways(helper, List.of(unlaid, door), goal, door);
-        Faring fare = ways.journey(who(), inside, Set.of(goal));
-        helper.assertTrue(fare instanceof Faring.Yes, "the way out is found, not " + fare);
-        Leg first = ((Faring.Yes) fare).by().legs().getFirst();
-        helper.assertTrue(first.to().equals(Set.of(door)) && first.from().isEmpty(),
-            "it walks out to the nearest door with a way on");
-        reckonedAlike(helper, ways, inside, goal, ((Faring.Yes) fare).by());
+    public static void aWorkAreaDoesNotMakeAnotherRealmReachableOnFoot(GameTestHelper helper) {
+        WorldPos inside = pos(helper, 10, 0);
+        WorldPos elsewhere = new WorldPos(new Realm.Frame(UUID.randomUUID()), inside.cell());
+        Asked asked = new Asked();
+        WayGraph ways = ways(helper, Map.of(), List.of(), asked);
+        for (List<WorldPos> trip : List.of(List.of(inside, elsewhere), List.of(elsewhere, inside))) {
+            helper.assertTrue(!(ways.journey(who(), trip.getFirst(), Set.of(trip.getLast())) instanceof Faring.Yes),
+                "identical local coordinates in another realm cannot be reached without a passage");
+            helper.assertTrue(!(ways.reckon(who(), trip.getFirst(), Set.of(trip.getLast())) instanceof Faring.Yes),
+                "planning cannot invent a native walk across realms either");
+        }
+        helper.assertTrue(asked.drain().isEmpty(), "no internal public path is requested for an absent passage");
         helper.succeed();
     }
 
     @GameTest(template = "empty")
-    public static void placesInTheSameClosedGroundAreWalkedBetween(GameTestHelper helper) {
-        WorldPos from = pos(helper, 9, -1);
-        WorldPos to = pos(helper, 12, 2);
-        WayGraph ways = ways(helper, List.of(pos(helper, 7, 0)), pos(helper, 0, 0), pos(helper, 7, 0));
-        Faring fare = ways.journey(who(), from, Set.of(to));
-        helper.assertTrue(fare instanceof Faring.Yes yes && yes.by().legs().size() == 1
-            && yes.by().legs().getFirst().to().equals(Set.of(to)), "it is one walk, off the ways");
+    public static void aDisconnectedNearestPublicPointDoesNotHideACrossRealmPassage(GameTestHelper helper) {
+        WorldPos inside = pos(helper, 10, 0);
+        WorldPos publicGround = pos(helper, 0, 0);
+        Realm aboard = new Realm.Frame(UUID.randomUUID());
+        WorldPos landing = new WorldPos(aboard, new BlockPos(100, 1, 0));
+        WorldPos destination = new WorldPos(aboard, new BlockPos(104, 1, 0));
+        Waypoints ground = new Waypoints();
+        ground.pin(publicGround.cell().asLong(), 0);
+        // This ordinary isolated work position is closer to the site than the passage's public landing.
+        // It has no link to that landing, so choosing only the nearest point strands both travel directions.
+        WorldPos isolated = pos(helper, 4, 0);
+        ground.pin(isolated.cell().asLong(), 0);
+        ground.closeOff(BOX);
+        helper.assertTrue(ground.at(isolated.cell().asLong()) >= 0,
+            "the closer disconnected public island remains outside the closure");
+        Waypoints ship = new Waypoints();
+        both(ship, ship.pin(landing.cell().asLong(), 0), ship.pin(destination.cell().asLong(), 0));
+        Hop outward = new Hop(SERVICE, new Stances.Cells(Set.of(publicGround)),
+            new Stances.Cells(Set.of(landing)), Fare.flat(20));
+        Hop homeward = new Hop(SERVICE, new Stances.Cells(Set.of(landing)),
+            new Stances.Cells(Set.of(publicGround)), Fare.flat(20));
+        Asked asked = new Asked();
+        WayGraph ways = ways(helper, Map.of(new Tract(SORT, publicGround.realm()), ground.freeze(1),
+                new Tract(SORT, aboard), ship.freeze(1)),
+            List.of(new Crossing(publicGround, landing, outward, SERVICE),
+                new Crossing(landing, publicGround, homeward, SERVICE)), asked);
+        for (List<WorldPos> trip : List.of(List.of(inside, destination), List.of(destination, inside))) {
+            WorldPos from = trip.getFirst();
+            WorldPos goal = trip.getLast();
+            Faring fare = ways.journey(who(), from, Set.of(goal));
+            helper.assertTrue(fare instanceof Faring.Yes, "a real passage connects the work trip across realms, got " + fare);
+            Journey by = ((Faring.Yes) fare).by();
+            helper.assertValueEqual(by.rideTicks(), 20, "the actual passage is retained instead of a cross-realm native walk");
+            helper.assertTrue(by.legs().stream().anyMatch(leg -> leg.hop().isPresent()), "the trip includes its passage");
+            helper.assertValueEqual(by.legs().getLast().to(), Set.of(goal), "the journey still ends at the real destination");
+            if (from.equals(inside)) {
+                helper.assertValueEqual(by.legs().getFirst(), Leg.afoot(Set.of(publicGround)),
+                    "leaving the work area walks natively to the ordinary passage network");
+            } else {
+                helper.assertValueEqual(by.legs().getLast(), Leg.afoot(Set.of(inside)),
+                    "after the passage, the final native segment reaches the work itself");
+            }
+            reckonedAlike(helper, ways, from, goal, by);
+        }
+        helper.assertTrue(asked.drain().isEmpty(), "the existing passage requires no public search inside the work area");
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty")
+    public static void aDistantWorkTripKeepsItsPublicRideAndNativeFinalSegment(GameTestHelper helper) {
+        WorldPos inside = pos(helper, 10, 0);
+        WorldPos nearbyPublic = pos(helper, 0, 0);
+        WorldPos distantPublic = pos(helper, 200, 0);
+        Waypoints net = new Waypoints();
+        net.pin(nearbyPublic.cell().asLong(), 0);
+        net.pin(distantPublic.cell().asLong(), 0);
+        net.closeOff(BOX);
+        Hop outward = new Hop(SERVICE, new Stances.Cells(Set.of(distantPublic)),
+            new Stances.Cells(Set.of(nearbyPublic)), Fare.flat(20));
+        Hop homeward = new Hop(SERVICE, new Stances.Cells(Set.of(nearbyPublic)),
+            new Stances.Cells(Set.of(distantPublic)), Fare.flat(20));
+        Asked asked = new Asked();
+        WayGraph ways = ways(helper, Map.of(new Tract(SORT, inside.realm()), net.freeze(1)),
+            List.of(new Crossing(distantPublic, nearbyPublic, outward, SERVICE),
+                new Crossing(nearbyPublic, distantPublic, homeward, SERVICE)), asked);
+        for (List<WorldPos> trip : List.of(List.of(distantPublic, inside), List.of(inside, distantPublic))) {
+            WorldPos from = trip.getFirst();
+            WorldPos goal = trip.getLast();
+            Faring fare = ways.journey(who(), from, Set.of(goal));
+            helper.assertTrue(fare instanceof Faring.Yes, "the existing long-distance network serves the work trip, got " + fare);
+            Journey by = ((Faring.Yes) fare).by();
+            helper.assertValueEqual(by.rideTicks(), 20, "the distant approach preserves the available ride");
+            helper.assertTrue(by.legs().stream().anyMatch(leg -> leg.hop().isPresent()), "the native fallback does not replace the public ride");
+            if (goal.equals(inside)) {
+                helper.assertValueEqual(by.legs().getLast(), Leg.afoot(Set.of(inside)),
+                    "the last segment reaches the actual work without selecting an entrance");
+            } else {
+                helper.assertValueEqual(by.legs().getFirst(), Leg.afoot(Set.of(nearbyPublic)),
+                    "the return trip walks natively to the available public network");
+            }
+            reckonedAlike(helper, ways, from, goal, by);
+        }
+        helper.assertTrue(asked.drain().isEmpty(), "the long approach does not request routes through the closed work area");
         helper.succeed();
     }
 
@@ -138,13 +258,11 @@ public final class ClosureGameTests {
         return net;
     }
 
-    // A graph whose ways join `from` and `to`, over ground closed by BOX with the doors given.
-    private static WayGraph ways(GameTestHelper helper, List<WorldPos> doors, WorldPos from, WorldPos to) {
-        Waypoints net = new Waypoints();
-        both(net, net.pin(from.cell().asLong(), 0), net.pin(to.cell().asLong(), 0));
-        Closures.Closed closed = new Closures.Closed(helper.getLevel().dimension(), BOX, doors);
-        return new WayGraph(Map.of(KIND, SORT), Map.of(new Tract(SORT, Realm.of(helper.getLevel())), net.freeze(0)),
-            List.of(), Map.of(), new Asked(), new Trodden(), List.of(closed), 0L);
+    private static WayGraph ways(GameTestHelper helper, Map<Tract, Waypoints.Net> nets,
+            List<Crossing> crossings, Asked asked) {
+        Closures.Closed closed = new Closures.Closed(helper.getLevel().dimension(), BOX);
+        return new WayGraph(Map.of(KIND, SORT), nets, crossings,
+            Map.of(), asked, new Trodden(), List.of(closed), 0L);
     }
 
     private static void both(Waypoints net, int one, int other) {

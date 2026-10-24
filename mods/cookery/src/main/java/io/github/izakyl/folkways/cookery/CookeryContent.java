@@ -5,7 +5,7 @@ import com.github.ysbbbbbb.kaleidoscopecookery.init.tag.TagMod;
 import io.github.izakyl.folkways.core.api.Declaring;
 import io.github.izakyl.folkways.core.api.terms.ItemSpec;
 import io.github.izakyl.folkways.cookery.seeds.SeedPresence;
-import io.github.izakyl.folkways.cookery.seeds.SeedSupport;
+import io.github.izakyl.folkways.plugins.compost.SeedSupport;
 import io.github.izakyl.folkways.front.api.Delegation;
 import io.github.izakyl.folkways.front.api.Enrollment;
 import io.github.izakyl.folkways.front.api.Fronts;
@@ -22,7 +22,6 @@ import net.minecraft.world.level.block.state.BlockState;
 public final class CookeryContent {
     public static final ResourceLocation ID = id("cookery");
     public static final ResourceLocation STATION = id("kitchen");
-    public static final ResourceLocation COMPOST = id("compost");
     public static final ResourceLocation STOVE = id("stove");
     public static final ResourceLocation PREPARING = id("preparing_food");
     public static final ResourceLocation CHOPPING = id("chopping_food");
@@ -42,10 +41,10 @@ public final class CookeryContent {
     }
 
     public static void declare(Declaring event) {
-        BuiltinKitchenStations.register();
-        io.github.izakyl.folkways.plugins.farming.CropSeeds.purpose(id("cookery_rice"), () -> List.of(
+        io.github.izakyl.folkways.plugins.compost.SeedReserves.register(List.of(
             com.github.ysbbbbbb.kaleidoscopecookery.init.ModItems.WILD_RICE_SEED.get(),
             com.github.ysbbbbbb.kaleidoscopecookery.init.ModItems.RICE_SEED.get()));
+        BuiltinKitchenStations.register();
         io.github.izakyl.folkways.cookery.racks.KitchenRacks.register();
         io.github.izakyl.folkways.cookery.oil.PlacedOilStore.register();
         io.github.izakyl.folkways.cookery.farming.CookeryCrops.register();
@@ -61,7 +60,15 @@ public final class CookeryContent {
             colony.service(ID, CookeryPresence.class).map(state -> state.tools().decorate(work)).orElse(work));
         event.colony(SeedPresence.ID, scope -> {
             var support = new SeedSupport(scope.colony(), scope.server());
-            var seeds = new SeedPresence(scope.colony(), support::budget, support::enabled);
+            var seeds = new SeedPresence(scope.colony(), support::budget, () ->
+                scope.colony().residents().stream().anyMatch(resident -> {
+                    for (var level : scope.server().getAllLevels()) {
+                        var entity = level.getEntity(resident.id());
+                        if (entity != null && io.github.izakyl.folkways.core.api.resident.body.Bodies.of(entity)
+                                .filter(body -> io.github.izakyl.folkways.cookery.gear.CookeryGear.permitsSeeds(scope.colony(), body)).isPresent()) return true;
+                    }
+                    return false;
+                }));
             scope.share(seeds);
             scope.tick(seeds::tick);
             scope.closed(seeds::closed);

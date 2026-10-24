@@ -38,13 +38,9 @@ lang = {
         "error.wall.ground": "No ground under the wall",
         "error.wall.gate_length": "Wall too short for a gatehouse",
         "error.wall.points": "A city wall needs at least two path points",
-        "error.wall.height": "Wall height must be 5–14 blocks",
-        "error.wall.thickness": "Wall thickness must be 3–9 blocks",
-        "error.wall.spacing": "Tower spacing must be 0 or 12–48 blocks",
         "error.material": "Choose material for %s",
         "error.wall.stretch": "Each wall stretch must be at least %s blocks",
         "error.wall.corner": "A corner turns back too sharply",
-        "error.wall.length": "A wall runs at most 120 blocks",
         "error.wall.gate_ground": "No ground under the gate",
         "error.wall.crowded": "Towers and gate crowd each other; lengthen the wall or widen the spacing",
     },
@@ -64,13 +60,9 @@ lang = {
         "error.wall.ground": "城墙下方没有地面",
         "error.wall.gate_length": "城墙太短，放不下城门",
         "error.wall.points": "城墙至少需要两个路径点",
-        "error.wall.height": "城墙高度须为 5–14 格",
-        "error.wall.thickness": "城墙厚度须为 3–9 格",
-        "error.wall.spacing": "敌台间距须为 0 或 12–48 格",
         "error.material": "请为%s选择材料",
         "error.wall.stretch": "每段城墙至少 %s 格",
         "error.wall.corner": "转角过急，不得超过直角",
-        "error.wall.length": "城墙总长不得超过 120 格",
         "error.wall.gate_ground": "城门下方没有地面",
         "error.wall.crowded": "敌台与城门过于拥挤，请加长城墙或加大间距",
     },
@@ -90,13 +82,9 @@ lang = {
         "error.wall.ground": "城牆下方沒有地面",
         "error.wall.gate_length": "城牆太短，放不下城門",
         "error.wall.points": "城牆至少需要兩個路徑點",
-        "error.wall.height": "城牆高度須為 5–14 格",
-        "error.wall.thickness": "城牆厚度須為 3–9 格",
-        "error.wall.spacing": "敵台間距須為 0 或 12–48 格",
         "error.material": "請為%s選擇材料",
         "error.wall.stretch": "每段城牆至少 %s 格",
         "error.wall.corner": "轉角過急，不得超過直角",
-        "error.wall.length": "城牆總長不得超過 120 格",
         "error.wall.gate_ground": "城門下方沒有地面",
         "error.wall.crowded": "敵台與城門過於擁擠，請加長城牆或加大間距",
     },
@@ -116,13 +104,9 @@ lang = {
         "error.wall.ground": "城牆下方沒有地面",
         "error.wall.gate_length": "城牆太短，放不下城門",
         "error.wall.points": "城牆至少需要兩個路徑點",
-        "error.wall.height": "城牆高度須為 5–14 格",
-        "error.wall.thickness": "城牆厚度須為 3–9 格",
-        "error.wall.spacing": "敵臺間距須為 0 或 12–48 格",
         "error.material": "請為%s選擇材料",
         "error.wall.stretch": "每段城牆至少 %s 格",
         "error.wall.corner": "轉角過急，不得超過直角",
-        "error.wall.length": "城牆總長不得超過 120 格",
         "error.wall.gate_ground": "城門下方沒有地面",
         "error.wall.crowded": "敵臺與城門過於擁擠，請加長城牆或加大間距",
     },
@@ -221,21 +205,13 @@ def draw(site):
     height = site.count("height")
     thick = site.count("thickness")
     spacing = site.count("spacing")
-    if height < 5 or height > 14:
-        reject("error.wall.height")
-    if thick < 3 or thick > 9:
-        reject("error.wall.thickness")
-    if spacing != 0 and (spacing < 12 or spacing > 48):
-        reject("error.wall.spacing")
     for key in ["wall", "base", "walkway", "trim", "timber", "panel", "roof"]:
         if not site.items(key):
             reject("error.material", translated(key))
     runs = site.path.stretches
     lengths = [run.depth - 1 for run in runs]
     square = thick + 4
-    total = 0
     for length in lengths:
-        total += length
         if length < square + 3:
             reject("error.wall.stretch", square + 3)
     for i in range(1, len(points) - 1):
@@ -245,8 +221,6 @@ def draw(site):
         bz = points[i + 1].z - points[i].z
         if ax * bx + az * bz < 0:
             reject("error.wall.corner")
-    if total > 120:
-        reject("error.wall.length")
     gate_width = 3 if height < 7 else 5
     gate_length = gate_width + 8
     towers, gate = plan(runs, lengths, square, gate_length, spacing, site.flag("gate"), points,

@@ -69,9 +69,10 @@ public final class StructureNbt {
             }
             offsets.add(offset.get());
             if (state.isPresent()) {
-                cells.add(new BlueprintBlock(offset.get(), state.get()));
+                cells.add(new BlueprintBlock(offset.get(), state.get(), BlockData.of(cell.getCompound("nbt"))));
             } else {
-                unloaded.add(new UnloadedBlock(offset.get(), paletteTag.getCompound(index), List.of()));
+                unloaded.add(new UnloadedBlock(offset.get(), paletteTag.getCompound(index), List.of(),
+                    BlockData.of(cell.getCompound("nbt"))));
             }
         }
         if (offsets.isEmpty()) {
