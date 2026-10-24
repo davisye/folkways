@@ -3,6 +3,7 @@ package io.github.izakyl.folkways.plugins.pasture;
 import io.github.izakyl.folkways.FolkwaysMod;
 import io.github.izakyl.folkways.core.api.colony.ColonyView;
 import io.github.izakyl.folkways.effect.Effects;
+import io.github.izakyl.folkways.effect.Modifier;
 import io.github.izakyl.folkways.core.api.terms.Reach;
 import io.github.izakyl.folkways.core.api.terms.WorldPos;
 import io.github.izakyl.folkways.core.api.work.Grown;
@@ -41,6 +42,7 @@ import net.minecraft.world.phys.Vec3;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.event.RegisterGameTestsEvent;
+import net.neoforged.neoforge.event.entity.living.BabyEntitySpawnEvent;
 import net.neoforged.neoforge.gametest.GameTestHolder;
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate;
 
@@ -60,6 +62,44 @@ public final class PastureBreedingGameTests {
         helper.assertTrue(rig.nodes().size() == 1, "a herd exactly at its target still breeds for meat");
         helper.assertTrue(rig.nodes(Herd.Job.CULL).isEmpty(), "the retained adults are not surplus");
         rig.clear();
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty", batch = "pasture_twins_current_settings")
+    public static void aFeedingPlannedBeforeATargetEditCapsItsRealTwinBirthAtTheCurrentTarget(GameTestHelper helper) {
+        Effects twins = Effects.of(List.of(new Effects.Part("certain_twins", Modifier.add(PastureContent.TWINS, 1))));
+        for (int currentTarget : List.of(3, 4)) {
+            Rig rig = pair(helper);
+            try {
+                rig.target = 8;
+                Node feed = rig.nodes().getFirst();
+                rig.target = currentTarget;
+                SimpleContainer pack = new SimpleContainer(new ItemStack(Items.WHEAT, 2));
+                helper.assertTrue(Commit.run(rig.level, feed, rig.worker(feed, pack, twins)) instanceof Outcome.Done,
+                    "lowering the target still leaves this ordinary breeding pair legitimate");
+                helper.assertValueEqual(pack.countItem(Items.WHEAT), 0, "the real transaction consumes both wheat");
+                helper.assertTrue(rig.animals.stream().allMatch(Cow::isInLove), "both actual parents enter love");
+                Cow first = rig.animals.getFirst();
+                Cow second = rig.animals.getLast();
+                var ordinary = first.getBreedOffspring(rig.level, second);
+                helper.assertTrue(ordinary != null, "vanilla creates the ordinary offspring for the real birth event");
+                ordinary.setAge(-24000);
+                ordinary.setPos(first.position());
+                BreedingPerks.born(new BabyEntitySpawnEvent(first, second, ordinary));
+                int bonus = currentTarget - 3;
+                helper.assertValueEqual(rig.pen().stock(rig.level).size(), 2 + bonus,
+                    "the callback adds a real twin only when both children fit the edited target");
+                helper.assertTrue(rig.level.addFreshEntity(ordinary), "the ordinary child then joins the actual world");
+                List<Animal> born = rig.pen().stock(rig.level);
+                helper.assertValueEqual(born.size(), currentTarget,
+                    "the old target of eight cannot authorize an extra animal beyond the new target");
+                helper.assertTrue(born.stream().filter(Animal::isBaby).count() == 1L + bonus,
+                    "the target-four control proves the certain twin perk really spawned its extra juvenile");
+            } finally {
+                rig.pen().stock(rig.level).forEach(Animal::discard);
+                rig.clear();
+            }
+        }
         helper.succeed();
     }
 
@@ -653,6 +693,10 @@ public final class PastureBreedingGameTests {
         }
 
         Worker worker(Node node, SimpleContainer pack) {
+            return worker(node, pack, Effects.NONE);
+        }
+
+        Worker worker(Node node, SimpleContainer pack, Effects effects) {
             var resident = PersonBody.RESIDENT.get().create(level);
             resident.setPos(Vec3.atBottomCenterOf(node.spec().stances().cells().iterator().next().block(level)));
             return (Worker) Proxy.newProxyInstance(Worker.class.getClassLoader(), new Class<?>[] {Worker.class},
@@ -663,7 +707,7 @@ public final class PastureBreedingGameTests {
                     case "within", "route" -> List.of();
                     case "placement" -> Placement.NOWHERE;
                     case "held" -> ItemStack.EMPTY;
-                    case "effects" -> Effects.NONE;
+                    case "effects" -> effects;
                     default -> throw new AssertionError(method.getName());
                 });
         }

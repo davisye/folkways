@@ -39,12 +39,15 @@ produces a development version. It enables these defaults only if Spark is separ
 Without Spark, it leaves the heartbeat default off and does not mutate Spark properties or files.
 Saved heartbeat and Spark preferences always take priority.
 
-Only Nightly Core includes the unmodified [Spark NeoForge 1.21.1 build](https://modrinth.com/mod/spark/version/1.10.124-neoforge-1.21.1)
-as a Jar-in-Jar mod. Other channels never bundle Spark. The fixed Spark release rejects automatic
-client sampling even when opted in, so development versions package a client-only compatibility
+Every channel, including Nightly, requires players to install Spark separately; Folkways never
+bundles Spark or adds it to game runtimes. The [Spark NeoForge 1.21.1 reference build](https://modrinth.com/mod/spark/version/1.10.124-neoforge-1.21.1)
+is used only for compilation and compatibility tests. It rejects automatic client sampling even
+when opted in, so development versions package a client-only compatibility
 mixin that lets Spark's own background manager honour its merged `backgroundProfiler` setting.
-An optional loading guard and string target skip this hook when Spark is absent; ordinary
-Release/RC/Beta/Alpha versions contain neither the hook nor its registration.
+The optional loading guard applies this internal hook only to the verified Spark mod version
+`1.10.124`. Missing or other Spark versions skip it and retain Spark's own client behaviour; use
+Spark's commands to start client sampling when needed. Ordinary Release/RC/Beta/Alpha versions
+contain neither the hook nor its registration.
 Sampling uses Spark's default 10 ms interval. The early Folkways log requests sampling; confirm
 that Spark actually started it with `profiler info` on each side.
 
@@ -72,7 +75,7 @@ macOS; on Windows its Java sampler provides CPU stack samples. See
 
 `./gradlew :core:checkDiagnostics :core:verifyDiagnostics` checks the selected
 version boundaries, Spark-presence gating, saved opt-outs, actual Spark constructor/field compatibility,
-optional client-hook registration and packaged profiler checksum without launching
+optional client-hook registration and absence of bundled Spark files without launching
 Minecraft. Both checks are included in `build`.
 
 ## NeoForge GameTests
@@ -113,7 +116,7 @@ accepting the Minecraft EULA.
 | `npm run test:sable`    | Aboard variants of twin e2e specs and Sable-only specs           |
 | `npm run test:coverage` | Both e2e suites with coverage, followed by a report              |
 | `npm run visual:take`   | Screenshots of screens, panels, resident looks and world visuals |
-| `npm run ponder:take`   | Recordings of the Colony Book's Ponder scenes                    |
+| `npm run ponder:take`   | Filtered visual suite: Ponder clips and text keyframes           |
 | `npm run pattern:take`  | Building-pattern galleries                                       |
 | `npm run bench:take`    | Large-colony performance benchmarks                              |
 | `npm run promo:take`    | Promotional footage                                              |
@@ -156,6 +159,41 @@ installs JEC only on the client. Both servers run without it. It covers item,
 folder, Workforce and stock matching, existing query operators, and changes to
 JEC's fuzzy spelling and keyboard settings while reusing a prepared query.
 The default profile keeps JEC absent; CI's founding smoke test does not run this spec.
+
+### Ponder and UI recordings
+
+Ponder recording lives in `tests/visual/ponder.spec.ts`; `npm run visual:take` includes it,
+and `npm run ponder:take` selects it with `-g ponder`. Lessons are discovered from
+`Scenes.declared()` and opened by name. The base fixture records every Folkways lesson;
+`blockwright.toml#cookery-tavern` records every lesson in `folkways:cookery`, including
+Tavern. Housing, dining and household are also recorded in `zh_cn`, and farming at GUI scale 3.
+`PONDER_SCENES=housing,tavern npm run ponder:take` records only the named lessons.
+Each scene directory under `tests/out/visual/takes/ponder-<profile>-<locale>-scale-<scale>-<scene>/`
+contains `<scene>.mp4`, `NN-keyframe.png` and `index.json`. The index records the time,
+shown text, English text and translation keys of each frame.
+
+`living-ui.spec.ts` and `resident-detail.spec.ts` capture the living UI in both
+`en_us` and `zh_cn`; their directories are `living-ui-<locale>` and `resident-detail-<locale>`.
+Filtered reruns refresh their own scopes and preserve other visual takes.
+
+### Promotional takes
+
+Run `npm run setup` before filming; `npm run setup:promo-models` prepares the Wine Fox
+models. Each Cookery take stages one small set on bare ground with a few Wine Fox
+residents, films it from one fixed camera, and fails unless its feature happens on camera:
+
+| Take                      | Shows                                                                                           |
+| ------------------------- | ----------------------------------------------------------------------------------------------- |
+| `cookery-kitchen.take.ts` | Cooks work a stockpot, two pots and a chopping board, and set dishes on the dining area's table |
+| `cookery-dining.take.ts`  | A waiter fills one long connected table; hungry residents sit at free chairs and eat            |
+| `cookery-wine.take.ts`    | Vintners press grapes and fill a barrel; after bottling, diners drink wine with their meal      |
+| `create-elevator.take.ts` | Tired residents ride a Create elevator, the only way up, to beds in a loft                      |
+
+`npm run promo:cookery` films the kitchen, wine and elevator takes; run the dining take with
+`npm run promo:take -- cookery-dining.take.ts`. Clips are written under
+`tests/out/promo/takes/<take>/`, with each second's samples beside them.
+`npm run promo:cookery:film` copies every recorded take into `tests/out/promo/film/`
+and writes the Wine Fox model credits.
 
 ## Cookery fixtures
 

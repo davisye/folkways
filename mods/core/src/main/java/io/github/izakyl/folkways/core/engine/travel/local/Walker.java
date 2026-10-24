@@ -36,6 +36,7 @@ record Walker(Kind kind, Locomotion locomotion, Mob body, LivingEntity source) {
             && kind.height() == Float.floatToIntBits(dimensions.height())
             && kind.onRail() == Kind.onRail(source)
             && (kind.railOrigin() == null || kind.railOrigin().equals(source.blockPosition()))
+            && (kind.keepoutOrigin() == null || kind.keepoutOrigin().equals(source.blockPosition()))
             && kind.inKeepout() == Keepouts.forbidden(source.level(), source.blockPosition());
     }
 
@@ -43,7 +44,7 @@ record Walker(Kind kind, Locomotion locomotion, Mob body, LivingEntity source) {
     // on the origin, while step height, falls, fire immunity and maluses may differ between two villagers.
     record Kind(ResourceLocation locomotion, EntityType<?> type, int width, int height, int step, int fall,
                 boolean fireImmune, boolean onRail, @Nullable BlockPos railOrigin, boolean inKeepout,
-                List<Integer> maluses, @Nullable UUID individual) {
+                @Nullable BlockPos keepoutOrigin, List<Integer> maluses, @Nullable UUID individual) {
 
         private static final PathType[] PATH_TYPES = PathType.values();
 
@@ -53,10 +54,11 @@ record Walker(Kind kind, Locomotion locomotion, Mob body, LivingEntity source) {
                 maluses.add(Float.floatToIntBits(body.getPathfindingMalus(type)));
             }
             boolean rail = onRail(body);
+            boolean keepout = Keepouts.forbidden(body.level(), body.blockPosition());
             return new Kind(locomotion.id(), body.getType(), Float.floatToIntBits(body.getBbWidth()),
                 Float.floatToIntBits(body.getBbHeight()), Float.floatToIntBits(body.maxUpStep()),
                 body.getMaxFallDistance(), body.fireImmune(), rail, rail ? body.blockPosition().immutable() : null,
-                Keepouts.forbidden(body.level(), body.blockPosition()), List.copyOf(maluses),
+                keepout, keepout ? body.blockPosition().immutable() : null, List.copyOf(maluses),
                 locomotion.id().equals(Locomotions.WALKING) ? null : body.getUUID());
         }
 
@@ -66,6 +68,7 @@ record Walker(Kind kind, Locomotion locomotion, Mob body, LivingEntity source) {
                     || step != Float.floatToIntBits(body.maxUpStep()) || fall != body.getMaxFallDistance()
                     || fireImmune != body.fireImmune() || onRail != onRail(body)
                     || railOrigin != null && !railOrigin.equals(body.blockPosition())
+                    || keepoutOrigin != null && !keepoutOrigin.equals(body.blockPosition())
                     || individual != null && !individual.equals(body.getUUID())
                     || inKeepout != Keepouts.forbidden(body.level(), body.blockPosition())) {
                 return false;

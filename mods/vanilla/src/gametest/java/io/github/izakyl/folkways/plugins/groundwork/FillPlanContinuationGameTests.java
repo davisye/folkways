@@ -784,6 +784,7 @@ public final class FillPlanContinuationGameTests {
         private int retainedTicks;
         private boolean changed;
         private boolean closed;
+        private ConstructionFixtureUrges fixtureUrges;
         private final boolean edgeSupport;
         private Vec3 edgeStart;
         private boolean edgeAttempt;
@@ -817,6 +818,7 @@ public final class FillPlanContinuationGameTests {
             chores = new Chores(UUID.randomUUID(), "fill", (at, chore) -> new FillNode(chore, MATERIAL, plan),
                 () -> { }, new PastDay());
             try {
+                fixtureUrges = ConstructionFixtureUrges.isolate(helper, colony);
                 body.setPos(Vec3.atBottomCenterOf(at(helper, edgeSupport ? 9 : 1, 1, edgeSupport ? 3 : 1)));
                 body.pack().setItem(0, new ItemStack(Items.DIRT, 8));
                 body.pack().setItem(1, new ItemStack(Items.DIAMOND_SHOVEL));
@@ -859,7 +861,7 @@ public final class FillPlanContinuationGameTests {
                         && level.noCollision(body, body.getBoundingBox()),
                     "the continuous native correction never hurts or embeds the edge-supported worker");
                 if (level.getBlockState(cell).is(Blocks.DIRT) && plan.complete()) {
-                    invoke(run, labor, level, inline);
+                    fixtureUrges.run(body, () -> invoke(run, labor, level, inline));
                     helper.assertTrue(chores.spent().contains(Job.keyOf(cell)),
                         "the actual core also settles this original request as Done after its physical placement");
                     if (edgeSupport) {
@@ -887,14 +889,18 @@ public final class FillPlanContinuationGameTests {
                 goals.addAll(plan.steppingAside());
                 asking.offer(Map.of(level.dimension(), goals));
                 ColonyWays.advance(colony, level);
-                invoke(run, labor, level, inline);
+                fixtureUrges.run(body, () -> invoke(run, labor, level, inline));
                 Node current = current();
                 if (edgeSupport) {
                     CompletionRuntime completion = (CompletionRuntime) value(plan, "completion");
                     Object raw = completion.diagnostics().get("lastAttempt");
                     if (raw instanceof Map<?, ?> attempt
                             && at(helper, 9, 2, 4).toShortString().equals(attempt.get("actualFeet"))
-                            && Boolean.TRUE.equals(attempt.get("standingAtStance"))) edgeAttempt = true;
+                            && Boolean.TRUE.equals(attempt.get("standingAtStance"))) {
+                        if (!edgeAttempt) System.out.println("CONSTRUCTION_EDGE_INITIAL actor=" + body.getUUID()
+                            + " position=" + body.position() + " attempt=" + attempt);
+                        edgeAttempt = true;
+                    }
                 }
                 if (!edgeSupport && current instanceof FillNode && !changed
                         && body.position().distanceToSqr(Vec3.atCenterOf(cell)) > 36.0D) {
@@ -935,10 +941,14 @@ public final class FillPlanContinuationGameTests {
             try {
                 invoke(closeLabor, labor);
             } finally {
-                plan.close();
-                body.discard();
-                colony.works().raze();
-                ColonyWays.forget(colony.colonyId());
+                try {
+                    if (fixtureUrges != null) fixtureUrges.close();
+                } finally {
+                    plan.close();
+                    body.discard();
+                    colony.works().raze();
+                    ColonyWays.forget(colony.colonyId());
+                }
             }
         }
 

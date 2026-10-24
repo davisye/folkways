@@ -8,7 +8,7 @@ ext.modId = "folkways_core"
 ext.modName = "folkways-core"
 apply from: rootProject.file("gradle/mod.gradle")
 
-if (rootProject.diagnosticsBuild || rootProject.nightlyBuild) {
+if (rootProject.diagnosticsBuild) {
     repositories {
         exclusiveContent {
             forRepository { maven { url = "https://api.modrinth.com/maven" } }
@@ -25,19 +25,6 @@ if (rootProject.diagnosticsBuild) {
     sourceSets.main.resources.srcDir("src/diagnostics/resources")
 }
 
-if (rootProject.nightlyBuild) {
-    dependencies {
-        jarJar("maven.modrinth:spark") {
-            version {
-                strictly "[${project.spark_version}]"
-                prefer project.spark_version
-            }
-            transitive = false
-        }
-    }
-    sourceSets.main.resources.srcDir("src/nightly/resources")
-}
-
 tasks.named("processResources") {
     inputs.property("buildChannel", rootProject.buildChannel)
     inputs.property("buildVersion", project.version.toString())
@@ -46,7 +33,7 @@ tasks.named("processResources") {
     }
 }
 
-// The optional development hook and Nightly's bundled Spark have separate packaging conditions.
+// Spark remains player-installed in every channel; only the optional development hook is packaged.
 tasks.register("verifyDiagnostics") {
     group = "verification"
     dependsOn tasks.named("jar")
@@ -54,7 +41,6 @@ tasks.register("verifyDiagnostics") {
     inputs.property("buildChannel", rootProject.buildChannel)
     inputs.property("buildVersion", project.version.toString())
     inputs.property("diagnosticsBuild", rootProject.diagnosticsBuild)
-    inputs.property("sparkSha512", project.spark_sha512)
     doLast {
         def archive = tasks.named("jar", Jar).get().archiveFile.get().asFile
         def contents = zipTree(archive)
@@ -69,22 +55,11 @@ tasks.register("verifyDiagnostics") {
         def metadata = new groovy.json.JsonSlurper().parse(
             contents.matching { include "META-INF/jarjar/metadata.json" }.singleFile)
         def profiler = metadata.jars.findAll { it.identifier.artifact == "spark" }
-        if (profiler.size() != (rootProject.nightlyBuild ? 1 : 0)) {
-            throw new GradleException("Unexpected Spark dependency in ${archive.name}")
-        }
-        if (rootProject.nightlyBuild) {
-            def nested = contents.matching { include profiler.first().path }.singleFile
-            def hash = java.security.MessageDigest.getInstance("SHA-512").digest(nested.bytes).encodeHex().toString()
-            if (hash != project.spark_sha512) {
-                throw new GradleException("Spark checksum mismatch in ${archive.name}")
-            }
-            contents.matching { include "META-INF/LICENSE_spark.txt" }.singleFile
-            contents.matching { include "META-INF/NOTICE_spark.txt" }.singleFile
-        } else if (!contents.matching {
+        if (!profiler.isEmpty() || !contents.matching {
             include "META-INF/jarjar/*spark*.jar", "me/lucko/spark/**"
             include "META-INF/LICENSE_spark.txt", "META-INF/NOTICE_spark.txt"
         }.isEmpty()) {
-            throw new GradleException("Nightly profiler files leaked into ${archive.name}")
+            throw new GradleException("Spark must be installed separately; profiler files leaked into ${archive.name}")
         }
         def modInfo = contents.matching { include "META-INF/neoforge.mods.toml" }.singleFile.text
         if (rootProject.diagnosticsBuild) {

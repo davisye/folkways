@@ -198,7 +198,8 @@ public final class GrassSourcesGameTests {
             && level.setChunkForced(travellingChunk.x, travellingChunk.z, true);
         afterEntityTicking(helper, travellingFeet, 1000, () -> {
             try {
-                helper.assertTrue(level.isPositionEntityTicking(travellingFeet), "the travelling resident's real chunk ticks before the sweep starts");
+                helper.assertTrue(level.isPositionEntityTicking(travellingFeet),
+                    "the travelling resident's real chunk ticks before the sweep starts");
                 for (boolean restore : List.of(false, true)) {
                     try (Fixture rig = new Fixture(helper)) {
                         rig.mark(restore); rig.wearHat();

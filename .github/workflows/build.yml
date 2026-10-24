@@ -183,12 +183,13 @@ jobs:
           **folkways-modulargolems** only with Modular Golems, and **folkways-cookery** only with Kaleidoscope Cookery 1.6.0.
           All Folkways jars must come from the same build.
 
-          Nightly Core includes Spark 1.10.124 for NeoForge 1.21.1. Background CPU sampling is enabled
-          for the client and server at Spark's default 10 ms interval, unless you have opted out.
+          Spark is optional and must be installed separately; no Folkways build bundles it.
+          With Spark installed, Nightly requests background sampling for the client and server
+          at Spark's default 10 ms interval, unless you have opted out. Use `profiler info` to confirm.
           To save a local profile, run `/spark profiler stop --save-to-file` (server) or
           `/sparkc profiler stop --save-to-file` (client). Profiles are saved under `config/spark/`.
           The usual `open`/`stop` commands without `--save-to-file` upload data to Spark's viewer.
-          Release builds do not include Spark and default to disabled planning heartbeat logs.
+          Release builds default to disabled planning heartbeat logs.
           EOF
           gh release create nightly jars/*.jar --prerelease --target "$GITHUB_SHA" \
             --title "Nightly build" \

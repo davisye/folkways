@@ -1,12 +1,16 @@
 package io.github.izakyl.folkways;
 
 import com.electronwill.nightconfig.core.CommentedConfig;
+import com.electronwill.nightconfig.core.UnmodifiableConfig;
+import com.electronwill.nightconfig.toml.TomlParser;
 import com.google.gson.JsonParser;
+import java.io.StringReader;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
+import java.util.List;
 import java.util.Objects;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.Opcodes;
@@ -152,6 +156,32 @@ public final class DiagnosticsCheck {
             require(hook.invisibleAnnotations.stream().anyMatch(annotation -> annotation.desc.equals("Lorg/spongepowered/asm/mixin/Pseudo;")),
                 "optional hook target does not require Spark presence");
         }
+
+        // Resolve metadata beside the actual target class, so Core's identically named metadata
+        // cannot stand in for the fixed external Spark reference on this test-only runtime.
+        var targetResource = DiagnosticsCheck.class.getResource("/me/lucko/spark/common/sampler/BackgroundSamplerManager.class");
+        require(targetResource != null, "fixed Spark class anchors its own mod metadata");
+        String referenceVersion;
+        try (var input = new URL(targetResource, "../../../../../META-INF/neoforge.mods.toml").openStream()) {
+            var metadata = new TomlParser().parse(new StringReader(new String(input.readAllBytes(), StandardCharsets.UTF_8)));
+            List<? extends UnmodifiableConfig> mods = metadata.get("mods");
+            require(mods != null, "fixed Spark has actual mod entries");
+            var spark = mods.stream().filter(mod -> "spark".equals(mod.get("modId"))).toList();
+            require(spark.size() == 1, "reference metadata identifies exactly the Spark mod");
+            referenceVersion = spark.getFirst().get("version");
+            require("1.10.124".equals(referenceVersion), "verified Spark modVersion comes from its real metadata");
+        }
+        var supports = guard.getClass().getDeclaredMethod("supportsSpark", String.class, String.class);
+        supports.setAccessible(true);
+        require(Boolean.TRUE.equals(supports.invoke(null, "spark", referenceVersion)),
+            "the actual verified Spark metadata version enables its exact internal client hook");
+        for (String version : new String[] { null, "", "1.10.123", "1.10.125", "2.0.0", "1.10.124.0",
+                "1.10.124-SNAPSHOT", "1.10.124+custom", "1.10.124-neoforge-1.21.1" }) {
+            require(Boolean.FALSE.equals(supports.invoke(null, "spark", version)),
+                "unverified or absent Spark modVersion skips the internal hook: " + version);
+        }
+        require(Boolean.FALSE.equals(supports.invoke(null, null, referenceVersion)), "missing mod id skips the internal hook");
+        require(Boolean.FALSE.equals(supports.invoke(null, "other_mod", referenceVersion)), "another mod cannot impersonate the Spark version guard");
 
         // Check the actual fixed Spark artifact, rather than a fake option holder which misses its client veto.
         try (var input = DiagnosticsCheck.class.getResourceAsStream("/me/lucko/spark/common/sampler/BackgroundSamplerManager.class")) {

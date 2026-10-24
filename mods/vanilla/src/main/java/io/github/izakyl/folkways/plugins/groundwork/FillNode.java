@@ -10,6 +10,7 @@ import io.github.izakyl.folkways.core.api.work.Worker;
 import io.github.izakyl.folkways.core.api.work.Workload;
 import io.github.izakyl.folkways.core.api.work.Xp;
 import io.github.izakyl.folkways.plugins.build.BuildContent;
+import io.github.izakyl.folkways.plugins.build.BuildingPerks;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -29,7 +30,7 @@ final class FillNode extends GroundNode {
 
     FillNode(Chores.Chore chore, ItemSpec with, FillPlan plan) {
         super(GroundNode.declare(chore, BuildContent.trade(),
-                Workload.Once.of(GroundworkContent.CELL_TICKS, BuildContent::haste))
+                Workload.Once.of(GroundworkContent.CELL_TICKS, BuildingPerks::constructionHaste))
             .needs(new Need(with, 1))
             .doing(GroundworkContent.FILLING, with).done(), chore);
         this.plan = plan;
@@ -87,6 +88,7 @@ final class FillNode extends GroundNode {
             }
             plan.committed(cell, laid, who.body());
             completed = true;
+            BuildingPerks.interrupt(who);
             return new Outcome.Done(List.of(WorkNoise.placed(cell, laid)), List.of(),
                 Optional.of(new Xp(BuildContent.trade(), 1)), unused(supplied, stack));
         }

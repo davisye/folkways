@@ -84,6 +84,7 @@ public final class CompletionApproachGameTests {
         private boolean initialAttempt;
         private boolean unsupportedAirborne;
         private boolean closed;
+        private ConstructionFixtureUrges fixtureUrges;
 
         Dispatch(GameTestHelper helper, boolean fenced) {
             this.helper = helper;
@@ -131,6 +132,7 @@ public final class CompletionApproachGameTests {
                 () -> { }, new PastDay());
             start = Vec3.atLowerCornerOf(at(0, 0, 0)).add(10.300000011920929D, 1.0D, 10.699999988079071D);
             try {
+                fixtureUrges = ConstructionFixtureUrges.isolate(helper, colony);
                 // The only position write: even initial certificate capture uses the real pit-bottom
                 // actor. All later motion, including the first up-step, is native AI/BodyRunner.
                 body.setPos(start);
@@ -178,7 +180,7 @@ public final class CompletionApproachGameTests {
                 if (!body.onGround() && body.getY() > start.y + 0.2D
                         && level.getBlockState(body.blockPosition().below()).isAir()) unsupportedAirborne = true;
                 if (level.getBlockState(target).is(Blocks.DIRT) && plan.complete()) {
-                    invoke(run, labor, level, inline);
+                    fixtureUrges.run(body, () -> invoke(run, labor, level, inline));
                     helper.assertTrue(initialAttempt && unsupportedAirborne,
                         "a real commit saw the initial pit-bottom arrival, followed by a genuine unsupported-centre jump");
                     helper.assertTrue(chores.spent().contains(Job.keyOf(target)) && body.pack().count(Items.DIRT) == 7,
@@ -202,10 +204,14 @@ public final class CompletionApproachGameTests {
                 goals.addAll(plan.steppingAside());
                 asking.offer(Map.of(level.dimension(), goals));
                 ColonyWays.advance(colony, level);
-                invoke(run, labor, level, inline);
+                fixtureUrges.run(body, () -> invoke(run, labor, level, inline));
                 Object raw = completion().diagnostics().get("lastAttempt");
                 if (raw instanceof Map<?, ?> attempt && target.toShortString().equals(attempt.get("actualFeet"))
-                        && Boolean.TRUE.equals(attempt.get("standingAtStance"))) initialAttempt = true;
+                        && Boolean.TRUE.equals(attempt.get("standingAtStance"))) {
+                    if (!initialAttempt) System.out.println("CONSTRUCTION_UP_STEP_INITIAL actor=" + body.getUUID()
+                        + " position=" + body.position() + " attempt=" + attempt);
+                    initialAttempt = true;
+                }
                 helper.runAfterDelay(1, () -> tick(remaining - 1));
             } catch (RuntimeException | Error failure) {
                 close();
@@ -233,10 +239,14 @@ public final class CompletionApproachGameTests {
             try {
                 invoke(closeLabor, labor);
             } finally {
-                plan.close();
-                body.discard();
-                colony.works().raze();
-                ColonyWays.forget(colony.colonyId());
+                try {
+                    if (fixtureUrges != null) fixtureUrges.close();
+                } finally {
+                    plan.close();
+                    body.discard();
+                    colony.works().raze();
+                    ColonyWays.forget(colony.colonyId());
+                }
             }
         }
 

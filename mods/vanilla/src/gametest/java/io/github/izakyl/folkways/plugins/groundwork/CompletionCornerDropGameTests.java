@@ -105,6 +105,7 @@ public final class CompletionCornerDropGameTests {
         private long originalGeneration;
         private Object originalHead;
         private boolean closed;
+        private ConstructionFixtureUrges fixtureUrges;
 
         Dispatch(GameTestHelper helper, Obstruction obstruction) {
             this.helper = helper;
@@ -147,6 +148,7 @@ public final class CompletionCornerDropGameTests {
             chores = new Chores(UUID.randomUUID(), "fill", (at, chore) -> new FillNode(chore, MATERIAL, plan),
                 () -> { }, new PastDay());
             try {
+                fixtureUrges = ConstructionFixtureUrges.isolate(helper, colony);
                 // The only position write. Even reaching the later corner is real native movement.
                 body.setPos(Vec3.atBottomCenterOf(stance));
                 body.setOnGround(true);
@@ -206,7 +208,7 @@ public final class CompletionCornerDropGameTests {
                     }
                 } else {
                     if (level.getBlockState(target).is(Blocks.DIRT) && plan.complete()) {
-                        invoke(run, labor, level, inline);
+                        fixtureUrges.run(body, () -> invoke(run, labor, level, inline));
                         helper.assertTrue(actualCorner && initialAttempt,
                             "normal movement reached a real supported corner whose feet centre was unsupported");
                         helper.assertTrue(((Number) completion().diagnostics().get("approachProjectedDropCommands")).longValue() > 0,
@@ -229,10 +231,14 @@ public final class CompletionCornerDropGameTests {
                     goals.addAll(plan.steppingAside());
                     asking.offer(Map.of(level.dimension(), goals));
                     ColonyWays.advance(colony, level);
-                    invoke(run, labor, level, inline);
+                    fixtureUrges.run(body, () -> invoke(run, labor, level, inline));
                     Object raw = completion().diagnostics().get("lastAttempt");
                     if (raw instanceof Map<?, ?> attempt && Boolean.TRUE.equals(attempt.get("standingAtStance"))
-                            && Boolean.FALSE.equals(attempt.get("nativeBeforeStandable"))) initialAttempt = true;
+                            && Boolean.FALSE.equals(attempt.get("nativeBeforeStandable"))) {
+                        if (!initialAttempt) System.out.println("CONSTRUCTION_CORNER_INITIAL actor=" + body.getUUID()
+                            + " position=" + body.position() + " attempt=" + attempt);
+                        initialAttempt = true;
+                    }
                 }
                 helper.runAfterDelay(1, () -> tick(remaining - 1));
             } catch (RuntimeException | Error failure) {
@@ -332,10 +338,14 @@ public final class CompletionCornerDropGameTests {
             try {
                 invoke(closeLabor, labor);
             } finally {
-                plan.close();
-                body.discard();
-                colony.works().raze();
-                ColonyWays.forget(colony.colonyId());
+                try {
+                    if (fixtureUrges != null) fixtureUrges.close();
+                } finally {
+                    plan.close();
+                    body.discard();
+                    colony.works().raze();
+                    ColonyWays.forget(colony.colonyId());
+                }
             }
         }
 

@@ -435,6 +435,94 @@ public final class GroundGameTests {
         helper.succeed();
     }
 
+    @GameTest(template = "empty_large", batch = "ground_keepout_origins", timeoutTicks = 100)
+    public static void independentKeepoutOriginsKeepActualProofsSeparateAndRenewOnSwap(GameTestHelper helper) {
+        room(helper, 6, 8);
+        BlockPos a = at(helper, 7, 1, 7);
+        BlockPos b = at(helper, 17, 1, 7);
+        Mob first = walker(helper, a);
+        Mob second = walker(helper, b);
+        Runnable removeA = originKeepout(helper, a);
+        Runnable removeB = originKeepout(helper, b);
+        try (Grounds.Watch watch = hallWatch(helper)) {
+            Ground fromA = watch.now(first);
+            Ground fromB = watch.now(second);
+            proveOwnKeepoutOnly(helper, fromA, a, b);
+            proveOwnKeepoutOnly(helper, fromB, b, a);
+            Ground.Access pendingA = fromA.beginAccess(List.of(a));
+            Ground.Access pendingB = fromB.beginAccess(List.of(b));
+            pendingA.advance(new Ground.Budget(1, 0));
+            pendingB.advance(new Ground.Budget(1, 0));
+            helper.assertTrue(!pendingA.complete() && !pendingB.complete(), "the extra one-unit proofs remain suspended");
+            first.setPos(Vec3.atBottomCenterOf(b));
+            second.setPos(Vec3.atBottomCenterOf(a));
+            helper.assertTrue(!fromA.valid() && !fromB.valid() && !pendingA.valid() && !pendingB.valid(),
+                "swapping two still-forbidden actual origins invalidates both views and unfinished proofs");
+            proveOwnKeepoutOnly(helper, watch.now(first), b, a);
+            proveOwnKeepoutOnly(helper, watch.now(second), a, b);
+        } finally {
+            removeB.run();
+            removeA.run();
+            first.discard();
+            second.discard();
+        }
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty_large", batch = "ground_keepout_sizing_origins", timeoutTicks = 100)
+    public static void sizingBodiesFollowBothRealPlayerOriginsRatherThanTheirOldProxyPositions(GameTestHelper helper) {
+        room(helper, 6, 8);
+        BlockPos a = at(helper, 7, 1, 7);
+        BlockPos b = at(helper, 17, 1, 7);
+        var first = net.neoforged.neoforge.common.util.FakePlayerFactory.get(helper.getLevel(),
+            new com.mojang.authlib.GameProfile(java.util.UUID.randomUUID(), "keepout-a"));
+        var second = net.neoforged.neoforge.common.util.FakePlayerFactory.get(helper.getLevel(),
+            new com.mojang.authlib.GameProfile(java.util.UUID.randomUUID(), "keepout-b"));
+        first.setPos(Vec3.atBottomCenterOf(a));
+        second.setPos(Vec3.atBottomCenterOf(b));
+        Runnable removeA = originKeepout(helper, a);
+        Runnable removeB = originKeepout(helper, b);
+        try (Grounds.Watch watch = hallWatch(helper)) {
+            Ground fromA = watch.now(first);
+            Ground fromB = watch.now(second);
+            proveOwnKeepoutOnly(helper, fromA, a, b);
+            proveOwnKeepoutOnly(helper, fromB, b, a);
+            Ground.Access pendingA = fromA.beginAccess(List.of(a));
+            Ground.Access pendingB = fromB.beginAccess(List.of(b));
+            pendingA.advance(new Ground.Budget(1, 0));
+            pendingB.advance(new Ground.Budget(1, 0));
+            helper.assertTrue(!pendingA.complete() && !pendingB.complete(), "the player proofs suspend before finishing");
+            first.setPos(Vec3.atBottomCenterOf(b));
+            second.setPos(Vec3.atBottomCenterOf(a));
+            helper.assertTrue(!fromA.valid() && !fromB.valid() && !pendingA.valid() && !pendingB.valid(),
+                "the moved real sources invalidate their old views even though the unspawned proxies never moved");
+            proveOwnKeepoutOnly(helper, watch.now(first), b, a);
+            proveOwnKeepoutOnly(helper, watch.now(second), a, b);
+        } finally {
+            removeB.run();
+            removeA.run();
+            first.discard();
+            second.discard();
+        }
+        helper.succeed();
+    }
+
+    private static Runnable originKeepout(GameTestHelper helper, BlockPos origin) {
+        return Keepouts.install((level, x, y, z) -> level == helper.getLevel()
+            && Math.abs(x - origin.getX()) <= 1 && Math.abs(z - origin.getZ()) <= 1
+            && y >= origin.getY() && y <= origin.getY() + 1);
+    }
+
+    private static void proveOwnKeepoutOnly(GameTestHelper helper, Ground ground, BlockPos own, BlockPos other) {
+        Ground.Access proof = ground.beginAccess(List.of(own, other));
+        drain(helper, proof, 127);
+        helper.assertTrue(ground.valid() && proof.exhaustive(), "the actual native geometry proof finishes exhaustively");
+        helper.assertTrue(proof.distance(own.east()) > 0 && proof.path(own.east()).getLast().equals(own),
+            "the actual source can traverse its own forbidden area to its explicitly supplied origin");
+        helper.assertTrue(proof.distance(other.east()) < 0 && proof.path(other.east()).isEmpty(),
+            "the other independent source remains a wall despite appearing in the same requested exits");
+    }
+
     @GameTest(template = "empty_large", timeoutTicks = 100)
     public static void railOriginRulesKeepPositionDependentGraphsSeparate(GameTestHelper helper) {
         room(helper, 6, 8);

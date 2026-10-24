@@ -38,6 +38,7 @@ final class Herd {
 
         SHEAR(30),
         FEED(40),
+        NURTURE(30),
         CULL(40),
         GLEAN(10);
 
@@ -131,6 +132,9 @@ final class Herd {
             pen.keeps().lays().ifPresent(produce ->
                 work.put(Job.GLEAN, glean(level, pen, enclosure, produce)));
             milk(level, workable, now, udders);
+            work.put(Job.NURTURE, workable.stream().filter(Animal::isBaby)
+                .filter(beast -> !beast.getPersistentData().getBoolean(BreedingPerks.NURTURED))
+                .map(beast -> quarry(level, beast)).toList());
             int surplus = adults - pen.target();
             if (surplus > 0) {
                 work.put(Job.CULL, cull(level, workable, surplus));

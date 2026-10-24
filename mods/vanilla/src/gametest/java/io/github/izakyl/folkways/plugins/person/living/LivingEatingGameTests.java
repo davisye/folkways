@@ -4,6 +4,10 @@ import io.github.izakyl.folkways.FolkwaysMod;
 import io.github.izakyl.folkways.base.persist.Writer;
 import io.github.izakyl.folkways.core.api.work.Outcome;
 import io.github.izakyl.folkways.core.api.terms.Goods;
+import io.github.izakyl.folkways.core.api.terms.ItemFilter;
+import io.github.izakyl.folkways.front.api.Fronts;
+import io.github.izakyl.folkways.front.engine.colony.ColonySettings;
+import io.github.izakyl.folkways.base.persist.Reader;
 import io.github.izakyl.folkways.core.api.work.Delivery;
 import java.util.List;
 import net.minecraft.core.component.DataComponents;
@@ -28,6 +32,173 @@ public final class LivingEatingGameTests {
     @SubscribeEvent
     public static void register(RegisterGameTestsEvent event) {
         event.register(LivingEatingGameTests.class);
+    }
+
+    @GameTest(template = "empty")
+    public static void safetyDefaultsOnForOldColoniesAndPersistsWhenDisabled(GameTestHelper helper) {
+        var schema = new io.github.izakyl.folkways.front.api.Schema(
+            List.of(LivingContent.FOOD_MODE, LivingContent.FOOD_SAFETY, LivingContent.FOOD));
+        var migrated = ColonySettings.load(Reader.of(Writer.of().tag())).conformedTo(schema);
+        helper.assertTrue(migrated.flag(LivingContent.FOOD_SAFETY.key()), "old colonies default to safe food");
+        var disabled = migrated.with(LivingContent.FOOD_SAFETY.key(), new ColonySettings.Value.Flag(false));
+        helper.assertFalse(ColonySettings.load(Reader.of(disabled.save())).conformedTo(schema)
+            .flag(LivingContent.FOOD_SAFETY.key()), "disabled safety survives save/load");
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty")
+    public static void disablingSafetyAllowsListedUnsafeFoodButStillHonorsTheList(GameTestHelper helper) {
+        try (EatingFixture meal = new EatingFixture(helper, new ItemStack(Items.ROTTEN_FLESH, 3), 0)) {
+            helper.assertTrue(Fronts.of(meal.colony).settings(LivingContent.ID)
+                .flag(LivingContent.FOOD_SAFETY.key()), "safety starts enabled");
+            assertRefused(helper, meal);
+            meal.rejectUnsafe(false);
+            helper.assertTrue(Goods.matches(new ItemStack(Items.ROTTEN_FLESH),
+                LivingContent.rations(meal.colony, meal.body).getFirst().spec()), "unsafe food can be reserved");
+            meal.blacklist(true);
+            helper.assertTrue(meal.action().commit(helper.getLevel(), meal.worker) instanceof Outcome.Failed,
+                "disabling safety does not bypass the blacklist");
+            meal.blacklist(false);
+            meal.eat();
+            helper.assertValueEqual(meal.pack.getItem(0).getCount(), 2, "one listed unsafe meal is consumed");
+            helper.assertValueEqual(meal.living.foodLevelOf(meal.body.id()).orElseThrow(), 4,
+                "the unsafe meal nourishes the resident");
+        }
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty")
+    public static void enablingSafetyBeforeCommitRefusesAPreviouslySelectedUnsafeMeal(GameTestHelper helper) {
+        try (EatingFixture meal = new EatingFixture(helper, new ItemStack(Items.SPIDER_EYE, 3), 0)) {
+            meal.rejectUnsafe(false);
+            var action = meal.living.urges(meal.worker, meal.colony.view(helper.getLevel())).stream()
+                .filter(urge -> urge.id().equals(LivingPresence.EAT)).findFirst().orElseThrow().take().get();
+            meal.rejectUnsafe(true);
+            helper.assertTrue(action.commit(helper.getLevel(), meal.worker) instanceof Outcome.Failed,
+                "safety is rechecked when the action commits");
+            helper.assertValueEqual(meal.pack.getItem(0).getCount(), 3, "unsafe meal stays untouched");
+        }
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty")
+    public static void savedFoodSettingsKeepEmptyListsAndMigrateExistingMenus(GameTestHelper helper) {
+        var schema = new io.github.izakyl.folkways.front.api.Schema(List.of(LivingContent.FOOD_MODE, LivingContent.FOOD));
+        var bread = ItemFilter.item(net.minecraft.resources.ResourceLocation.withDefaultNamespace("bread"));
+        var old = ColonySettings.empty().with(LivingContent.FOOD.key(), new ColonySettings.Value.Items(List.of(bread)));
+        var migrated = ColonySettings.load(Reader.of(old.save())).conformedTo(schema);
+        helper.assertTrue(migrated.choice(LivingContent.FOOD_MODE.key()).equals(LivingContent.WHITELIST),
+            "existing menus gain whitelist mode");
+        helper.assertTrue(migrated.entries(LivingContent.FOOD.key()).equals(List.of(bread)),
+            "migration preserves the player's saved menu");
+        for (var mode : List.of(LivingContent.WHITELIST, LivingContent.BLACKLIST)) {
+            var empty = migrated.with(LivingContent.FOOD.key(), new ColonySettings.Value.Items(List.of()))
+                .with(LivingContent.FOOD_MODE.key(), new ColonySettings.Value.Choice(mode));
+            var loaded = ColonySettings.load(Reader.of(empty.save())).conformedTo(schema);
+            helper.assertTrue(loaded.equals(empty), "an explicitly empty list survives reload in " + mode);
+        }
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty")
+    public static void farmersDelightDefaultsResolveWhenInstalledAndAreOptionalOtherwise(GameTestHelper helper) {
+        var registry = net.minecraft.core.registries.BuiltInRegistries.ITEM;
+        var tag = net.minecraft.tags.TagKey.create(net.minecraft.core.registries.Registries.ITEM,
+            net.minecraft.resources.ResourceLocation.fromNamespaceAndPath("folkways", "resident_food_farmers_delight"));
+        boolean installed = registry.containsKey(net.minecraft.resources.ResourceLocation
+            .fromNamespaceAndPath("farmersdelight", "cooked_rice"));
+        var members = registry.getTag(tag).orElseThrow();
+        helper.assertValueEqual(members.size(), installed ? 44 : 0,
+            "all curated Farmer's Delight items resolve only when installed");
+        for (var member : members) {
+            var stack = member.value().getDefaultInstance();
+            var food = stack.getFoodProperties(null);
+            helper.assertTrue(FoodSafety.safe(stack, food) && food.nutrition() > 0,
+                "every default Farmer's Delight ration is nourishing and safe: " + net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(member.value()));
+        }
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty")
+    public static void defaultWhitelistUsesCuratedReloadableFoodTags(GameTestHelper helper) {
+        var settings = ColonySettings.byDefault(new io.github.izakyl.folkways.front.api.Schema(
+            List.of(LivingContent.FOOD_MODE, LivingContent.FOOD)));
+        helper.assertTrue(settings.choice(LivingContent.FOOD_MODE.key()).equals(LivingContent.WHITELIST),
+            "new colonies start in whitelist mode");
+        var food = FoodSafety.allowed(settings.items(LivingContent.FOOD.key()), false).orElseThrow();
+        helper.assertTrue(Goods.matches(new ItemStack(Items.BREAD), food), "default food includes bread");
+        helper.assertTrue(Goods.matches(new ItemStack(Items.COOKED_BEEF), food), "default food includes cooked meat");
+        helper.assertFalse(Goods.matches(new ItemStack(Items.APPLE), food), "raw ingredients are opt-in");
+        helper.assertFalse(Goods.matches(new ItemStack(Items.GOLDEN_APPLE), food), "valuable special food is opt-in");
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty")
+    public static void queryWhitelistControlsEatingAndRationPlanning(GameTestHelper helper) {
+        try (EatingFixture meal = new EatingFixture(helper, 0,
+                new ItemStack(Items.APPLE, 3), new ItemStack(Items.BREAD, 3))) {
+            meal.rules(ItemFilter.query("@minecraft bread").orElseThrow());
+            var ration = LivingContent.rations(meal.colony, meal.body).getFirst();
+            helper.assertTrue(Goods.members(ration.spec()).equals(java.util.Set.of(Items.BREAD)),
+                "saved queries use the same matching rules in food planning");
+            meal.eat();
+            helper.assertValueEqual(meal.pack.getItem(0).getCount(), 3, "unlisted safe food stays untouched");
+            helper.assertValueEqual(meal.pack.getItem(1).getCount(), 2, "the listed food is eaten");
+        }
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty")
+    public static void blacklistQueriesExcludeFoodWithoutAllowingHarmfulMeals(GameTestHelper helper) {
+        try (EatingFixture meal = new EatingFixture(helper, 0,
+                new ItemStack(Items.BREAD, 3), new ItemStack(Items.PUFFERFISH, 3), new ItemStack(Items.APPLE, 3))) {
+            meal.rules(ItemFilter.query("@minecraft bread").orElseThrow());
+            meal.blacklist(true);
+            var ration = LivingContent.rations(meal.colony, meal.body).getFirst();
+            helper.assertFalse(Goods.matches(new ItemStack(Items.BREAD), ration.spec()), "blacklisted food is not reserved");
+            helper.assertFalse(Goods.matches(new ItemStack(Items.PUFFERFISH), ration.spec()), "safety still applies");
+            helper.assertTrue(Goods.matches(new ItemStack(Items.APPLE), ration.spec()), "unlisted safe food is reserved");
+            meal.eat();
+            helper.assertValueEqual(meal.pack.getItem(0).getCount(), 3, "blacklisted bread stays untouched");
+            helper.assertValueEqual(meal.pack.getItem(1).getCount(), 3, "unsafe food stays untouched");
+            helper.assertValueEqual(meal.pack.getItem(2).getCount(), 2, "unlisted safe food is eaten");
+            var settings = (ColonySettings) Fronts.of(meal.colony).settings(LivingContent.ID);
+            var loaded = ColonySettings.load(Reader.of(settings.save()));
+            helper.assertTrue(loaded.equals(settings), "list mode and query rules survive save/load");
+        }
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty")
+    public static void emptyWhitelistRefusesFoodAndKeepsSettlerRequirement(GameTestHelper helper) {
+        try (EatingFixture meal = new EatingFixture(helper, new ItemStack(Items.BREAD, 3), 0)) {
+            meal.rules();
+            helper.assertTrue(LivingContent.rations(meal.colony, meal.body).isEmpty(), "empty whitelist reserves nothing");
+            assertRefused(helper, meal);
+            var need = meal.living.settlerNeeds(helper.getLevel().getServer()).stream()
+                .filter(one -> one.kind() == LivingNeed.FOOD).findFirst().orElseThrow();
+            helper.assertFalse(need.met(0), "empty whitelist cannot waive the food requirement");
+            meal.blacklist(true);
+            helper.assertFalse(LivingContent.rations(meal.colony, meal.body).isEmpty(), "empty blacklist allows safe food");
+            meal.eat();
+        }
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty")
+    public static void changingListModeBeforeCommitRechecksTheSameRules(GameTestHelper helper) {
+        try (EatingFixture meal = new EatingFixture(helper, new ItemStack(Items.BREAD, 3), 0)) {
+            var action = meal.living.urges(meal.worker, meal.colony.view(helper.getLevel())).stream()
+                .filter(urge -> urge.id().equals(LivingPresence.EAT)).findFirst().orElseThrow().take().get();
+            meal.blacklist(true);
+            helper.assertTrue(action.commit(helper.getLevel(), meal.worker) instanceof Outcome.Failed,
+                "switching to blacklist invalidates a previously selected meal");
+            helper.assertValueEqual(meal.pack.getItem(0).getCount(), 3, "newly forbidden food stays untouched");
+            meal.blacklist(false);
+            meal.eat();
+            helper.assertValueEqual(meal.pack.getItem(0).getCount(), 2, "switching back keeps the same rules");
+        }
+        helper.succeed();
     }
 
     @GameTest(template = "empty")
@@ -250,10 +421,36 @@ public final class LivingEatingGameTests {
         hunger.load(io.github.izakyl.folkways.base.persist.Reader.of(
             Writer.of().integer("FoodLevel", 0).tag()));
         FoodProperties food = new FoodProperties.Builder().nutrition(24).build();
-        helper.assertTrue(hunger.canEatWithoutWaste(food), "quality can raise a meal past twenty points");
+        helper.assertTrue(hunger.canEatMeal(food), "quality can raise a meal past twenty points");
         hunger.eat(food);
         helper.assertValueEqual(hunger.foodLevel(), Hunger.MAX_FOOD_LEVEL, "fullness is capped at twenty");
-        helper.assertFalse(hunger.canEatWithoutWaste(food), "an oversized meal still waits while full");
+        helper.assertFalse(hunger.canEatMeal(food), "an oversized meal still waits while full");
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty")
+    public static void largeMealsAllowBoundedWasteButSmallPortionsStillFit(GameTestHelper helper) {
+        Hunger hunger = new Hunger();
+        for (int nutrition : new int[] {5, 9, 10, 14, 20, 24}) {
+            var food = new FoodProperties.Builder().nutrition(nutrition).build();
+            int effective = Math.min(20, nutrition);
+            int threshold = 20 - effective + (effective >= 10 ? effective * 3 / 10 : 0);
+            hunger.load(io.github.izakyl.folkways.base.persist.Reader.of(
+                Writer.of().integer("FoodLevel", threshold).tag()));
+            helper.assertTrue(hunger.canEatMeal(food), "meal fits at its waste allowance: " + nutrition);
+            hunger.load(io.github.izakyl.folkways.base.persist.Reader.of(
+                Writer.of().integer("FoodLevel", threshold + 1).tag()));
+            helper.assertFalse(hunger.canEatMeal(food), "meal exceeding its waste allowance waits: " + nutrition);
+        }
+        var large = new ItemStack(Items.BREAD);
+        large.set(net.minecraft.core.component.DataComponents.FOOD,
+            new FoodProperties.Builder().nutrition(20).build());
+        try (EatingFixture meal = new EatingFixture(helper, large, 6)) {
+            meal.eat();
+            helper.assertTrue(meal.pack.getItem(0).isEmpty(), "the large meal is consumed once");
+            helper.assertValueEqual(meal.living.foodLevelOf(meal.body.id()).orElseThrow(), 20,
+                "overflow nutrition is discarded and fullness remains capped");
+        }
         helper.succeed();
     }
 

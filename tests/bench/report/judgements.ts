@@ -233,6 +233,8 @@ export const NEVER_HERE = new Set([
   "FOUNDER_ONLY", "NO_SUCH_PLAYER", "ALREADY_MEMBER", "NOT_MEMBER", "ALREADY_INVITED", "NOT_INVITED",
   "LAST_MEMBER", "KEPT_BY_TEAM", "TEAM_OWNER_ONLY", "NO_PARTY", "BAD_NAME",
   "TOO_LARGE", "SETTLED_FOR_GOOD",
+  // Bench worlds register no elevators, so no ride should be selected or cancelled.
+  "UNAVAILABLE", "RIDE_CANCELLED",
 ]);
 
 export const PASSING = new Set([

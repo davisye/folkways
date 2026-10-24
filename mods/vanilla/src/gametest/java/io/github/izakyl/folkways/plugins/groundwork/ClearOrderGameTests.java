@@ -292,6 +292,7 @@ public final class ClearOrderGameTests {
             (proxy, method, args) -> switch (method.getName()) {
                 case "body" -> body.mob();
                 case "held" -> tool;
+                case "effects" -> io.github.izakyl.folkways.effect.Effects.NONE;
                 default -> throw new AssertionError(method.getName());
             });
     }

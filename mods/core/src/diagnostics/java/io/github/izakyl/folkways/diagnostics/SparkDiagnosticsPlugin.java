@@ -10,6 +10,14 @@ import org.spongepowered.asm.mixin.extensibility.IMixinInfo;
 // Consult only the loading-layer metadata: this runs before game-side ModList exists and must
 // neither initialise Spark nor require a Spark class when the optional mod is absent.
 public final class SparkDiagnosticsPlugin implements IMixinConfigPlugin {
+    // Exact mod metadata version from the validated NeoForge artifact, not its Maven classifier.
+    // Other separately installed Spark versions keep their own client lifecycle untouched.
+    private static final String VALIDATED_SPARK_VERSION = "1.10.124";
+
+    static boolean supportsSpark(String modId, String modVersion) {
+        return "spark".equals(modId) && VALIDATED_SPARK_VERSION.equals(modVersion);
+    }
+
     @Override
     public void onLoad(String mixinPackage) {
     }
@@ -22,7 +30,10 @@ public final class SparkDiagnosticsPlugin implements IMixinConfigPlugin {
     @Override
     public boolean shouldApplyMixin(String targetClassName, String mixinClassName) {
         var mods = LoadingModList.get();
-        return mods != null && mods.getModFileById("spark") != null;
+        if (mods == null) return false;
+        var spark = mods.getModFileById("spark");
+        return spark != null && spark.getMods().stream().anyMatch(mod ->
+            supportsSpark(mod.getModId(), String.valueOf(mod.getVersion())));
     }
 
     @Override
