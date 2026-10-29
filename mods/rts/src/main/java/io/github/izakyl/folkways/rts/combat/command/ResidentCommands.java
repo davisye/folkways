@@ -11,6 +11,7 @@ import io.github.izakyl.folkways.core.api.work.Ending;
 import io.github.izakyl.folkways.core.api.work.Stances;
 import io.github.izakyl.folkways.core.api.work.Urge;
 import io.github.izakyl.folkways.core.api.work.Worker;
+import io.github.izakyl.folkways.core.engine.labor.LaborRefusal;
 import io.github.izakyl.folkways.plugins.combat.DefenseControl;
 import io.github.izakyl.folkways.plugins.combat.Threats;
 import io.github.izakyl.folkways.plugins.combat.weapon.Weapons;
@@ -79,6 +80,8 @@ public final class ResidentCommands {
         private UUID step = UUID.randomUUID();
         private WorldPos approached;
         private long retargetAt;
+        private long attackRetryAt = Long.MIN_VALUE;
+        private int attackFailures;
         private double attackRange = 4.5;
         private long movingSince = server.overworld().getGameTime();
         private long engagedUntil = Long.MIN_VALUE;
@@ -388,6 +391,9 @@ public final class ResidentCommands {
             return List.of();
         }
         if (order.mode == Mode.ATTACK) {
+            if (server.overworld().getGameTime() < order.attackRetryAt) {
+                return List.of();
+            }
             order.attackRange = Weapons.range(who);
         }
         // A replacement has its own urge identity: it safely interrupts even a trip already in
@@ -505,6 +511,10 @@ public final class ResidentCommands {
     }
 
     void ended(Order order, Ending how) {
+        if (how instanceof Ending.Failed failed && active.get(order.resident()) == order
+            && retryAttack(order, failed.why())) {
+            return;
+        }
         if (how instanceof Ending.Failed failed && active.remove(order.resident(), order)) {
             order.failure = failed.why();
             if (order.mode == Mode.ATTACK) {
@@ -527,9 +537,28 @@ public final class ResidentCommands {
         }
     }
 
+    private boolean retryAttack(Order order, RefusalKind why) {
+        if (order.mode != Mode.ATTACK || attackInvalidation(order) != AttackEnd.NONE
+            || why != LaborRefusal.NO_WAY_THERE && why != LaborRefusal.GOODS_GONE) {
+            return false;
+        }
+        // A path obstruction or a hand still being returned ends this attempt, not the player's
+        // target intent. Revoke its native collision permission before offering a fresh approach.
+        // Keep the same command handle and original deadline; peers continue their own attacks.
+        order.step = UUID.randomUUID();
+        order.failure = why;
+        order.status = Status.MOVING;
+        long delay = Math.min(100L, 10L << Math.min(order.attackFailures++, 4));
+        order.attackRetryAt = server.overworld().getGameTime() + delay;
+        return true;
+    }
+
     void taking(Order order) {
         active(order);
         order.yielded = false;
+        if (order.mode == Mode.ATTACK) {
+            order.failure = null;
+        }
     }
 
     void tick(MinecraftServer ignored) {

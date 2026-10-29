@@ -27,6 +27,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.gametest.framework.GameTest;
 import net.minecraft.gametest.framework.GameTestHelper;
@@ -39,7 +41,10 @@ import net.minecraft.server.players.PlayerList;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.monster.Zombie;
+import net.minecraft.world.entity.monster.Spider;
+import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Blocks;
@@ -48,6 +53,8 @@ import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.common.util.FakePlayerFactory;
 import net.neoforged.neoforge.event.RegisterGameTestsEvent;
+import net.neoforged.neoforge.event.entity.living.LivingDamageEvent;
+import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.gametest.GameTestHolder;
 import net.neoforged.neoforge.gametest.PrefixGameTestTemplate;
 
@@ -455,6 +462,220 @@ public final class SquadExecutionGameTests {
             .thenSucceed();
     }
 
+    @GameTest(template = "empty_large", timeoutTicks = 900)
+    public static void twoArmedResidentsPursueSpiderOverOneBlockStepAndDefeatIt(GameTestHelper helper) {
+        Fixture f = new Fixture(helper);
+        List<Body> people = f.people(2);
+        for (int x = 10; x <= 15; x++) {
+            for (int z = 8; z <= 12; z++) {
+                helper.setBlock(new BlockPos(x, 1, z), Blocks.GRASS_BLOCK);
+            }
+        }
+        Spider spider = EntityType.SPIDER.create(f.level);
+        spider.setNoAi(true);
+        spider.setPersistenceRequired();
+        spider.getAttribute(Attributes.MAX_HEALTH).setBaseValue(40);
+        spider.setHealth(40);
+        BlockPos target = helper.absolutePos(new BlockPos(13, 2, 10));
+        spider.moveTo(target.getX() + .5, target.getY(), target.getZ() + .5);
+        f.level.addFreshEntity(spider);
+        f.enemies.add(spider);
+        UnitGroup group = f.groups.attackSelection(people, spider, f.player);
+        f.ownership.trackGroup(f.player, group);
+        helper.onEachTick(() -> {
+            if (spider.isAlive() && (group.phase() == UnitGroup.Phase.FAILED_WAITING || group.phase() == UnitGroup.Phase.FAILED)) {
+                helper.fail("armed squad stopped before defeating the reachable spider: phase=" + group.phase()
+                    + " reason=" + group.endReason() + " health=" + spider.getHealth()
+                    + " members=" + people.stream().map(body -> f.commands.current(body.id())
+                        .map(order -> order.status() + "/" + order.attackEnd() + "/" + order.failure())
+                        .orElse("no order") + " pos=" + body.mob().position() + " pack=" + body.pack().contents()).toList());
+            }
+        });
+        helper.startSequence()
+            .thenWaitUntil(() -> helper.assertTrue(spider.getHealth() < 40, "the real approach reaches the small target and deals actual damage"))
+            .thenWaitUntil(() -> helper.assertFalse(spider.isAlive(), "the explicit squad attack physically defeats the spider"))
+            .thenExecute(() -> helper.assertTrue(people.stream().allMatch(body -> f.ownership.owns(f.player, body)),
+                "finishing combat retains player control until explicit release"))
+            .thenSucceed();
+    }
+
+    @GameTest(template = "empty_large", timeoutTicks = 850)
+    public static void temporarilyBlockedAttackerRejoinsAndDealsRealDamageAfterOpening(GameTestHelper helper) {
+        Fixture f = new Fixture(helper);
+        List<Body> people = f.people(2);
+        // Unequal real weapon damage avoids vanilla's synchronized equal-damage invulnerability
+        // window masking every hit by the recovered attacker. The healthy peer keeps this same
+        // physical weapon and order throughout the scenario.
+        people.getLast().pack().setItem(0, new ItemStack(Items.GOLDEN_SWORD));
+        for (int y = 1; y <= 3; y++) for (int x = 1; x <= 3; x++) for (int z = 6; z <= 8; z++) {
+            if (x != 2 || z != 7) helper.setBlock(new BlockPos(x, y, z), Blocks.STONE);
+        }
+        Spider spider = EntityType.SPIDER.create(f.level);
+        spider.setNoAi(true);
+        spider.setPersistenceRequired();
+        spider.getAttribute(Attributes.MAX_HEALTH).setBaseValue(160);
+        // NoAI alone still allows hit knockback. Keep this recovery fixture's target at its
+        // original approach site so it does not turn into a different moving-target chase test.
+        spider.getAttribute(Attributes.KNOCKBACK_RESISTANCE).setBaseValue(1);
+        spider.setHealth(160);
+        BlockPos target = helper.absolutePos(new BlockPos(12, 1, 10));
+        spider.moveTo(target.getX() + .5, target.getY(), target.getZ() + .5);
+        f.level.addFreshEntity(spider);
+        f.enemies.add(spider);
+        AtomicBoolean opened = new AtomicBoolean(), recoveredHit = new AtomicBoolean(), peerHit = new AtomicBoolean();
+        Consumer<LivingDamageEvent.Post> damage = event -> {
+            if (event.getEntity() != spider) return;
+            if (event.getSource().getEntity() == people.getLast().mob()) peerHit.set(true);
+            if (opened.get() && event.getSource().getEntity() == people.getFirst().mob()) recoveredHit.set(true);
+        };
+        NeoForge.EVENT_BUS.addListener(damage);
+        f.listeners.add(damage);
+        UnitGroup group = f.groups.attackSelection(people, spider, f.player);
+        f.ownership.trackGroup(f.player, group);
+        UUID generation = group.commandId().orElseThrow();
+        ResidentCommands.Order healthy = f.commands.current(people.getLast().id()).orElseThrow();
+        helper.startSequence()
+            .thenWaitUntil(() -> helper.assertTrue(peerHit.get(), "the unobstructed peer keeps dealing real damage"))
+            .thenExecute(() -> {
+                for (int y = 1; y <= 3; y++) for (int x = 1; x <= 3; x++) for (int z = 6; z <= 8; z++) {
+                    if (x != 2 || z != 7) helper.setBlock(new BlockPos(x, y, z), Blocks.AIR);
+                }
+                opened.set(true);
+                helper.assertTrue(f.commands.current(healthy.resident()).orElse(null) == healthy,
+                    "a peer failure cannot replace the healthy attack handle");
+            })
+            .thenWaitUntil(() -> helper.assertTrue(recoveredHit.get(),
+                "after opening the way the original squad must recover its blocked attacker and land a real hit; phase="
+                    + group.phase() + " reason=" + group.endReason() + " first=" + people.getFirst().mob().position()
+                    + " order=" + f.commands.current(people.getFirst().id()).map(order -> order.status()
+                        + "/" + order.attackEnd() + "/" + order.failure()).orElse("none")))
+            .thenExecute(() -> helper.assertTrue(f.commands.current(people.getFirst().id()).orElseThrow().failure().isEmpty(),
+                "a real resumed attack clears the previous attempt's refusal"))
+            .thenWaitUntil(() -> helper.assertFalse(spider.isAlive(), "the preserved attack intent defeats the real spider"))
+            .thenExecute(() -> helper.assertTrue(group.commandId().orElseThrow().equals(generation),
+                "member recovery must not author a new squad command or reset its deadline"))
+            .thenSucceed();
+    }
+
+    @GameTest(template = "empty_large", timeoutTicks = 700)
+    public static void regroupRetriesOnlyBlockedMemberAfterOpeningWithoutReplacingHealthyHold(GameTestHelper helper) {
+        Fixture f = new Fixture(helper);
+        List<Body> people = f.people(2);
+        regroupWall(helper, true);
+        UnitGroup group = f.groups.stopSelection(people);
+        f.ownership.trackGroup(f.player, group);
+        UUID generation = group.commandId().orElseThrow();
+        ResidentCommands.Order healthy = f.commands.current(people.getFirst().id()).orElseThrow();
+        helper.startSequence()
+            .thenWaitUntil(() -> helper.assertTrue(group.phase() == UnitGroup.Phase.WAITING_FOR_MEMBER
+                || group.phase() == UnitGroup.Phase.FAILED_WAITING,
+                "an actually blocked regroup becomes observable"))
+            .thenExecute(() -> {
+                helper.assertTrue(f.commands.current(healthy.resident()).orElse(null) == healthy,
+                    "one failed member must not clear the already safe member's hold");
+                regroupWall(helper, false);
+            })
+            .thenWaitUntil(() -> helper.assertValueEqual(group.phase(), UnitGroup.Phase.HOLDING,
+                "opening the obstruction automatically restores the original regroup"))
+            .thenExecute(() -> {
+                helper.assertTrue(group.commandId().orElseThrow().equals(generation), "recovery retains the original command generation");
+                helper.assertTrue(f.commands.current(healthy.resident()).orElse(null) == healthy,
+                    "successful recovery leaves the healthy order instance unchanged");
+                helper.assertTrue(group.failedMembers().isEmpty(), "recovered members no longer report a failed slot");
+                helper.assertTrue(people.stream().allMatch(body -> f.ownership.owns(f.player, body)), "recovery retains player control");
+            }).thenSucceed();
+    }
+
+    @GameTest(template = "empty_large", timeoutTicks = 700)
+    public static void releaseDuringRegroupBackoffCannotReviveAnyOldHold(GameTestHelper helper) {
+        Fixture f = new Fixture(helper);
+        List<Body> people = f.people(2);
+        regroupWall(helper, true);
+        UnitGroup group = f.groups.stopSelection(people);
+        f.ownership.trackGroup(f.player, group);
+        helper.startSequence()
+            .thenWaitUntil(() -> helper.assertTrue(group.phase() == UnitGroup.Phase.WAITING_FOR_MEMBER
+                || group.phase() == UnitGroup.Phase.FAILED_WAITING, "the regroup is actually waiting on an obstruction"))
+            .thenExecute(() -> {
+                helper.assertTrue(f.ownership.releaseSelected(f.player, people.stream().map(Body::id).toList()), "player releases the waiting squad");
+                regroupWall(helper, false);
+            }).thenIdle(220)
+            .thenExecute(() -> helper.assertTrue(people.stream().allMatch(body -> f.commands.current(body.id()).isEmpty()
+                && !f.ownership.owns(f.player, body)), "late regroup probes cannot reclaim released residents"))
+            .thenSucceed();
+    }
+
+    @GameTest(template = "empty_large", timeoutTicks = 700)
+    public static void replacementMoveDuringAttackBackoffCannotReviveTheOldTarget(GameTestHelper helper) {
+        Fixture f = new Fixture(helper);
+        List<Body> people = f.people(2);
+        for (int y = 1; y <= 3; y++) for (int x = 1; x <= 3; x++) for (int z = 6; z <= 8; z++) {
+            if (x != 2 || z != 7) helper.setBlock(new BlockPos(x, y, z), Blocks.STONE);
+        }
+        Zombie enemy = f.enemy(12, 10);
+        enemy.getAttribute(Attributes.MAX_HEALTH).setBaseValue(160);
+        enemy.setHealth(160);
+        UnitGroup original = f.groups.attackSelection(people, enemy, f.player);
+        f.ownership.trackGroup(f.player, original);
+        ResidentCommands.Order oldAttack = f.commands.current(people.getFirst().id()).orElseThrow();
+        AtomicReference<UnitGroup> moved = new AtomicReference<>();
+        float[] afterMove = new float[1];
+        helper.startSequence()
+            .thenWaitUntil(() -> helper.assertTrue(oldAttack.failure().isPresent()
+                && f.commands.current(oldAttack.resident()).orElse(null) == oldAttack,
+                "the original failed approach is really in recoverable backoff"))
+            .thenExecute(() -> {
+                // Remove the fixture wall in this same tick, before the new route's all-member
+                // start-footing validation. The old attack is still in its timed backoff.
+                for (int y = 1; y <= 3; y++) for (int x = 1; x <= 3; x++) for (int z = 6; z <= 8; z++) {
+                    if (x != 2 || z != 7) helper.setBlock(new BlockPos(x, y, z), Blocks.AIR);
+                }
+                helper.assertTrue(f.groups.commandSelectionPoints(people, List.of(f.at(18, 18)), -1), "the new ground move is accepted");
+                moved.set(f.groups.ofResident(people.getFirst().id()).orElseThrow());
+                f.ownership.trackGroup(f.player, moved.get());
+                afterMove[0] = enemy.getHealth();
+            }).thenIdle(160)
+            .thenExecute(() -> {
+                helper.assertValueEqual(enemy.getHealth(), afterMove[0], "no delayed attack retry damages the old target after MOVE");
+                helper.assertTrue(people.stream().noneMatch(body -> f.commands.current(body.id())
+                    .filter(order -> order.mode() == ResidentCommands.Mode.ATTACK).isPresent()), "the old attack cannot retake either member");
+                helper.assertValueEqual(oldAttack.attackEnd(), ResidentCommands.AttackEnd.REPLACED, "the old permission stays replaced");
+            })
+            .thenWaitUntil(() -> helper.assertTrue(moved.get().routeComplete(), "the new move reaches its own mandatory stop"))
+            .thenSucceed();
+    }
+
+    @GameTest(template = "empty_large", timeoutTicks = 650)
+    public static void individualMoveDuringMissingAnchorWaitCannotBeOverwrittenByRegroup(GameTestHelper helper) {
+        Fixture f = new Fixture(helper);
+        List<Body> people = f.people(2);
+        for (int x = 0; x <= 5; x++) for (int z = 4; z <= 12; z++) for (int y = -3; y <= 0; y++) {
+            helper.setBlock(new BlockPos(x, y, z), Blocks.AIR);
+        }
+        UnitGroup group = f.groups.stopSelection(people);
+        f.ownership.trackGroup(f.player, group);
+        helper.assertValueEqual(group.endReason(), UnitGroup.EndReason.NO_SAFE_ANCHOR, "the regroup really has no local anchor");
+        ResidentCommands.Order move = f.commands.move(people.getFirst(), f.at(18, 18));
+        // Restore traversable terrain before advancing the world, while the old regroup is waiting.
+        for (int x = 0; x <= 5; x++) for (int z = 4; z <= 12; z++) {
+            helper.setBlock(new BlockPos(x, 0, z), Blocks.STONE);
+        }
+        helper.startSequence()
+            .thenWaitUntil(() -> helper.assertValueEqual(move.status(), ResidentCommands.Status.ARRIVED,
+                "the individual replacement physically arrives instead of being reclaimed by regroup"))
+            .thenIdle(220)
+            .thenExecute(() -> {
+                helper.assertTrue(f.commands.current(move.resident()).isEmpty(), "no old regroup HOLD appears after the completed move");
+                helper.assertTrue(!group.members().contains(move.resident()), "the individual replacement safely leaves the recovering group");
+            }).thenSucceed();
+    }
+
+    private static void regroupWall(GameTestHelper helper, boolean present) {
+        for (int y = 1; y <= 3; y++) for (int x = 1; x <= 3; x++) for (int z = 8; z <= 10; z++) {
+            if (x != 2 || z != 9) helper.setBlock(new BlockPos(x, y, z), present ? Blocks.STONE : Blocks.AIR);
+        }
+    }
+
     private static final class Fixture implements GameTestListener {
         final GameTestHelper helper;
         final ServerLevel level;
@@ -465,7 +686,8 @@ public final class SquadExecutionGameTests {
         final ServerPlayer player;
         final LaborFixture labour;
         final List<Body> bodies = new ArrayList<>();
-        final List<Zombie> enemies = new ArrayList<>();
+        final List<Mob> enemies = new ArrayList<>();
+        final List<Object> listeners = new ArrayList<>();
         final Map<UUID, ServerPlayer> playerIndex;
 
         @SuppressWarnings("unchecked")
@@ -546,10 +768,11 @@ public final class SquadExecutionGameTests {
 
         void close() {
             try {
+                listeners.forEach(NeoForge.EVENT_BUS::unregister);
                 ownership.clearContext(player);
                 labour.close();
                 bodies.forEach(body -> body.mob().discard());
-                enemies.forEach(Zombie::discard);
+                enemies.forEach(Mob::discard);
                 colony.raze();
             } finally {
                 playerIndex.remove(player.getUUID(), player);

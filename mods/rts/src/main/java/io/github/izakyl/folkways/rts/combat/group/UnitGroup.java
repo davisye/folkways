@@ -70,6 +70,10 @@ public final class UnitGroup {
     }
 
     private static final int PATROL_PAUSE = 20;
+    private static final int REGROUP_BUDGET = 1200;
+    private static final int REGROUP_RETRY_STEP = 20;
+    private static final int REGROUP_RETRY_LIMIT = 100;
+    private static final int REGROUP_WAIT_RETRY = 200;
     private static final int POINT_TRAVEL_BUDGET = 2400;
     private static final int POINT_PATH_RETRIES = 3;
     private static final int POINT_RETRY_DELAY = 10;
@@ -98,6 +102,10 @@ public final class UnitGroup {
     private boolean attacking;
     private boolean regrouping;
     private int regroupTicks;
+    private PointRoute regroupRoute;
+    private long regroupRetryAt;
+    private int regroupRetries;
+    private EndReason regroupReason = EndReason.NONE;
     private long attackStarted;
     private boolean pointsCombatPaused;
     private final Set<UUID> failedMembers = new LinkedHashSet<>();
@@ -185,7 +193,7 @@ public final class UnitGroup {
     public int waitingMembers() {
         List<Body> bodies = loaded();
         int waiting = members.size() - bodies.size();
-        if (phase == Phase.FAILED_WAITING) {
+        if (phase == Phase.FAILED_WAITING && !regrouping) {
             return Math.min(
                 members.size(),
                 waiting + (int) bodies.stream().filter(body -> failedMembers.contains(body.id())).count());
@@ -369,7 +377,7 @@ public final class UnitGroup {
         failedMembers.clear();
         attacking = false;
         regrouping = false;
-        regroupTicks = 0;
+        resetRegroupProgress();
         pointsCombatPaused = false;
         resetPointProgress();
     }
@@ -458,26 +466,39 @@ public final class UnitGroup {
     private void regroup(List<Body> bodies) {
         orders.values().forEach(ResidentCommands.Order::close);
         orders.clear();
+        resetRegroupProgress();
         regrouping = true;
-        regroupTicks = 0;
-        if (bodies.isEmpty()) {
+        regroupReason = endReason;
+        deployment = null;
+        mode = ResidentCommands.Mode.HOLD;
+        if (members.isEmpty()) {
             failedWaiting(EndReason.NO_SURVIVORS);
+            return;
+        }
+        establishRegroup(bodies);
+    }
+
+    /** A failed initial anchor has no deployment yet. Reprobe it without reviving the ended attack. */
+    private void establishRegroup(List<Body> bodies) {
+        if (bodies.isEmpty()) {
+            waitForRegroup(EndReason.NO_SAFE_ANCHOR);
             return;
         }
         try {
             PointRoute anchor = PointRoute.regroup(owner, bodies);
             deployment =
                 new Deployment(anchor.captain(), anchor.captain(), anchor.front(), new Deployment.Formation(2, 1));
-            mode = ResidentCommands.Mode.HOLD;
-            issue(bodies, anchor.slots(bodies), Phase.REFORMING, mode);
+            issue(bodies, anchor.slots(bodies), Phase.REFORMING, ResidentCommands.Mode.HOLD);
+            regroupRoute = anchor;
+            endReason = regroupReason;
             orders.values().forEach(ResidentCommands.Order::allowDangerRetreat);
         } catch (IllegalArgumentException unavailable) {
-            failedWaiting(EndReason.NO_SAFE_ANCHOR);
+            waitForRegroup(EndReason.NO_SAFE_ANCHOR);
         }
     }
 
     private void tickRegroup(List<Body> bodies) {
-        if (bodies.isEmpty()) {
+        if (members.isEmpty()) {
             failedWaiting(EndReason.NO_SURVIVORS);
             return;
         }
@@ -493,44 +514,52 @@ public final class UnitGroup {
             assembledSince = Long.MIN_VALUE;
             return;
         }
-        if (++regroupTicks >= 1200) {
-            failedWaiting(EndReason.REGROUP_TIMED_OUT);
+        regroupTicks = Math.min(REGROUP_BUDGET, regroupTicks + 1);
+        long now = owner.server.overworld().getGameTime();
+        if (regroupRoute == null) {
+            if (now >= regroupRetryAt) {
+                establishRegroup(bodies);
+            } else {
+                regroupWaitingPhase();
+            }
             return;
         }
-        if (orders.values().stream().anyMatch(order -> order.status() == ResidentCommands.Status.FAILED)) {
-            orders.forEach(
-                (id, order) -> {
-                    if (order.status() == ResidentCommands.Status.FAILED) {
-                        failedMembers.add(id);
-                    }
-                });
-            failedWaiting(EndReason.FAILED);
-            return;
-        }
-        if (changed || bodies.size() != orders.size()) {
-            // Preserve the safe anchor and existing slots; only newcomers require a fresh local
-            // assembly.
-            changed = false;
-            if (bodies.stream()
-                .anyMatch(body -> !orders.containsKey(body.id()) || !orders.get(body.id()).boundTo(body))) {
-                try {
-                    PointRoute anchor = new PointRoute(owner, bodies, List.of(deployment.left()), -1);
-                    issue(bodies, anchor.slots(bodies, deployment.left()), Phase.REFORMING, mode);
-                    orders.values().forEach(ResidentCommands.Order::allowDangerRetreat);
-                } catch (IllegalArgumentException unavailable) {
-                    failedWaiting(EndReason.NO_SAFE_ANCHOR);
-                }
-                return;
+        Set<UUID> blocked = new LinkedHashSet<>();
+        for (Body body : bodies) {
+            ResidentCommands.Order order = orders.get(body.id());
+            if (order == null || !order.boundTo(body) || order.status() == ResidentCommands.Status.FAILED) {
+                blocked.add(body.id());
             }
         }
-        if (bodies.size() != members.size()
-            || !assembled(bodies)
-            || orders.values().stream().anyMatch(ResidentCommands.Order::engaged)) {
-            phase = bodies.size() != members.size() ? Phase.WAITING_FOR_MEMBER : Phase.REFORMING;
+        changed = false;
+        if (!blocked.isEmpty()) {
+            failedMembers.addAll(blocked);
+            if (now >= regroupRetryAt) {
+                recoverRegroupMembers(bodies, blocked);
+            } else {
+                regroupWaitingPhase();
+            }
+            return;
+        }
+        if (bodies.size() != members.size() || !assembled(bodies)) {
+            if (regroupTicks >= REGROUP_BUDGET) {
+                members.stream().filter(member -> bodies.stream().noneMatch(body -> body.id().equals(member)))
+                    .forEach(failedMembers::add);
+                bodies.stream().filter(body -> {
+                    ResidentCommands.Order order = orders.get(body.id());
+                    return order == null || order.status() != ResidentCommands.Status.HOLDING
+                        || !Reach.standingIn(body.mob(), Stances.at(order.destination()));
+                }).forEach(body -> failedMembers.add(body.id()));
+                endReason = EndReason.REGROUP_TIMED_OUT;
+            }
+            if (regroupTicks >= REGROUP_BUDGET) {
+                phase = Phase.FAILED_WAITING;
+            } else {
+                phase = bodies.size() != members.size() ? Phase.WAITING_FOR_MEMBER : Phase.REFORMING;
+            }
             assembledSince = Long.MIN_VALUE;
             return;
         }
-        long now = owner.server.overworld().getGameTime();
         if (assembledSince == Long.MIN_VALUE) {
             assembledSince = now;
         }
@@ -540,6 +569,67 @@ public final class UnitGroup {
         }
         regrouping = false;
         phase = Phase.HOLDING;
+        endReason = regroupReason;
+        failedMembers.clear();
+        resetRegroupProgress();
+    }
+
+    /** Keep all healthy order objects and their exact targets; only repair the failed/new entity handles. */
+    private void recoverRegroupMembers(List<Body> bodies, Set<UUID> blocked) {
+        try {
+            List<WorldPos> slots = regroupRoute.slots(bodies, deployment.left(), destinations(), blocked, blocked);
+            List<ResidentCommands.Target> targets = new ArrayList<>();
+            for (int n = 0; n < bodies.size(); n++) {
+                Body body = bodies.get(n);
+                if (blocked.contains(body.id())) {
+                    targets.add(target(body, slots.get(n), ResidentCommands.Mode.HOLD));
+                }
+            }
+            List<ResidentCommands.Order> replacements = owner.commands.replace(targets);
+            for (ResidentCommands.Order replacement : replacements) {
+                replacement.allowDangerRetreat();
+                ResidentCommands.Order old = orders.put(replacement.resident(), replacement);
+                if (old != null) {
+                    old.close();
+                }
+                failedMembers.remove(replacement.resident());
+            }
+            // Replacement success is not arrival. A repeated runner refusal still backs off.
+            waitForRegroup(EndReason.FAILED);
+        } catch (IllegalArgumentException unavailable) {
+            waitForRegroup(EndReason.NO_SAFE_ANCHOR);
+        }
+    }
+
+    private void waitForRegroup(EndReason reason) {
+        assembledSince = Long.MIN_VALUE;
+        regroupRetries = Math.min(REGROUP_RETRY_LIMIT / REGROUP_RETRY_STEP, regroupRetries + 1);
+        int delay = regroupTicks >= REGROUP_BUDGET ? REGROUP_WAIT_RETRY
+            : regroupRoute == null ? REGROUP_RETRY_LIMIT : REGROUP_RETRY_STEP * regroupRetries;
+        regroupRetryAt = owner.server.overworld().getGameTime() + delay;
+        if (regroupTicks >= REGROUP_BUDGET) {
+            endReason = reason == EndReason.FAILED ? EndReason.REGROUP_TIMED_OUT : reason;
+        }
+        regroupWaitingPhase();
+    }
+
+    private void regroupWaitingPhase() {
+        if (regroupRoute == null) {
+            // Stop still reports unsafe footing immediately; the retained regroup retries it later.
+            phase = Phase.FAILED_WAITING;
+            endReason = EndReason.NO_SAFE_ANCHOR;
+        } else {
+            phase = regroupTicks >= REGROUP_BUDGET ? Phase.FAILED_WAITING : Phase.WAITING_FOR_MEMBER;
+        }
+        assembledSince = Long.MIN_VALUE;
+    }
+
+    private void resetRegroupProgress() {
+        regroupTicks = 0;
+        regroupRoute = null;
+        regroupRetryAt = 0;
+        regroupRetries = 0;
+        regroupReason = EndReason.NONE;
     }
 
     private void failedWaiting(EndReason reason) {
@@ -558,6 +648,7 @@ public final class UnitGroup {
         orders.clear();
         attacking = false;
         regrouping = false;
+        resetRegroupProgress();
         endReason = reason;
         phase = Phase.FAILED_WAITING;
     }
@@ -578,6 +669,7 @@ public final class UnitGroup {
         commandKind = CommandKind.NONE;
         attacking = false;
         regrouping = false;
+        resetRegroupProgress();
         resetPointProgress();
     }
 
@@ -652,15 +744,18 @@ public final class UnitGroup {
     void tick() {
         if ((!attacking && !regrouping && deployment == null)
             || phase == Phase.FAILED
-            || phase == Phase.FAILED_WAITING) {
+            // A timed-out regroup stays visible as failed while retaining bounded recovery probes.
+            || phase == Phase.FAILED_WAITING && !regrouping) {
             return;
         }
         List<Body> bodies = loaded();
         for (Body body : List.copyOf(bodies)) {
             ResidentCommands.Order order = orders.get(body.id());
-            if (order != null && owner.commands.current(body.id()).filter(current -> current != order).isPresent()) {
+            ResidentCommands.Order current = owner.commands.current(body.id()).orElse(null);
+            if (current != null && current != order && (order != null || regrouping)) {
                 // A direct individual order takes the member out of formation without touching its
-                // new handle.
+                // new handle. An anchorless regroup owns no handles yet, so a newly present handle
+                // is external authority too; a delayed probe must never adopt or replace it.
                 owner.remove(this, body.id());
             } else if (order != null && !order.boundTo(body)) {
                 // Unload and reload can occur between group ticks. The old entity's released handle

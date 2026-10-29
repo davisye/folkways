@@ -33,6 +33,7 @@ final class AttackNode implements Node {
     private final boolean reachable;
     private WeaponSession session;
     private RefusalKind failure;
+    private boolean begun;
 
     AttackNode(ResidentCommands commands, ResidentCommands.Order order, Worker who) {
         this.commands = commands;
@@ -72,6 +73,10 @@ final class AttackNode implements Node {
         Mob target = commands.attackTarget(order).orElse(null);
         if (target == null || !commands.permitsAttack(order, step, who, target)) {
             return false;
+        }
+        if (!begun) {
+            commands.taking(order);
+            begun = true;
         }
         WeaponSession previous = session;
         session = Weapons.select(who, target, session);
