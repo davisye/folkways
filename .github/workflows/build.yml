@@ -49,7 +49,7 @@ jobs:
           - mod: cookery
             profiles: cookery
           - mod: rts
-            profiles: rts
+            profiles: rts rts-epicfight
           - mod: warfare
             profiles: warfare
           - mod: tacz
@@ -108,6 +108,9 @@ jobs:
             if [[ "$profile" == epicfight ]]; then
               gradle_args+=(-PepicfightTests=true)
             fi
+            if [[ "$profile" == rts-epicfight ]]; then
+              gradle_args+=(-PrtsTests=true -PepicfightTests=true)
+            fi
             status=failure
             if timeout --signal=TERM --kill-after=60s 50m ./gradlew "${gradle_args[@]}" --console=plain runGameTestServer 2>&1 | tee "run/gametest/ci/$GAME_TEST_MOD-$profile.log"; then
               status=success
@@ -144,6 +147,9 @@ jobs:
           - label: Epic Fight acceptance
             artifact: epicfight-acceptance
             spec: tests/e2e/epicfight-acceptance.spec.ts
+          - label: Epic Fight pursuit
+            artifact: epicfight-pursuit
+            spec: tests/e2e/epicfight-pursuit.spec.ts
           - label: Epic Fight GEO reload
             artifact: epicfight-geo
             spec: tests/e2e/epicfight-geo.spec.ts
